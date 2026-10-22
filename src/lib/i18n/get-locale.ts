@@ -22,7 +22,7 @@ export async function getLocale(portal?: Portal | null): Promise<Locale> {
       return stored;
     }
   } catch (error) {
-    
+
   }
 
   return defaultLocaleForPortal(portal ?? null);

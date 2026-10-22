@@ -48,7 +48,6 @@ export default async function HomePage() {
     reception: t.portals.reception,
   };
 
-  // ترتيب البطاقات في الواجهة العربية مطابق للصورة المرجعية.
   const orderedPortals = isArabic
     ? ["admin", "doctor", "reception"] as const
     : ["admin", "doctor", "reception"] as const;
