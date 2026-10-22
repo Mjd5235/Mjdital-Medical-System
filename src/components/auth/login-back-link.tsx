@@ -15,7 +15,7 @@ export function LoginBackLink({ locale }: { locale: Locale }) {
         {isArabic ? (
           <>
             <span>رجوع</span>
-            <ArrowRight className="size-4" aria-hidden="true" />
+            <ArrowRight className="size-4 rotate-180" aria-hidden="true" />
           </>
         ) : (
           <>

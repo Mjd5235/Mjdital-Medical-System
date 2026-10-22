@@ -14,16 +14,15 @@ export function portalFromPathname(pathname: string): Portal | null {
   return null;
 }
 
-/**
- * Reads the locale cookie, then falls back to the portal default.
- * Callers must live inside a <Suspense> boundary because cookies() is a
- * request-time API under Cache Components.
- */
 export async function getLocale(portal?: Portal | null): Promise<Locale> {
-  const cookieStore = await cookies();
-  const stored = cookieStore.get(LOCALE_COOKIE)?.value;
-  if (isLocale(stored)) {
-    return stored;
+  try {
+    const cookieStore = await cookies();
+    const stored = cookieStore.get(LOCALE_COOKIE)?.value;
+    if (isLocale(stored)) {
+      return stored;
+    }
+  } catch (error) {
+    
   }
 
   return defaultLocaleForPortal(portal ?? null);

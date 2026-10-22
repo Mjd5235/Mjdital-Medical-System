@@ -10,7 +10,7 @@ export type UserRole = (typeof USER_ROLES)[number];
 
 export const PORTAL_ROLES = {
   admin: ["ADMIN"] as const,
-  reception: ["RECEPTIONIST", "ADMIN"] as const,
+  reception: ["RECEPTIONIST"] as const,
   doctor: ["DOCTOR"] as const,
 } as const;
 

@@ -1,4 +1,3 @@
-
 import Image from "next/image";
 import Link from "next/link";
 import {
@@ -13,6 +12,9 @@ import { ThemeToggle } from "@/components/portal/theme-toggle";
 import { getDictionary } from "@/lib/i18n/dictionaries";
 import { getLocale } from "@/lib/i18n/get-locale";
 import { BrandLogo } from "@/components/brand/logo";
+
+export const instant = false;
+
 
 const portals = [
   {
@@ -57,20 +59,17 @@ export default async function HomePage() {
       lang={locale}
       className="flex min-h-dvh flex-col bg-[#F8FAFC] text-[#1E293B] transition-colors dark:bg-slate-950 dark:text-slate-100"
     >
-      <header className="mx-auto flex w-full max-w-[1920px] flex-wrap items-center justify-between gap-4 border-b border-[#DCE5EF] px-4 py-4 dark:border-slate-800 sm:px-6 lg:min-h-[103px] lg:px-[26px]">
-        <div
-          aria-label="Mjdital Medical System"
-          className="flex shrink-0 items-center gap-3"
-        >
-     <BrandLogo />
+      <header className="flex w-full items-center justify-between gap-4 py-4 lg:px-4 ">
+        <div className={isArabic ? "flex items-center gap-3 sm: mr-2" : "flex items-center gap-3 sm: ml-2"}>
+          <BrandLogo />
         </div>
-
-        <div className="flex flex-wrap items-center gap-3">
+        <div className={isArabic ? "flex items-center gap-3 sm: ml-2 gap-0" : "flex items-center gap-3 sm: mr-2 gap-0"} dir="ltr">
           <LanguageToggle locale={locale} />
-
+          <span className="hidden h-6 w-px bg-[#E2E8F0] sm:block" />
           <ThemeToggle
             lightLabel={t.lightMode}
             darkLabel={t.darkMode}
+            variant="compact"
           />
         </div>
       </header>
@@ -113,20 +112,18 @@ export default async function HomePage() {
                 className="flex min-w-0 flex-col items-center rounded-2xl border border-[#DCE7F2] bg-white px-5 py-7 shadow-sm transition duration-200 hover:-translate-y-1 hover:shadow-md dark:border-slate-700 dark:bg-slate-900 sm:px-6 sm:py-8 lg:px-7 lg:py-9"
               >
                 <div
-                  className={`flex size-36 shrink-0 items-center justify-center rounded-full sm:size-40 lg:size-[185px] ${
-                    isAdmin
-                      ? "bg-[#E4F0FF] dark:bg-blue-950"
-                      : "bg-[#E7F6F5] dark:bg-teal-950"
-                  }`}
+                  className={`flex size-36 shrink-0 items-center justify-center rounded-full sm:size-40 lg:size-[185px] ${isAdmin
+                    ? "bg-[#E4F0FF] dark:bg-blue-950"
+                    : "bg-[#E7F6F5] dark:bg-teal-950"
+                    }`}
                 >
                   <Icon
                     aria-hidden="true"
                     strokeWidth={1.5}
-                    className={`size-[68px] sm:size-[78px] lg:size-[94px] ${
-                      isAdmin
-                        ? "text-[#0066CC]"
-                        : "text-[#0D9488]"
-                    }`}
+                    className={`size-[68px] sm:size-[78px] lg:size-[94px] ${isAdmin
+                      ? "text-[#0066CC]"
+                      : "text-[#0D9488]"
+                      }`}
                   />
                 </div>
 
@@ -140,19 +137,17 @@ export default async function HomePage() {
 
                 <Link
                   href={portal.href}
-                  className={`mt-6 flex min-h-[62px] w-full items-center justify-center gap-4 rounded-xl px-4 text-base font-bold text-white shadow-sm transition hover:brightness-105 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-300 sm:text-lg lg:mt-7 lg:text-xl ${
-                    isAdmin
-                      ? "bg-[#0066CC]"
-                      : "bg-gradient-to-r from-[#0D9488] to-[#149A9D]"
-                  }`}
+                  className={`mt-6 flex min-h-[62px] w-full items-center justify-center gap-4 rounded-xl px-4 text-base font-bold text-white shadow-sm transition hover:brightness-105 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-300 sm:text-lg lg:mt-7 lg:text-xl ${isAdmin
+                    ? "bg-[#0066CC]"
+                    : "bg-gradient-to-r from-[#0D9488] to-[#149A9D]"
+                    }`}
                 >
                   <span>{content.cta}</span>
 
                   <ArrowRight
                     aria-hidden="true"
-                    className={`size-6 shrink-0 ${
-                      isArabic ? "rotate-180" : ""
-                    }`}
+                    className={`size-6 shrink-0 ${isArabic ? "rotate-180" : ""
+                      }`}
                   />
                 </Link>
               </article>

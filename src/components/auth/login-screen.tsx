@@ -58,8 +58,11 @@ export function LoginScreen({
           lang={locale}
           className="flex w-full min-h-dvh flex-col bg-white px-5 py-6 dark:bg-background sm:px-10 lg:w-1/2 lg:px-16"
         >
-          <header className="flex items-center justify-between gap-3">
-            <BrandLogo />
+          {/* Header responsive enhancement */}
+          <header className="flex w-full items-center justify-between gap-4 py-4">
+            <div className="flex items-center gap-3">
+              <BrandLogo />
+            </div>
             <div className="flex items-center gap-3" dir="ltr">
               <LanguageToggle locale={locale} variant="compact" />
               <span className="hidden h-6 w-px bg-[#E2E8F0] sm:block" />

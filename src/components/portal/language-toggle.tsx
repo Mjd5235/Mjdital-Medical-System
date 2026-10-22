@@ -39,17 +39,16 @@ export function LanguageToggle({
       <div
         role="group"
         aria-label={locale === "ar" ? "اللغة" : "Language"}
-        className="flex items-center gap-2 text-sm"
+        className="flex items-center gap-1.5 sm:gap-2 text-xs sm:text-sm"
       >
         <button
           type="button"
           disabled={pending}
           onClick={() => switchLocale("ar")}
-          className={`font-semibold transition disabled:opacity-60 ${
-            locale === "ar"
-              ? "text-[#0066CC]"
-              : "text-[#94A3B8] hover:text-[#475569] dark:hover:text-slate-200"
-          }`}
+          className={`font-semibold transition disabled:opacity-60 ${locale === "ar"
+            ? "text-[#0066CC]"
+            : "text-[#94A3B8] hover:text-[#475569] dark:hover:text-slate-200"
+            }`}
         >
           العربية
         </button>
@@ -60,11 +59,10 @@ export function LanguageToggle({
           type="button"
           disabled={pending}
           onClick={() => switchLocale("en")}
-          className={`font-medium transition disabled:opacity-60 ${
-            locale === "en"
-              ? "text-[#0066CC]"
-              : "text-[#94A3B8] hover:text-[#475569] dark:hover:text-slate-200"
-          }`}
+          className={`font-medium transition disabled:opacity-60 ${locale === "en"
+            ? "text-[#0066CC]"
+            : "text-[#94A3B8] hover:text-[#475569] dark:hover:text-slate-200"
+            }`}
         >
           English
         </button>
@@ -82,11 +80,10 @@ export function LanguageToggle({
         type="button"
         disabled={pending}
         onClick={() => switchLocale("ar")}
-        className={`rounded-full px-4 py-1.5 text-sm font-semibold transition disabled:opacity-60 ${
-          locale === "ar"
-            ? "bg-[#0066CC] text-white shadow-sm"
-            : "text-[#64748B] hover:text-[#0F172A] dark:text-slate-400 dark:hover:text-slate-100"
-        }`}
+        className={`rounded-full px-2.5 sm:px-4 py-1 text-xs sm:text-sm font-semibold transition disabled:opacity-60 ${locale === "ar"
+          ? "bg-[#0066CC] text-white shadow-sm"
+          : "text-[#64748B] hover:text-[#0F172A] dark:text-slate-400 dark:hover:text-slate-100"
+          }`}
       >
         العربية
       </button>
@@ -94,11 +91,10 @@ export function LanguageToggle({
         type="button"
         disabled={pending}
         onClick={() => switchLocale("en")}
-        className={`rounded-full px-4 py-1.5 text-sm font-medium transition disabled:opacity-60 ${
-          locale === "en"
-            ? "bg-[#0066CC] text-white shadow-sm"
-            : "text-[#94A3B8] hover:text-[#0F172A] dark:text-slate-400 dark:hover:text-slate-100"
-        }`}
+        className={`rounded-full px-2.5 sm:px-4 py-1 text-xs sm:text-sm font-medium transition disabled:opacity-60 ${locale === "en"
+          ? "bg-[#0066CC] text-white shadow-sm"
+          : "text-[#94A3B8] hover:text-[#0F172A] dark:text-slate-400 dark:hover:text-slate-100"
+          }`}
       >
         English
       </button>

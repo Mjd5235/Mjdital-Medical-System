@@ -46,30 +46,30 @@ export function ThemeToggle({
   return (
     <button
       type="button"
+      suppressHydrationWarning
       onClick={toggle}
       aria-label={isDark ? lightLabel : darkLabel}
       dir="ltr"
-      className={`inline-flex items-center gap-2 rounded-full border border-[#E2E8F0] bg-white px-2.5 py-1.5 shadow-sm transition hover:shadow-md dark:border-border dark:bg-card ${variant === "compact" ? "gap-1.5" : ""
+      className={`inline-flex items-center gap-1.5 sm:gap-2 rounded-full border border-[#E2E8F0] bg-white px-2 sm:px-2.5 py-1.5 sm:py-1.5 shadow-sm transition hover:shadow-md dark:border-border dark:bg-card ${variant === "compact" ? "gap-1 sm:gap-1.5" : ""
         }`}
     >
       <Sun
         aria-hidden="true"
-        className={`size-4 ${isDark ? "text-[#94A3B8]" : "text-[#F59E0B]"}`}
+        className={`size-3.5 sm:size-4 shrink-0 ${isDark ? "text-[#94A3B8]" : "text-[#F59E0B]"}`}
         strokeWidth={2.2}
       />
       <span
         aria-hidden="true"
-        className="relative h-6 w-11 rounded-full bg-[#E2E8F0] dark:bg-slate-600"
+        className="relative h-5 sm:h-6 w-9 sm:w-11 shrink-0 rounded-full bg-[#E2E8F0] dark:bg-slate-600"
       >
         <span
-          className={`absolute top-0.5 size-5 rounded-full bg-[#0066CC] shadow-sm transition-transform ${
-            isDark ? "translate-x-[1px]" : "translate-x-[-20px]"
-          }`}
+          className={`absolute top-0.5 size-4 sm:size-5 rounded-full bg-[#0066CC] shadow-sm transition-transform ${isDark ? "translate-x-[1px]" : "translate-x-[-16px] sm:translate-x-[-20px]"
+            }`}
         />
       </span>
       <Moon
         aria-hidden="true"
-        className={`size-4 ${isDark ? "text-[#0066CC]" : "text-[#94A3B8]"}`}
+        className={`size-3.5 sm:size-4 shrink-0 ${isDark ? "text-[#0066CC]" : "text-[#94A3B8]"}`}
         strokeWidth={2.2}
       />
     </button>
