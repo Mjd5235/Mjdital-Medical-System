@@ -1,13 +1,15 @@
 import { Suspense } from "react";
-import AdminDashboardPage from "./page";
-import { getLocale } from "@/lib/i18n/get-locale";
 
-export default async function AdminDashboardLayout() {
+export const instant = false;
 
-  const locale = await getLocale()
+export default async function AdminDashboardLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <Suspense fallback={<div className="min-h-dvh bg-background" />}>
-      <AdminDashboardPage initialLocale={locale} />
+      {children}
     </Suspense>
   );
 }
