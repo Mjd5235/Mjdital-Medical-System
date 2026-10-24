@@ -75,6 +75,8 @@ model Clinic {
   isActive  Boolean  @default(true) @map("is_active")
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
+  specialty  String? @map("specialty")
+  nphiesCode String? @map("nphies_code")
 
   users              User[]
   doctors            Doctor[]
@@ -83,8 +85,28 @@ model Clinic {
   auditLogs          AuditLog[]
   invoices           Invoice[]
   insuranceProviders InsuranceProvider[]
+  services           Service[]
 
   @@map("clinics")
+}
+
+model Service {
+  id          String   @id @default(uuid()) @db.Uuid
+  clinicId    String   @map("clinic_id") @db.Uuid
+  code        String
+  nameAr      String   @map("name_ar")
+  nameEn      String   @map("name_en")
+  basePrice   Decimal  @map("base_price") @db.Decimal(12, 2)
+  vatRate     Decimal  @default(15.00) @map("vat_rate") @db.Decimal(5, 2)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@unique([clinicId, code])
+  @@index([clinicId])
+  @@map("services")
 }
 
 model User {

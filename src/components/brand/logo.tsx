@@ -12,7 +12,7 @@ interface LogoProps {
 export function BrandLogo({ className = '', width = 140, height = 40 }: LogoProps) {
   return (
     <div>
-      <Link href="" className={`inline-block relative ${className}`}>
+      <div className={`inline-block relative ${className}`}>
         <Image
           src="/mjdital_logo_transparent.png"
           alt="Mjdital Logo"
@@ -31,7 +31,7 @@ export function BrandLogo({ className = '', width = 140, height = 40 }: LogoProp
           className="hidden dark:block h-auto w-auto object-contain"
           suppressHydrationWarning
         />
-      </Link>
+      </div>
     </div>
   );
 }
