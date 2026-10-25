@@ -1,3 +1,4 @@
+
 import { NextResponse, type NextRequest } from "next/server";
 import { portalAllowsRole } from "@/lib/auth/roles";
 import {
@@ -18,9 +19,13 @@ import {
 } from "@/lib/i18n/get-locale";
 import { isLocale, LOCALE_COOKIE } from "@/lib/i18n/types";
 
-async function readSession(request: NextRequest): Promise<SessionUser | null> {
+async function readSession(
+  request: NextRequest,
+): Promise<SessionUser | null> {
   try {
-    return await parseSessionToken(request.cookies.get(SESSION_COOKIE)?.value);
+    return await parseSessionToken(
+      request.cookies.get(SESSION_COOKIE)?.value,
+    );
   } catch (error) {
     console.error("Failed to parse portal session", error);
     return null;
@@ -33,14 +38,20 @@ function applyLocaleCookie(
   portal: Portal | null,
 ) {
   const stored = request.cookies.get(LOCALE_COOKIE)?.value;
+
   if (isLocale(stored)) {
     return;
   }
-  response.cookies.set(LOCALE_COOKIE, defaultLocaleForPortal(portal), {
-    path: "/",
-    sameSite: "lax",
-    maxAge: 60 * 60 * 24 * 365,
-  });
+
+  response.cookies.set(
+    LOCALE_COOKIE,
+    defaultLocaleForPortal(portal),
+    {
+      path: "/",
+      sameSite: "lax",
+      maxAge: 60 * 60 * 24 * 365,
+    },
+  );
 }
 
 function withRequestContext(
@@ -48,23 +59,33 @@ function withRequestContext(
   session: SessionUser | null,
 ) {
   const requestHeaders = new Headers(request.headers);
+
   requestHeaders.set("x-pathname", request.nextUrl.pathname);
+
   if (session) {
-    requestHeaders.set("x-clinic-id", session.clinicId);
+    requestHeaders.set(
+      "x-organization-id",
+      session.organizationId,
+    );
     requestHeaders.set("x-user-role", session.role);
     requestHeaders.set("x-user-id", session.userId);
   }
+
   return requestHeaders;
 }
 
 export async function proxy(request: NextRequest) {
-  const portal = portalFromPathname(request.nextUrl.pathname);
+  const pathname = request.nextUrl.pathname;
+  const portal = portalFromPathname(pathname);
   const session = await readSession(request);
 
   const passThrough = () => {
     const response = NextResponse.next({
-      request: { headers: withRequestContext(request, session) },
+      request: {
+        headers: withRequestContext(request, session),
+      },
     });
+
     applyLocaleCookie(request, response, portal);
     return response;
   };
@@ -73,49 +94,58 @@ export async function proxy(request: NextRequest) {
     return passThrough();
   }
 
-  const isLogin = request.nextUrl.pathname === portalLoginPath(portal);
+  const isLogin = pathname === portalLoginPath(portal);
 
   if (isLogin) {
-    if (session && portalAllowsRole(portal, session.role) && session.clinicId) {
+    if (
+      session &&
+      portalAllowsRole(portal, session.role) &&
+      session.organizationId
+    ) {
       const url = request.nextUrl.clone();
       url.pathname = portalHomePath(portal);
       url.search = "";
-      return NextResponse.redirect(url);
+
+      const response = NextResponse.redirect(url);
+      applyLocaleCookie(request, response, portal);
+      return response;
     }
+
     return passThrough();
   }
 
-  if (isPublicPath(request.nextUrl.pathname)) {
+  if (isPublicPath(pathname)) {
     return passThrough();
   }
 
-  if (!session || !session.clinicId) {
+  if (!session || !session.organizationId) {
     const url = request.nextUrl.clone();
     url.pathname = portalLoginPath(portal);
     url.search = "";
-    const intended = request.nextUrl.pathname;
-    if (intended.startsWith(`/${portal}/`) && !intended.includes("//")) {
-      url.searchParams.set("next", intended);
+
+    if (
+      pathname.startsWith(`/${portal}/`) &&
+      !pathname.includes("//")
+    ) {
+      url.searchParams.set("next", pathname);
     }
-    const redirectResponse = NextResponse.redirect(url);
-    applyLocaleCookie(request, redirectResponse, portal);
-    return redirectResponse;
+
+    const response = NextResponse.redirect(url);
+    applyLocaleCookie(request, response, portal);
+    return response;
   }
 
   if (!portalAllowsRole(portal, session.role)) {
     const url = request.nextUrl.clone();
     url.pathname = homePathForRole(session.role);
     url.search = "";
-    const redirectResponse = NextResponse.redirect(url);
-    applyLocaleCookie(request, redirectResponse, portal);
-    return redirectResponse;
+
+    const response = NextResponse.redirect(url);
+    applyLocaleCookie(request, response, portal);
+    return response;
   }
 
-  const response = NextResponse.next({
-    request: { headers: withRequestContext(request, session) },
-  });
-  applyLocaleCookie(request, response, portal);
-  return response;
+  return passThrough();
 }
 
 export const config = {

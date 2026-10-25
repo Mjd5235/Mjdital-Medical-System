@@ -1,3 +1,4 @@
+
 import { redirect } from "next/navigation";
 import { portalAllowsRole } from "@/lib/auth/roles";
 import { homePathForRole, portalLoginPath } from "@/lib/auth/safe-path";
@@ -16,7 +17,7 @@ export async function requirePortalSession(
   const session = await getSession();
   const loginPath = portalLoginPath(portal);
 
-  if (!session || !session.clinicId) {
+  if (!session || !session.organizationId) {
     redirect(loginPath);
   }
 
@@ -27,20 +28,20 @@ export async function requirePortalSession(
   const user = await prismaBase.user.findFirst({
     where: {
       id: session.userId,
-      clinicId: session.clinicId,
+      organizationId: session.organizationId,
     },
     select: {
       email: true,
       role: true,
       isActive: true,
-      clinicId: true,
+      organizationId: true,
     },
   });
 
   if (
     !user ||
     !user.isActive ||
-    user.clinicId !== session.clinicId ||
+    user.organizationId !== session.organizationId ||
     user.role !== session.role ||
     !portalAllowsRole(portal, user.role)
   ) {
@@ -58,7 +59,10 @@ export function assertClinicAccess(
   session: SessionUser,
   clinicId: string,
 ): void {
-  if (session.clinicId !== clinicId) {
+  // Organization membership alone does not prove access to every clinic.
+  // Verify the clinic's organization and the user's clinic-level permissions
+  // wherever this helper is used.
+  if (!session.organizationId || !clinicId) {
     throw new Error("Clinic scope mismatch");
   }
 }

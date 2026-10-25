@@ -1,29 +1,40 @@
+
 import { prisma } from "@/lib/db/prisma";
 import { writeAuditLog } from "@/lib/services/audit.service";
 
 type SignAppointmentInput = {
+  organizationId: string;
   clinicId: string;
   actorUserId: string;
   appointmentId: string;
   ipAddress?: string;
 };
 
-export async function signAndCompleteAppointment(input: SignAppointmentInput) {
+export async function signAndCompleteAppointment(
+  input: SignAppointmentInput,
+) {
   try {
     const appointment = await prisma.appointment.findFirst({
-      where: { clinicId: input.clinicId, id: input.appointmentId },
+      where: {
+        organizationId: input.organizationId,
+        clinicId: input.clinicId,
+        id: input.appointmentId,
+      },
     });
 
     if (!appointment) {
       throw new Error("Appointment not found for this clinic");
     }
 
-    if (appointment.isLocked || appointment.status === "COMPLETED") {
+    if (
+      appointment.isLocked ||
+      appointment.status === "COMPLETED"
+    ) {
       throw new Error("Completed medical notes are immutable");
     }
 
     const updated = await prisma.appointment.update({
-      where: { id: appointment.id, clinicId: input.clinicId },
+      where: { id: appointment.id },
       data: {
         status: "COMPLETED",
         isLocked: true,
@@ -34,6 +45,7 @@ export async function signAndCompleteAppointment(input: SignAppointmentInput) {
     });
 
     await writeAuditLog({
+      organizationId: input.organizationId,
       clinicId: input.clinicId,
       userId: input.actorUserId,
       actionType: "UPDATE",

@@ -1,9 +1,11 @@
+
 import { prisma } from "@/lib/db/prisma";
 import { writeAuditLog } from "@/lib/services/audit.service";
 import { buildFileNumber } from "@/lib/validators/file-number";
 import { parseSaudiIdentity } from "@/lib/validators/national-id";
 
 type CreatePatientInput = {
+  organizationId: string;
   clinicId: string;
   actorUserId: string;
   fullNameAr: string;
@@ -12,13 +14,17 @@ type CreatePatientInput = {
   ipAddress?: string;
 };
 
-export async function nextFileNumber(clinicId: string): Promise<string> {
+export async function nextFileNumber(
+  organizationId: string,
+  clinicId: string,
+): Promise<string> {
   const year = new Date().getFullYear();
   const prefix = `MC-${year}-`;
 
   try {
     const latest = await prisma.patient.findFirst({
       where: {
+        organizationId,
         clinicId,
         fileNumber: { startsWith: prefix },
       },
@@ -41,9 +47,14 @@ export async function createPatient(input: CreatePatientInput) {
   const identity = parseSaudiIdentity(input.nationalId);
 
   try {
-    const fileNumber = await nextFileNumber(input.clinicId);
+    const fileNumber = await nextFileNumber(
+      input.organizationId,
+      input.clinicId,
+    );
+
     const patient = await prisma.patient.create({
       data: {
+        organizationId: input.organizationId,
         clinicId: input.clinicId,
         fileNumber,
         nationalId: identity.nationalId,
@@ -54,6 +65,7 @@ export async function createPatient(input: CreatePatientInput) {
     });
 
     await writeAuditLog({
+      organizationId: input.organizationId,
       clinicId: input.clinicId,
       userId: input.actorUserId,
       actionType: "CREATE",
@@ -69,10 +81,18 @@ export async function createPatient(input: CreatePatientInput) {
   }
 }
 
-export async function getPatientById(clinicId: string, patientId: string) {
+export async function getPatientById(
+  organizationId: string,
+  clinicId: string,
+  patientId: string,
+) {
   try {
     return await prisma.patient.findFirst({
-      where: { clinicId, id: patientId },
+      where: {
+        organizationId,
+        clinicId,
+        id: patientId,
+      },
     });
   } catch (error) {
     console.error("Failed to load patient", error);

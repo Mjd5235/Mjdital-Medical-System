@@ -1,7 +1,9 @@
+
+import { Prisma, type AuditActionType } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
-import type { AuditActionType } from "@prisma/client";
 
 type WriteAuditInput = {
+  organizationId: string;
   clinicId: string;
   userId: string;
   actionType: AuditActionType;
@@ -9,13 +11,16 @@ type WriteAuditInput = {
   recordId: string;
   ipAddress?: string;
   userAgent?: string;
-  metadata?: Record<string, string | number | boolean | null>;
+  metadata?: Prisma.InputJsonObject;
 };
 
-export async function writeAuditLog(input: WriteAuditInput): Promise<void> {
+export async function writeAuditLog(
+  input: WriteAuditInput,
+): Promise<void> {
   try {
     await prisma.auditLog.create({
       data: {
+        organizationId: input.organizationId,
         clinicId: input.clinicId,
         userId: input.userId,
         actionType: input.actionType,
@@ -32,10 +37,17 @@ export async function writeAuditLog(input: WriteAuditInput): Promise<void> {
   }
 }
 
-export async function listAuditLogs(clinicId: string, take = 50) {
+export async function listAuditLogs(
+  organizationId: string,
+  clinicId: string,
+  take = 50,
+) {
   try {
     return await prisma.auditLog.findMany({
-      where: { clinicId },
+      where: {
+        organizationId,
+        clinicId,
+      },
       orderBy: { timestamp: "desc" },
       take,
     });

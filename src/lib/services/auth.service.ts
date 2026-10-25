@@ -1,3 +1,4 @@
+
 import "server-only";
 
 import { portalAllowsRole } from "@/lib/auth/roles";
@@ -19,7 +20,7 @@ export type LoginResult =
 
 type AuthUserRecord = {
   id: string;
-  clinicId: string;
+  organizationId: string;
   email: string;
   passwordHash: string;
   fullNameAr: string;
@@ -46,6 +47,7 @@ export async function authenticatePortalUser(input: {
   userAgent?: string;
 }): Promise<LoginResult> {
   const email = normalizeEmail(input.email);
+
   if (!email || !input.password) {
     return { ok: false, code: "invalid_credentials" };
   }
@@ -54,10 +56,13 @@ export async function authenticatePortalUser(input: {
 
   try {
     user = await prismaBase.user.findFirst({
-      where: { email },
+      where: {
+        email,
+        organization: { is: { isActive: true } },
+      },
       select: {
         id: true,
-        clinicId: true,
+        organizationId: true,
         email: true,
         passwordHash: true,
         fullNameAr: true,
@@ -79,7 +84,7 @@ export async function authenticatePortalUser(input: {
     return { ok: false, code: "inactive" };
   }
 
-  if (!isUuid(user.clinicId) || !isUuid(user.id)) {
+  if (!isUuid(user.id) || !isUuid(user.organizationId)) {
     return { ok: false, code: "misconfigured" };
   }
 
@@ -89,7 +94,7 @@ export async function authenticatePortalUser(input: {
 
   try {
     await prisma.user.update({
-      where: { id: user.id, clinicId: user.clinicId },
+      where: { id: user.id },
       data: { lastLoginAt: new Date() },
     });
   } catch (error) {
@@ -97,16 +102,36 @@ export async function authenticatePortalUser(input: {
   }
 
   try {
-    await writeAuditLog({
-      clinicId: user.clinicId,
-      userId: user.id,
-      actionType: "READ",
-      targetTable: "users",
-      recordId: user.id,
-      ipAddress: input.ipAddress,
-      userAgent: input.userAgent,
-      metadata: { event: "portal_login", portal: input.portal },
+    const clinic = await prismaBase.clinic.findFirst({
+      where: {
+        organizationId: user.organizationId,
+        isActive: true,
+      },
+      select: { id: true },
+      orderBy: { createdAt: "asc" },
     });
+
+    if (clinic) {
+      await writeAuditLog({
+        organizationId: user.organizationId,
+        clinicId: clinic.id,
+        userId: user.id,
+        actionType: "READ",
+        targetTable: "users",
+        recordId: user.id,
+        ipAddress: input.ipAddress,
+        userAgent: input.userAgent,
+        metadata: {
+          event: "portal_login",
+          portal: input.portal,
+        },
+      });
+    } else {
+      console.warn(
+        "Login audit skipped: no active clinic",
+        user.organizationId,
+      );
+    }
   } catch (error) {
     console.error("Failed to persist login audit", error);
   }
@@ -115,7 +140,7 @@ export async function authenticatePortalUser(input: {
     ok: true,
     session: {
       userId: user.id,
-      clinicId: user.clinicId,
+      organizationId: user.organizationId,
       role: user.role,
       fullNameAr: user.fullNameAr,
       fullNameEn: user.fullNameEn,

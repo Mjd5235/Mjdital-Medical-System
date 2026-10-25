@@ -62,8 +62,8 @@ enum AuditActionType {
   @@map("audit_action_type")
 }
 
-/// Tenant root. Isolation key for all other tables is clinic_id.
-model Clinic {
+/// المؤسسة الرئيسية والمستأجر (Tenant) في النظام.
+model Organization {
   id        String   @id @default(uuid()) @db.Uuid
   nameAr    String   @map("name_ar")
   nameEn    String   @map("name_en")
@@ -75,10 +75,9 @@ model Clinic {
   isActive  Boolean  @default(true) @map("is_active")
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
-  specialty  String? @map("specialty")
-  nphiesCode String? @map("nphies_code")
 
   users              User[]
+  clinics            Clinic[]
   doctors            Doctor[]
   patients           Patient[]
   appointments       Appointment[]
@@ -87,77 +86,123 @@ model Clinic {
   insuranceProviders InsuranceProvider[]
   services           Service[]
 
+  @@index([isActive])
+  @@map("organizations")
+}
+
+/// عيادة أو قسم داخلي تابع لمؤسسة.
+model Clinic {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  nameAr         String   @map("name_ar")
+  nameEn         String   @map("name_en")
+  crNumber       String?  @map("cr_number")
+  vatNumber      String?  @map("vat_number")
+  city           String   @default("Riyadh")
+  region         String   @default("SA-01")
+  timezone       String   @default("Asia/Riyadh")
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  specialty      String?  @map("specialty")
+  nphiesCode     String?  @map("nphies_code")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  doctors            Doctor[]
+  patients           Patient[]
+  appointments       Appointment[]
+  auditLogs          AuditLog[]
+  invoices           Invoice[]
+  insuranceProviders InsuranceProvider[]
+  services           Service[]
+
+  @@index([organizationId])
+  @@index([organizationId, isActive])
   @@map("clinics")
 }
 
+/// الخدمات المقدمة داخل العيادات.
 model Service {
-  id          String   @id @default(uuid()) @db.Uuid
-  clinicId    String   @map("clinic_id") @db.Uuid
-  code        String
-  nameAr      String   @map("name_ar")
-  nameEn      String   @map("name_en")
-  basePrice   Decimal  @map("base_price") @db.Decimal(12, 2)
-  vatRate     Decimal  @default(15.00) @map("vat_rate") @db.Decimal(5, 2)
-  isActive    Boolean  @default(true) @map("is_active")
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  clinicId       String   @map("clinic_id") @db.Uuid
+  code           String
+  nameAr         String   @map("name_ar")
+  nameEn         String   @map("name_en")
+  basePrice      Decimal  @map("base_price") @db.Decimal(12, 2)
+  vatRate        Decimal  @default(15.00) @map("vat_rate") @db.Decimal(5, 2)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
-  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
 
-  @@unique([clinicId, code])
-  @@index([clinicId])
+  @@unique([organizationId, clinicId, code])
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
   @@map("services")
 }
 
+/// حساب المستخدم داخل المؤسسة، وليس داخل عيادة محددة.
 model User {
-  id           String    @id @default(uuid()) @db.Uuid
-  clinicId     String    @map("clinic_id") @db.Uuid
-  email        String
-  passwordHash String    @map("password_hash")
-  fullNameAr   String    @map("full_name_ar")
-  fullNameEn   String    @map("full_name_en")
-  role         UserRole
-  isActive     Boolean   @default(true) @map("is_active")
-  lastLoginAt  DateTime? @map("last_login_at")
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  email          String
+  passwordHash   String    @map("password_hash")
+  fullNameAr     String    @map("full_name_ar")
+  fullNameEn     String    @map("full_name_en")
+  role           UserRole
+  isActive       Boolean   @default(true) @map("is_active")
+  lastLoginAt    DateTime? @map("last_login_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  clinic       Clinic        @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
   doctor       Doctor?
   auditLogs    AuditLog[]
   appointments Appointment[] @relation("AppointmentCreatedBy")
 
-  @@unique([clinicId, email])
-  @@index([clinicId])
-  @@index([clinicId, role])
+  @@unique([organizationId, email])
+  @@index([organizationId])
+  @@index([organizationId, role])
   @@map("users")
 }
 
+/// الملف المهني للطبيب، ويمكن ربطه بحساب مستخدم اختياري.
 model Doctor {
-  id                  String         @id @default(uuid()) @db.Uuid
-  clinicId            String         @map("clinic_id") @db.Uuid
-  userId              String?        @unique @map("user_id") @db.Uuid
-  fullNameAr          String         @map("full_name_ar")
-  fullNameEn          String         @map("full_name_en")
-  specialtyAr         String         @map("specialty_ar")
-  specialtyEn         String         @map("specialty_en")
-  scfhsLicenseNumber  String         @map("scfhs_license_number")
-  presence            DoctorPresence @default(AVAILABLE)
-  isActive            Boolean        @default(true) @map("is_active")
-  createdAt           DateTime       @default(now()) @map("created_at")
-  updatedAt           DateTime       @updatedAt @map("updated_at")
+  id                 String         @id @default(uuid()) @db.Uuid
+  organizationId     String         @map("organization_id") @db.Uuid
+  clinicId           String         @map("clinic_id") @db.Uuid
+  userId             String?        @unique @map("user_id") @db.Uuid
+  fullNameAr         String         @map("full_name_ar")
+  fullNameEn         String         @map("full_name_en")
+  specialtyAr        String         @map("specialty_ar")
+  specialtyEn        String         @map("specialty_en")
+  scfhsLicenseNumber String         @map("scfhs_license_number")
+  presence           DoctorPresence @default(AVAILABLE)
+  isActive           Boolean        @default(true) @map("is_active")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
 
-  clinic       Clinic        @relation(fields: [clinicId], references: [id], onDelete: Restrict)
-  user         User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
   appointments Appointment[]
 
-  @@unique([clinicId, scfhsLicenseNumber])
-  @@index([clinicId])
+  @@unique([organizationId, scfhsLicenseNumber])
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
   @@map("doctors")
 }
 
+/// بيانات المرضى على مستوى المؤسسة.
 model Patient {
   id                    String       @id @default(uuid()) @db.Uuid
+  organizationId        String       @map("organization_id") @db.Uuid
   clinicId              String       @map("clinic_id") @db.Uuid
   fileNumber            String       @map("file_number")
   nationalId            String       @map("national_id") @db.Char(10)
@@ -175,94 +220,114 @@ model Patient {
   createdAt             DateTime     @default(now()) @map("created_at")
   updatedAt             DateTime     @updatedAt @map("updated_at")
 
-  clinic             Clinic              @relation(fields: [clinicId], references: [id], onDelete: Restrict)
-  insuranceProvider  InsuranceProvider?  @relation(fields: [insuranceProviderId], references: [id], onDelete: SetNull)
-  appointments       Appointment[]
-  invoices           Invoice[]
+  organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic            Clinic             @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  insuranceProvider InsuranceProvider? @relation(fields: [insuranceProviderId], references: [id], onDelete: SetNull)
 
-  @@unique([clinicId, fileNumber])
-  @@unique([clinicId, nationalId])
-  @@index([clinicId])
+  appointments Appointment[]
+  invoices     Invoice[]
+
+  @@unique([organizationId, fileNumber])
+  @@unique([organizationId, nationalId])
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
+  @@index([organizationId, insuranceProviderId])
   @@map("patients")
 }
 
+/// المواعيد الطبية.
 model Appointment {
-  id               String             @id @default(uuid()) @db.Uuid
-  clinicId         String             @map("clinic_id") @db.Uuid
-  doctorId         String             @map("doctor_id") @db.Uuid
-  patientId        String             @map("patient_id") @db.Uuid
-  createdByUserId  String?            @map("created_by_user_id") @db.Uuid
-  status           AppointmentStatus  @default(SCHEDULED)
-  scheduledAt      DateTime           @map("scheduled_at")
-  startedAt        DateTime?          @map("started_at")
-  completedAt      DateTime?          @map("completed_at")
-  signedAt         DateTime?          @map("signed_at")
-  signedByUserId   String?            @map("signed_by_user_id") @db.Uuid
-  chiefComplaint   String?            @map("chief_complaint")
+  id               String            @id @default(uuid()) @db.Uuid
+  organizationId   String            @map("organization_id") @db.Uuid
+  clinicId         String            @map("clinic_id") @db.Uuid
+  doctorId         String            @map("doctor_id") @db.Uuid
+  patientId        String            @map("patient_id") @db.Uuid
+  createdByUserId  String?           @map("created_by_user_id") @db.Uuid
+  status           AppointmentStatus @default(SCHEDULED)
+  scheduledAt      DateTime          @map("scheduled_at")
+  startedAt        DateTime?         @map("started_at")
+  completedAt      DateTime?         @map("completed_at")
+  signedAt         DateTime?         @map("signed_at")
+  signedByUserId   String?           @map("signed_by_user_id") @db.Uuid
+  chiefComplaint   String?           @map("chief_complaint")
   diagnosis        String?
-  diagnosisIcd10Am String?            @map("diagnosis_icd10_am")
-  procedureAchi    String?            @map("procedure_achi")
-  sbsCode          String?            @map("sbs_code")
+  diagnosisIcd10Am String?           @map("diagnosis_icd10_am")
+  procedureAchi    String?           @map("procedure_achi")
+  sbsCode          String?           @map("sbs_code")
   prescriptions    String?
-  isLocked         Boolean            @default(false) @map("is_locked")
+  isLocked         Boolean           @default(false) @map("is_locked")
   notes            String?
-  createdAt        DateTime           @default(now()) @map("created_at")
-  updatedAt        DateTime           @updatedAt @map("updated_at")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
 
-  clinic    Clinic    @relation(fields: [clinicId], references: [id], onDelete: Restrict)
-  doctor    Doctor    @relation(fields: [doctorId], references: [id], onDelete: Restrict)
-  patient   Patient   @relation(fields: [patientId], references: [id], onDelete: Restrict)
-  createdBy User?     @relation("AppointmentCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
-  invoices  Invoice[]
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctor       Doctor       @relation(fields: [doctorId], references: [id], onDelete: Restrict)
+  patient      Patient      @relation(fields: [patientId], references: [id], onDelete: Restrict)
 
-  @@index([clinicId])
-  @@index([clinicId, doctorId, scheduledAt])
-  @@index([clinicId, patientId])
-  @@index([clinicId, status])
+  createdBy User? @relation("AppointmentCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  invoices Invoice[]
+
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
+  @@index([organizationId, doctorId, scheduledAt])
+  @@index([organizationId, patientId])
+  @@index([organizationId, status])
   @@map("appointments")
 }
 
-/// Append-only. UPDATE/DELETE must be rejected at the service and Prisma layers.
+/// سجل تدقيق العمليات.
+/// يجب منع تعديل السجلات أو حذفها عبر طبقة التطبيق والسياسات المناسبة.
 model AuditLog {
-  id          String          @id @default(uuid()) @db.Uuid
-  clinicId    String          @map("clinic_id") @db.Uuid
-  userId      String          @map("user_id") @db.Uuid
-  actionType  AuditActionType @map("action_type")
-  targetTable String          @map("target_table")
-  recordId    String          @map("record_id")
-  ipAddress   String?         @map("ip_address")
-  userAgent   String?         @map("user_agent")
-  metadata    Json?
-  timestamp   DateTime        @default(now())
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @map("organization_id") @db.Uuid
+  clinicId       String          @map("clinic_id") @db.Uuid
+  userId         String          @map("user_id") @db.Uuid
+  actionType     AuditActionType @map("action_type")
+  targetTable    String          @map("target_table")
+  recordId       String          @map("record_id")
+  ipAddress      String?         @map("ip_address")
+  userAgent      String?         @map("user_agent")
+  metadata       Json?
+  timestamp      DateTime        @default(now())
 
-  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Restrict)
-  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Restrict)
 
-  @@index([clinicId, timestamp])
-  @@index([clinicId, targetTable, recordId])
+  @@index([organizationId, timestamp])
+  @@index([organizationId, clinicId, timestamp])
+  @@index([organizationId, targetTable, recordId])
   @@map("audit_logs")
 }
 
+/// شركات التأمين المسجلة لدى المؤسسة.
 model InsuranceProvider {
-  id        String   @id @default(uuid()) @db.Uuid
-  clinicId  String   @map("clinic_id") @db.Uuid
-  nameAr    String   @map("name_ar")
-  nameEn    String   @map("name_en")
-  isActive  Boolean  @default(true) @map("is_active")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  clinicId       String   @map("clinic_id") @db.Uuid
+  nameAr         String   @map("name_ar")
+  nameEn         String   @map("name_en")
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
-  clinic   Clinic    @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+
   patients Patient[]
 
-  @@unique([clinicId, nameEn])
-  @@index([clinicId])
+  @@unique([organizationId, nameEn])
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
   @@map("insurance_providers")
 }
 
-/// ZATCA Phase 2 structural hooks. Hash chaining is implemented in a later phase.
+/// الفواتير مع الحقول الأساسية اللازمة للتكامل المستقبلي مع ZATCA.
 model Invoice {
   id                  String   @id @default(uuid()) @db.Uuid
+  organizationId      String   @map("organization_id") @db.Uuid
   clinicId            String   @map("clinic_id") @db.Uuid
   patientId           String   @map("patient_id") @db.Uuid
   appointmentId       String?  @map("appointment_id") @db.Uuid
@@ -277,12 +342,15 @@ model Invoice {
   createdAt           DateTime @default(now()) @map("created_at")
   updatedAt           DateTime @updatedAt @map("updated_at")
 
-  clinic      Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
-  patient     Patient      @relation(fields: [patientId], references: [id], onDelete: Restrict)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  patient      Patient      @relation(fields: [patientId], references: [id], onDelete: Restrict)
+
   appointment Appointment? @relation(fields: [appointmentId], references: [id], onDelete: Restrict)
 
-  @@unique([clinicId, invoiceCounter])
-  @@index([clinicId])
-  @@index([clinicId, patientId])
+  @@unique([organizationId, invoiceCounter])
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
+  @@index([organizationId, patientId])
   @@map("invoices")
 }

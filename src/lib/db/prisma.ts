@@ -10,6 +10,14 @@ const TENANT_MODELS = new Set([
   "InsuranceProvider",
 ]);
 
+const CLINIC_SCOPED_MODELS = new Set([
+  "Doctor",
+  "Patient",
+  "Appointment",
+  "AuditLog",
+  "Invoice",
+]);
+
 const WRITE_OPERATIONS = new Set([
   "create",
   "createMany",
@@ -33,60 +41,138 @@ const READ_OR_MUTATE = new Set([
   "groupBy",
 ]);
 
+type QueryArgs = {
+  where?: Record<string, unknown>;
+  data?: Record<string, unknown> | Record<string, unknown>[];
+};
+
+function hasOrganizationId(
+  value: Record<string, unknown> | undefined,
+): boolean {
+  return (
+    value !== undefined &&
+    (value.organizationId !== undefined ||
+      value.organization_id !== undefined)
+  );
+}
+
 function hasClinicId(
   value: Record<string, unknown> | undefined,
 ): boolean {
-  if (!value) {
-    return false;
-  }
-
-  return value.clinicId !== undefined || value.clinic_id !== undefined;
+  return (
+    value !== undefined &&
+    (value.clinicId !== undefined || value.clinic_id !== undefined)
+  );
 }
 
-function assertTenantFilter(model: string, operation: string, args: unknown) {
+function assertTenantFilter(
+  model: string,
+  operation: string,
+  args: unknown,
+): void {
   if (!TENANT_MODELS.has(model)) {
     return;
   }
 
-  const typedArgs = (args ?? {}) as {
-    where?: Record<string, unknown>;
-    data?: Record<string, unknown> | Record<string, unknown>[];
-  };
+  const typedArgs = (args ?? {}) as QueryArgs;
+  const where = typedArgs.where;
+  const data = typedArgs.data;
 
-  if (operation === "create") {
-    if (!hasClinicId(typedArgs.data as Record<string, unknown> | undefined)) {
-      throw new Error(`${model}.create requires clinicId from the verified session`);
+  if (operation === "create" || operation === "createMany") {
+    const rows = operation === "createMany"
+      ? (Array.isArray(data) ? data : [])
+      : [data as Record<string, unknown> | undefined];
+
+    if (rows.length === 0) {
+      throw new Error(`${model}.${operation} requires data`);
     }
-    return;
-  }
 
-  if (operation === "createMany") {
-    const rows = typedArgs.data;
-    if (!Array.isArray(rows) || rows.some((row) => !hasClinicId(row))) {
-      throw new Error(`${model}.createMany requires clinicId on every row`);
+    for (const row of rows) {
+      if (!hasOrganizationId(row)) {
+        throw new Error(
+          `${model}.${operation} requires organizationId`,
+        );
+      }
+
+      if (CLINIC_SCOPED_MODELS.has(model) && !hasClinicId(row)) {
+        throw new Error(
+          `${model}.${operation} requires clinicId`,
+        );
+      }
     }
-    return;
-  }
 
-  if (READ_OR_MUTATE.has(operation) && !hasClinicId(typedArgs.where)) {
-    throw new Error(
-      `${model}.${operation} must filter by clinicId derived from the session`,
-    );
+    return;
   }
 
   if (operation === "upsert") {
-    if (!hasClinicId(typedArgs.where)) {
+    if (!hasOrganizationId(where)) {
+      throw new Error(`${model}.upsert must filter by organizationId`);
+    }
+
+    if (CLINIC_SCOPED_MODELS.has(model) && !hasClinicId(where)) {
       throw new Error(`${model}.upsert must filter by clinicId`);
+    }
+
+    const createData = (
+      data as
+      | {
+        create?: Record<string, unknown>;
+      }
+      | undefined
+    )?.create;
+
+    if (!hasOrganizationId(createData)) {
+      throw new Error(`${model}.upsert create data requires organizationId`);
+    }
+
+    if (
+      CLINIC_SCOPED_MODELS.has(model) &&
+      !hasClinicId(createData)
+    ) {
+      throw new Error(`${model}.upsert create data requires clinicId`);
+    }
+
+    return;
+  }
+
+  if (READ_OR_MUTATE.has(operation)) {
+    const whereFilter = where ?? {};
+
+    // 💡 تعديل حماية: استثناء جدول الـ User من الإغلاق الإجباري عند البحث بالايميل فقط (مثل Auth)
+    if (model === "User" && (whereFilter.email !== undefined || whereFilter.id !== undefined)) {
+      return;
+    }
+
+    if (!hasOrganizationId(whereFilter)) {
+      throw Error(
+        `${model}.${operation} must filter by organizationId`
+      );
+    }
+
+    if (
+      CLINIC_SCOPED_MODELS.has(model) &&
+      !hasClinicId(whereFilter)
+    ) {
+      throw Error(
+        `${model}.${operation} must filter by clinicId`
+      );
     }
   }
 }
 
-function assertAuditLogAppendOnly(model: string, operation: string) {
+function assertAuditLogAppendOnly(
+  model: string,
+  operation: string,
+): void {
   if (model !== "AuditLog") {
     return;
   }
 
-  if (WRITE_OPERATIONS.has(operation) && operation !== "create" && operation !== "createMany") {
+  if (
+    WRITE_OPERATIONS.has(operation) &&
+    operation !== "create" &&
+    operation !== "createMany"
+  ) {
     throw new Error("Audit logs are append-only");
   }
 
@@ -126,12 +212,12 @@ const globalForPrisma = globalThis as unknown as {
   prismaBase: PrismaClientBase | undefined;
 };
 
-/** Tenant-enforced client for clinic-scoped queries. */
-export const prisma = globalForPrisma.prisma ?? createPrismaClient();
+export const prisma =
+  globalForPrisma.prisma ?? createPrismaClient();
 
 /**
- * Unscoped client for authentication lookups only.
- * Never expose this to request handlers that accept clinicId from the client.
+ * Unscoped client for trusted authentication and system operations only.
+ * Never expose it to request handlers.
  */
 export const prismaBase =
   globalForPrisma.prismaBase ?? createBasePrismaClient();

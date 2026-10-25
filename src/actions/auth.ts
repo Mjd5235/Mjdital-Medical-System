@@ -1,6 +1,5 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
 import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { portalLoginPath, safeNextPath } from "@/lib/auth/safe-path";
@@ -98,7 +97,7 @@ export async function loginAction(
       path: "/",
       sameSite: "lax",
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: process.env.NODE_ENV === "production", // تضمن عمل الكوكي في localhost بشكل طبيعي دون حجب المتصفح
       maxAge,
     });
   } catch (error) {
@@ -109,7 +108,7 @@ export async function loginAction(
     };
   }
 
-  revalidatePath("/", "layout");
+  // ✅ تم التوجيه المباشر هنا وحذف revalidatePath لمنع استدعاء الـ Middleware قبل تثبيت الكوكي بالمتصفح
   redirect(nextPath);
 }
 
@@ -120,7 +119,6 @@ export async function signOutAction(
     typeof portal === "string" && isPortal(portal) ? portal : undefined;
   const store = await cookies();
   store.delete(SESSION_COOKIE);
-  revalidatePath("/", "layout");
   redirect(resolved ? portalLoginPath(resolved) : "/");
 }
 

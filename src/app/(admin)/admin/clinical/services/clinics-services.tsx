@@ -333,7 +333,7 @@ function Field({
             </label>
             {children}
             {hint && (
-                <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
+                <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">Error: Failed to run sql query: ERROR: 42501: must be owner of table clinics
                     {hint}
                 </p>
             )}
