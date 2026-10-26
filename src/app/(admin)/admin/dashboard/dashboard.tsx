@@ -6,19 +6,14 @@ import Link from "next/link";
 import {
     Activity,
     ArrowUpLeft,
-    BadgeCheck,
-    Bell,
     CalendarDays,
     Check,
-    ChevronDown,
     ChevronLeft,
     CircleDollarSign,
     Clock3,
     FileText,
     HeartPulse,
     LayoutDashboard,
-    LogOut,
-    Menu,
     Search,
     Settings,
     ShieldCheck,
@@ -26,18 +21,15 @@ import {
     Users,
     UserRoundPlus,
     Wallet,
-    X,
     Building2,
     BriefcaseMedical,
     HandCoins,
     type LucideIcon,
 } from "lucide-react";
 
-import { BrandLogo } from "@/components/brand/logo";
-import { LanguageToggle } from "@/components/portal/language-toggle";
-import { ThemeToggle } from "@/components/portal/theme-toggle";
-import { signOutFromPortalAction } from "@/actions/auth";
 import { Locale } from "@/lib/i18n/types";
+import AdminSidebar from "@/components/AdminPortalSidebar/Sidebar";
+import AdminHeader from "@/components/AdminPortalHeader/Header";
 
 type PaymentStatus = "paid" | "insured";
 
@@ -598,137 +590,6 @@ function Sidebar({
                 />
             )}
 
-            <aside
-                id="admin-sidebar"
-                className={cn(
-                    "fixed inset-y-0 z-50 flex h-screen w-[290px] flex-col border-slate-200 bg-white transition-transform duration-200 dark:border-slate-800 dark:bg-slate-950 lg:sticky lg:top-0 lg:z-20 lg:w-[264px] lg:translate-x-0",
-                    isRtl ? "right-0 border-l" : "left-0 border-r",
-                    open ? "translate-x-0" : isRtl ? "translate-x-full lg:translate-x-0" : "-translate-x-full lg:translate-x-0",
-                )}
-            >
-                <div className="flex h-[76px] items-center justify-between border-b border-slate-100 px-5 dark:border-slate-800">
-                    <div
-                        className="flex min-w-0 items-center"
-                        onClick={onClose}
-                        aria-label={t.dashboard}
-                    >
-                        <div className="max-w-40"><BrandLogo /></div>
-                    </div>
-                    <button
-                        type="button"
-                        onClick={onClose}
-                        aria-label={t.menuClose}
-                        className="rounded-xl p-2 text-slate-500 hover:bg-slate-100 lg:hidden dark:hover:bg-slate-800"
-                    >
-                        <X size={20} />
-                    </button>
-                </div>
-
-                <div className="px-4 pb-3 pt-5">
-                    <p className="mb-3 px-3 text-[11px] font-bold tracking-wider text-slate-400">
-                        {t.navigation}
-                    </p>
-
-                    <nav aria-label={t.navigation} className="space-y-1.5">
-                        {navigation.map((group) => {
-                            const GroupIcon = group.icon;
-                            const expanded = expandedGroups.includes(group.id);
-                            const containsActive = group.items.some(
-                                (item) => item.href === routes.dashboard,
-                            );
-
-                            return (
-                                <section key={group.id}>
-                                    <button
-                                        type="button"
-                                        onClick={() => toggleGroup(group.id)}
-                                        aria-expanded={expanded}
-                                        className={cn(
-                                            "flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-semibold transition-colors",
-                                            containsActive
-                                                ? "bg-teal-50 text-teal-700 dark:bg-teal-950/40 dark:text-teal-400"
-                                                : "text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-900",
-                                        )}
-                                    >
-                                        <GroupIcon size={19} className="shrink-0" />
-                                        <span className="flex-1 text-start">{group.label}</span>
-                                        <ChevronDown
-                                            size={16}
-                                            className={cn("shrink-0 transition-transform", expanded && "rotate-180")}
-                                        />
-                                    </button>
-
-                                    {expanded && (
-                                        <div
-                                            className={cn(
-                                                "mt-1 space-y-1",
-                                                isRtl
-                                                    ? "mr-5 border-r pr-3"
-                                                    : "ml-5 border-l pl-3",
-                                                "border-slate-200 dark:border-slate-700",
-                                            )}
-                                        >
-                                            {group.items.map((item) => {
-                                                const ItemIcon = item.icon;
-                                                const active = item.href === routes.dashboard;
-
-                                                return (
-                                                    <Link
-                                                        key={item.href}
-                                                        href={item.href}
-                                                        onClick={onClose}
-                                                        aria-current={active ? "page" : undefined}
-                                                        className={cn(
-                                                            "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-xs leading-5 transition-colors",
-                                                            active
-                                                                ? "bg-teal-600 font-bold text-white shadow-sm"
-                                                                : "text-slate-500 hover:bg-slate-50 hover:text-teal-700 dark:text-slate-400 dark:hover:bg-slate-900 dark:hover:text-teal-400",
-                                                        )}
-                                                    >
-                                                        <ItemIcon size={16} className="shrink-0" />
-                                                        <span>{item.label}</span>
-                                                    </Link>
-                                                );
-                                            })}
-                                        </div>
-                                    )}
-                                </section>
-                            );
-                        })}
-                    </nav>
-                </div>
-
-                <div className="mt-auto space-y-4 p-4">
-                    <div className="rounded-2xl border border-teal-100 bg-gradient-to-br from-teal-50 to-cyan-50 p-4 dark:border-teal-900 dark:from-teal-950/40 dark:to-cyan-950/30">
-                        <div className="mb-2 flex items-center gap-2">
-                            <BadgeCheck size={18} className="text-teal-600 dark:text-teal-400" />
-                            <span className="text-xs font-bold text-slate-800 dark:text-white">
-                                {t.systemStatus}
-                            </span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                            <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                            <span className="text-xs text-slate-600 dark:text-slate-300">
-                                {t.systemOnline}
-                            </span>
-                        </div>
-                    </div>
-
-                    <form action={signOutFromPortalAction.bind(null, "admin")}>
-                        <button
-                            type="submit"
-                            className="flex w-full items-center gap-3 rounded-xl border border-rose-100 px-4 py-3 text-sm font-semibold text-rose-600 transition hover:border-rose-200 hover:bg-rose-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 dark:border-rose-950 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                        >
-                            <LogOut size={18} />
-                            <span>{t.logout}</span>
-                        </button>
-                    </form>
-
-                    <p className="text-center text-[10px] text-slate-400">
-                        Mjdital Admin · 1.0
-                    </p>
-                </div>
-            </aside>
         </>
     );
 }
@@ -858,73 +719,18 @@ export default function AdminDashboardClientView({ initialLocale,
             className="min-h-screen bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100"
         >
             <div className="flex min-h-screen">
-                <Sidebar
+                <AdminSidebar
                     locale={locale}
-                    t={t}
+                    activeHref="/admin/dashboard"
                     open={sidebarOpen}
                     onClose={() => setSidebarOpen(false)}
                 />
 
                 <main className="min-w-0 flex-1">
-                    <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/90 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-950/90">
-                        <div className="flex min-h-[76px] items-center justify-between gap-3 px-4 py-3 sm:px-6 xl:px-8">
-                            <div className="flex min-w-0 items-center gap-3">
-                                <button
-                                    type="button"
-                                    aria-label={t.menuOpen}
-                                    aria-controls="admin-sidebar"
-                                    aria-expanded={sidebarOpen}
-                                    onClick={() => setSidebarOpen(true)}
-                                    className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 lg:hidden dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
-                                >
-                                    <Menu size={21} />
-                                </button>
-
-                                <div className="min-w-0">
-                                    <p className="truncate text-sm font-bold text-slate-900 dark:text-white sm:text-base">
-                                        {t.greeting}
-                                    </p>
-                                    <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                                        {t.role}
-                                    </p>
-                                </div>
-                            </div>
-
-                            <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
-                                <LanguageToggle
-                                    locale={locale}
-                                    variant="header"
-                                />
-
-                                <ThemeToggle
-                                    lightLabel={locale === "ar" ? "الوضع الفاتح" : "Light mode"}
-                                    darkLabel={locale === "ar" ? "الوضع الداكن" : "Dark mode"}
-                                    variant="header"
-                                />
-
-                                <button
-                                    type="button"
-                                    aria-label={t.notifications}
-                                    className="relative grid h-10 w-10 place-items-center rounded-xl text-slate-600 transition hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-                                >
-                                    <Bell size={20} />
-
-                                    <span
-                                        className={cn(
-                                            "absolute top-2 h-2 w-2 rounded-full border-2 border-white bg-rose-500 dark:border-slate-950",
-                                            isRtl ? "right-2" : "left-2",
-                                        )}
-                                    />
-                                </button>
-
-                                <div className="hidden h-8 w-px bg-slate-200 sm:block dark:bg-slate-700" />
-
-                                <div className="hidden h-10 w-10 place-items-center rounded-full bg-teal-50 text-teal-700 sm:grid dark:bg-teal-950/50 dark:text-teal-400">
-                                    <Users size={20} />
-                                </div>
-                            </div>
-                        </div>
-                    </header>
+                    <AdminHeader
+                        locale={locale}
+                        onMenuOpen={() => setSidebarOpen(true)}
+                    />
 
                     <div className="mx-auto max-w-[1600px] space-y-6 p-4 sm:p-6 xl:p-8">
                         <section className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">

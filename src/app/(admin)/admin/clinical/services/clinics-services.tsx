@@ -22,18 +22,13 @@ import {
     Hospital,
     Pencil,
     Plus,
-    Menu,
     Power,
     PowerOff,
     Search,
     ShieldCheck,
     X,
-    Bell,
-    Users,
 } from "lucide-react";
 
-import { LanguageToggle } from "@/components/portal/language-toggle";
-import { ThemeToggle } from "@/components/portal/theme-toggle";
 import AdminSidebar from "@/components/AdminPortalSidebar/Sidebar";
 import type { Locale } from "@/lib/i18n/types";
 
@@ -52,6 +47,7 @@ import {
     type UpdateClinicInput,
     type UpdateServiceInput,
 } from "@/actions/clinicsActions";
+import AdminHeader from "@/components/AdminPortalHeader/Header";
 
 type ClinicsServicesProps = {
     initialLocale: Locale;
@@ -110,6 +106,13 @@ const specialties: {
         { code: "CARD", en: "Cardiology", ar: "أمراض القلب", nphies: "CARD-04" },
         { code: "IM", en: "Internal Medicine", ar: "الطب الباطني", nphies: "IM-05" },
         { code: "GEN", en: "General Medicine", ar: "الطب العام", nphies: "GEN-06" },
+        { code: "OBG", en: "Obstetrics & Gynecology", ar: "النساء والولادة", nphies: "OBG-07" },
+        { code: "ORT", en: "Orthopedics", ar: "جراحة العظام", nphies: "ORT-08" },
+        { code: "OPH", en: "Ophthalmology", ar: "طب العيون", nphies: "OPH-09" },
+        { code: "ENT", en: "ENT / Otolaryngology", ar: "أنف وأذن وحنجرة", nphies: "ENT-10" },
+        { code: "LAB", en: "Laboratory", ar: "المختبر / التحاليل", nphies: "LAB-11" },
+        { code: "RAD", en: "Radiology", ar: "الأشعة / السونار", nphies: "RAD-12" }
+
     ];
 
 const translations = {
@@ -166,6 +169,7 @@ const translations = {
         specialtyRequired: "يرجى اختيار التخصص.",
         codeRequired: "يرجى إدخال رمز صالح.",
         clinicRequired: "يرجى اختيار عيادة نشطة.",
+        serviceClinicInactive: "لا يمكن تفعيل الخدمة لأن العيادة المرتبطة بها معطلة حالياً. يرجى تفعيل العيادة أولاً.",
         priceRequired: "يرجى إدخال سعر صالح.",
         close: "إغلاق النافذة",
         newClinic: "عيادة جديدة",
@@ -254,6 +258,7 @@ const translations = {
         specialtyRequired: "Select a specialty.",
         codeRequired: "Enter a valid code.",
         clinicRequired: "Select an active clinic.",
+        serviceClinicInactive: "This service cannot be activated because its associated clinic is inactive. Activate the clinic first.",
         priceRequired: "Enter a valid price.",
         close: "Close dialog",
         newClinic: "New Clinic",
@@ -462,6 +467,39 @@ export default function ClinicsServicesPage({ initialLocale,
         [clinics],
     );
 
+    const generateServiceCode = useCallback(
+        (clinicId: string) => {
+            const clinic = clinics.find((item) => item.id === clinicId);
+            if (!clinic) return "";
+
+            const prefix = specialties.some(
+                (item) => item.code === clinic.specialty,
+            )
+                ? clinic.specialty!
+                : "GEN";
+
+            const existingCodes = services
+                .filter((service) => service.clinicId === clinicId)
+                .map((service) => service.code);
+
+            let maxNumber = 100;
+
+            for (const code of existingCodes) {
+                const match = new RegExp(
+                    `^${prefix}-(\\d+)$`,
+                    "i",
+                ).exec(code);
+
+                if (match) {
+                    maxNumber = Math.max(maxNumber, Number(match[1]));
+                }
+            }
+
+            return `${prefix}-${maxNumber + 1}`;
+        },
+        [clinics, services],
+    );
+
     const filteredClinics = useMemo(() => {
         const query = search.trim().toLocaleLowerCase(
             locale === "ar" ? "ar-SA" : "en",
@@ -540,9 +578,11 @@ export default function ClinicsServicesPage({ initialLocale,
     };
 
     const resetServiceForm = () => {
+        const clinicId = activeClinics[0]?.id ?? "";
+
         setServiceForm({
-            clinicId: activeClinics[0]?.id ?? "",
-            code: "",
+            clinicId,
+            code: generateServiceCode(clinicId),
             nameEn: "",
             nameAr: "",
             basePrice: "",
@@ -728,7 +768,7 @@ export default function ClinicsServicesPage({ initialLocale,
             return;
         }
 
-        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,39}$/.test(serviceForm.code.trim())) {
+        if (!editingService && !/^[A-Za-z0-9][A-Za-z0-9._-]{1,39}$/.test(serviceForm.code.trim())) {
             setError(t.codeRequired);
             return;
         }
@@ -740,7 +780,7 @@ export default function ClinicsServicesPage({ initialLocale,
             return;
         }
 
-        if (editingService && !serviceForm.clinicId) {
+        if (!clinics.some((clinic) => clinic.id === serviceForm.clinicId && clinic.isActive)) {
             setError(t.clinicRequired);
             return;
         }
@@ -753,7 +793,12 @@ export default function ClinicsServicesPage({ initialLocale,
         setSubmitting(true);
 
         try {
-            const code = serviceForm.code.trim().toUpperCase();
+            const code = (
+                editingService &&
+                    serviceForm.clinicId !== editingService.clinicId
+                    ? generateServiceCode(serviceForm.clinicId)
+                    : serviceForm.code
+            ).trim().toUpperCase();
             const nameEn = serviceForm.nameEn.trim();
             const nameAr = serviceForm.nameAr.trim();
             const basePrice = baseAmount.toFixed(2);
@@ -761,6 +806,7 @@ export default function ClinicsServicesPage({ initialLocale,
 
             if (editingService) {
                 const input: UpdateServiceInput = {
+                    clinicId: serviceForm.clinicId,
                     code,
                     nameEn,
                     nameAr,
@@ -822,6 +868,7 @@ export default function ClinicsServicesPage({ initialLocale,
         }
     };
 
+
     const handleToggleStatus = async () => {
         if (!statusTarget || statusSubmitting) return;
 
@@ -847,7 +894,28 @@ export default function ClinicsServicesPage({ initialLocale,
                             : clinic,
                     ),
                 );
+
+                // إذا تم تعطيل العيادة، عطّل خدماتها في الواجهة أيضًا
+                if (statusTarget.isActive) {
+                    setServices((current) =>
+                        current.map((service) =>
+                            service.clinicId === statusTarget.id
+                                ? { ...service, isActive: false }
+                                : service,
+                        ),
+                    );
+                }
             } else {
+                const targetService = services.find((service) => service.id === statusTarget.id);
+                const associatedClinic = targetService
+                    ? clinics.find((clinic) => clinic.id === targetService.clinicId)
+                    : undefined;
+
+                if (!statusTarget.isActive && (!associatedClinic || !associatedClinic.isActive)) {
+                    setError(t.serviceClinicInactive);
+                    return;
+                }
+
                 const result = await toggleServiceStatusAction(
                     statusTarget.id,
                     !statusTarget.isActive,
@@ -875,6 +943,7 @@ export default function ClinicsServicesPage({ initialLocale,
             setStatusSubmitting(false);
         }
     };
+
 
     const currentCount =
         tab === "clinics"
@@ -907,65 +976,10 @@ export default function ClinicsServicesPage({ initialLocale,
 
                 <div className="min-w-0 flex-1">
 
-                    <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/90 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-950/90">
-                        <div className="flex min-h-[76px] items-center justify-between gap-3 px-4 py-3 sm:px-6 xl:px-8">
-                            <div className="flex min-w-0 items-center gap-3">
-                                <button
-                                    type="button"
-                                    aria-label={t.menuOpen}
-                                    aria-controls="admin-sidebar"
-                                    aria-expanded={sidebarOpen}
-                                    onClick={() => setSidebarOpen(true)}
-                                    className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 lg:hidden dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
-                                >
-                                    <Menu size={21} />
-                                </button>
-
-                                <div className="min-w-0">
-                                    <p className="truncate text-sm font-bold text-slate-900 dark:text-white sm:text-base">
-                                        {t.greeting}
-                                    </p>
-                                    <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                                        {t.role}
-                                    </p>
-                                </div>
-                            </div>
-
-                            <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
-                                <LanguageToggle
-                                    locale={locale}
-                                    variant="header"
-                                />
-
-                                <ThemeToggle
-                                    lightLabel={locale === "ar" ? "الوضع الفاتح" : "Light mode"}
-                                    darkLabel={locale === "ar" ? "الوضع الداكن" : "Dark mode"}
-                                    variant="header"
-                                />
-
-                                <button
-                                    type="button"
-                                    aria-label={t.notifications}
-                                    className="relative grid h-10 w-10 place-items-center rounded-xl text-slate-600 transition hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-                                >
-                                    <Bell size={20} />
-
-                                    <span
-                                        className={cn(
-                                            "absolute top-2 h-2 w-2 rounded-full border-2 border-white bg-rose-500 dark:border-slate-950",
-                                            isRtl ? "right-2" : "left-2",
-                                        )}
-                                    />
-                                </button>
-
-                                <div className="hidden h-8 w-px bg-slate-200 sm:block dark:bg-slate-700" />
-
-                                <div className="hidden h-10 w-10 place-items-center rounded-full bg-teal-50 text-teal-700 sm:grid dark:bg-teal-950/50 dark:text-teal-400">
-                                    <Users size={20} />
-                                </div>
-                            </div>
-                        </div>
-                    </header>
+                    <AdminHeader
+                        locale={locale}
+                        onMenuOpen={() => setSidebarOpen(true)}
+                    />
 
                     <main className="mx-auto max-w-[1800px] space-y-6 p-4 sm:p-6 xl:p-8">
                         <section className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
@@ -1701,63 +1715,66 @@ export default function ClinicsServicesPage({ initialLocale,
                                         maxLength={40}
                                         pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,39}"
                                         value={serviceForm.code}
-                                        onChange={(event) =>
-                                            setServiceForm((current) => ({
-                                                ...current,
-                                                code: event.target.value.toUpperCase(),
-                                            }))
-                                        }
-                                        placeholder="e.g. INT-DENT-01"
-                                        className={cn(inputClass, "font-mono text-left")}
+                                        readOnly
+                                        aria-readonly="true"
+                                        placeholder="e.g. PED-101"
+                                        className={cn(
+                                            inputClass,
+                                            "font-mono text-left cursor-not-allowed",
+                                        )}
                                         dir="ltr"
                                     />
                                 </Field>
 
-                                {/*
-                                  * عند تعديل خدمة، نعرض العيادة المرتبطة للقراءة فقط.
-                                  * لا تغيّر updateServiceAction ارتباط الخدمة بعيادة أخرى.
-                                  */}
-                                {editingService ? (
-                                    <Field label={t.associatedClinic}>
-                                        <input
-                                            readOnly
-                                            value={clinicName(editingService.clinic)}
-                                            className={cn(inputClass, "cursor-not-allowed")}
-                                        />
-                                    </Field>
-                                ) : (
-                                    <Field label={t.associatedClinic}>
-                                        <div className="relative">
-                                            <select
-                                                required
-                                                value={serviceForm.clinicId}
-                                                onChange={(event) =>
-                                                    setServiceForm((current) => ({
-                                                        ...current,
-                                                        clinicId: event.target.value,
-                                                    }))
+                                <Field label={t.associatedClinic}>
+                                    <div className="relative">
+                                        <select
+                                            required
+                                            value={serviceForm.clinicId}
+                                            onChange={(event) => {
+                                                const clinicId = event.target.value;
+                                                const selectedClinic = clinics.find(
+                                                    (clinic) => clinic.id === clinicId,
+                                                );
+
+                                                setServiceForm((current) => ({
+                                                    ...current,
+                                                    clinicId,
+                                                    code: generateServiceCode(clinicId),
+                                                }));
+
+                                                if (selectedClinic && !selectedClinic.isActive) {
+                                                    setError(
+                                                        "لا يمكن ربط الخدمة بعيادة معطلة. يرجى تفعيل العيادة أولاً.",
+                                                    );
+                                                } else {
+                                                    setError("");
                                                 }
-                                                className={cn(inputClass, "appearance-none pe-10")}
-                                            >
-                                                <option value="" disabled>
-                                                    {t.chooseClinic}
+                                            }}
+                                            className={cn(inputClass, "appearance-none pe-10")}
+                                        >
+                                            <option value="" disabled>
+                                                {t.chooseClinic}
+                                            </option>
+                                            {clinics.map((clinic) => (
+                                                <option
+                                                    key={clinic.id}
+                                                    value={clinic.id}
+                                                    disabled={!clinic.isActive}
+                                                >
+                                                    {clinicName(clinic)}{!clinic.isActive ? ` (${t.inactive})` : ""}
                                                 </option>
-                                                {activeClinics.map((clinic) => (
-                                                    <option key={clinic.id} value={clinic.id}>
-                                                        {clinicName(clinic)}
-                                                    </option>
-                                                ))}
-                                            </select>
-                                            <ChevronDown
-                                                size={16}
-                                                className={cn(
-                                                    "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                    isRtl ? "left-3" : "right-3",
-                                                )}
-                                            />
-                                        </div>
-                                    </Field>
-                                )}
+                                            ))}
+                                        </select>
+                                        <ChevronDown
+                                            size={16}
+                                            className={cn(
+                                                "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
+                                                isRtl ? "left-3" : "right-3",
+                                            )}
+                                        />
+                                    </div>
+                                </Field>
 
                                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                                     <Field label={t.basePrice}>
@@ -1945,7 +1962,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                         {statusTarget.isActive
                                             ? t.confirmDisable
                                             : t.confirmEnable}{" "}
-                                        {statusTarget.name}؟
+                                        {statusTarget.name}?
                                     </p>
                                 </div>
 

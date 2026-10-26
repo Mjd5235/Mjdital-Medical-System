@@ -1,9 +1,9 @@
-
 "use server";
 
 import { Prisma } from "@prisma/client";
 import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/db/prisma";
+import { requirePortalSession } from "@/lib/auth/guard";
 
 const MANAGEMENT_PATH = "/admin/clinical/services";
 
@@ -14,12 +14,17 @@ const ALLOWED_SPECIALTIES = [
     "CARD",
     "IM",
     "GEN",
+    "OBG",
+    "ORT",
+    "OPH",
+    "ENT",
+    "LAB",
+    "RAD",
 ] as const;
 
 const ALLOWED_VAT_RATES = [0, 15] as const;
 
-export type ClinicSpecialty =
-    (typeof ALLOWED_SPECIALTIES)[number];
+export type ClinicSpecialty = (typeof ALLOWED_SPECIALTIES)[number];
 
 export interface CreateClinicInput {
     nameEn: string;
@@ -46,6 +51,8 @@ export interface CreateServiceInput {
 }
 
 export interface UpdateServiceInput {
+    clinicId: string;
+    // Kept for compatibility with existing callers; the server deliberately ignores it.
     code: string;
     nameEn: string;
     nameAr: string;
@@ -67,14 +74,10 @@ function cleanText(value: unknown): string {
 }
 
 function validUuid(value: string): boolean {
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        value,
-    );
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-function parseMoney(
-    value: string | number,
-): Prisma.Decimal | null {
+function parseMoney(value: string | number): Prisma.Decimal | null {
     const normalized = String(value).trim();
 
     if (!/^\d{1,10}(?:\.\d{1,2})?$/.test(normalized)) {
@@ -181,12 +184,7 @@ function validClinicFields(input: UpdateClinicInput) {
     const specialty = cleanText(input?.specialty);
     const nphiesCode = cleanText(input?.nphiesCode).toUpperCase();
 
-    if (
-        !nameEn ||
-        !nameAr ||
-        nameEn.length > 150 ||
-        nameAr.length > 150
-    ) {
+    if (!nameEn || !nameAr || nameEn.length > 150 || nameAr.length > 150) {
         return {
             success: false as const,
             error: "Enter both clinic names, up to 150 characters each.",
@@ -221,14 +219,21 @@ function validClinicFields(input: UpdateClinicInput) {
     };
 }
 
-function validServiceFields(input: UpdateServiceInput) {
+function validServiceFields(
+    input: UpdateServiceInput | CreateServiceInput,
+    options: { requireCode?: boolean } = {},
+) {
+    const requireCode = options.requireCode ?? true;
     const code = cleanText(input?.code).toUpperCase();
     const nameEn = cleanText(input?.nameEn);
     const nameAr = cleanText(input?.nameAr);
     const basePrice = parseMoney(input?.basePrice);
     const vatRate = Number(input?.vatRate);
 
-    if (!/^[A-Z0-9][A-Z0-9._-]{1,39}$/.test(code)) {
+    if (
+        requireCode &&
+        !/^[A-Z0-9][A-Z0-9._-]{1,39}$/.test(code)
+    ) {
         return {
             success: false as const,
             error: "Enter a valid service code (2–40 characters).",
@@ -282,7 +287,34 @@ function databaseError<T>(
     error: unknown,
     message: string,
 ): ActionResult<T> {
+    // Keep details in server logs; return a safe, actionable message to the client.
     console.error(`[${action}]`, error);
+
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        if (error.code === "P2002") {
+            return {
+                success: false,
+                error: "A record with the same unique value already exists.",
+                code: "DUPLICATE_RECORD",
+            };
+        }
+
+        if (error.code === "P2003") {
+            return {
+                success: false,
+                error: "This record cannot be changed because it is referenced by other records.",
+                code: "RELATED_RECORD_CONSTRAINT",
+            };
+        }
+
+        if (error.code === "P2025") {
+            return {
+                success: false,
+                error: "The record no longer exists. Refresh the page and try again.",
+                code: "RECORD_NOT_FOUND",
+            };
+        }
+    }
 
     return {
         success: false,
@@ -291,25 +323,32 @@ function databaseError<T>(
     };
 }
 
-/**
- * Fetch all clinics, including inactive clinics.
- */
+function notFound<T>(message: string, code: string): ActionResult<T> {
+    return { success: false, error: message, code };
+}
+
+const serviceClinicInclude = {
+    clinic: {
+        select: {
+            id: true,
+            nameAr: true,
+            nameEn: true,
+        },
+    },
+} as const;
+
 export async function getClinicsData() {
+    const session = await requirePortalSession("admin");
+
     try {
         const clinics = await prisma.clinic.findMany({
-            orderBy: [
-                { isActive: "desc" },
-                { nameEn: "asc" },
-            ],
+            where: { organizationId: session.organizationId },
+            orderBy: [{ isActive: "desc" }, { nameEn: "asc" }],
         });
 
-        return {
-            success: true as const,
-            data: clinics.map(mapClinic),
-        };
+        return { success: true as const, data: clinics.map(mapClinic) };
     } catch (error) {
         console.error("[getClinicsData]", error);
-
         return {
             success: false as const,
             data: [],
@@ -318,31 +357,21 @@ export async function getClinicsData() {
     }
 }
 
-/**
- * Fetch services and their related clinics.
- */
 export async function getServicesData() {
+    const session = await requirePortalSession("admin");
+
     try {
         const services = await prisma.service.findMany({
-            include: {
-                clinic: {
-                    select: {
-                        id: true,
-                        nameAr: true,
-                        nameEn: true,
-                    },
-                },
+            where: {
+                clinic: { is: { organizationId: session.organizationId } },
             },
+            include: serviceClinicInclude,
             orderBy: { createdAt: "desc" },
         });
 
-        return {
-            success: true as const,
-            data: services.map(mapService),
-        };
+        return { success: true as const, data: services.map(mapService) };
     } catch (error) {
         console.error("[getServicesData]", error);
-
         return {
             success: false as const,
             data: [],
@@ -351,236 +380,224 @@ export async function getServicesData() {
     }
 }
 
-/**
- * Create a clinic.
- */
 export async function createClinicAction(
     input: CreateClinicInput,
 ): Promise<ActionResult<ReturnType<typeof mapClinic>>> {
+    const session = await requirePortalSession("admin");
     const parsed = validClinicFields(input);
 
-    if (!parsed.success) {
-        return parsed;
+    if (!parsed.success) return parsed;
+
+    if (typeof input?.isActive !== "boolean") {
+        return notFound("Invalid clinic status.", "INVALID_INPUT");
     }
 
     try {
         const clinic = await prisma.clinic.create({
             data: {
                 ...parsed.data,
-                isActive: input.isActive === true,
+                organizationId: session.organizationId,
+                isActive: input.isActive,
             },
         });
 
         revalidatePath(MANAGEMENT_PATH);
-
-        return {
-            success: true,
-            data: mapClinic(clinic),
-        };
+        return { success: true, data: mapClinic(clinic) };
     } catch (error) {
         return databaseError(
             "createClinicAction",
             error,
-            "Unable to create the clinic. Please try again.",
+            "Unable to create the clinic. Please check the entered values and try again.",
         );
     }
 }
 
-/**
- * Update clinic names, specialty, and NPHIES/catalog code.
- * Status is deliberately managed by toggleClinicStatusAction.
- */
 export async function updateClinicAction(
     id: string,
     input: UpdateClinicInput,
 ): Promise<ActionResult<ReturnType<typeof mapClinic>>> {
+    const session = await requirePortalSession("admin");
+
     if (!validUuid(id)) {
-        return {
-            success: false,
-            error: "Invalid clinic identifier.",
-            code: "INVALID_CLINIC_ID",
-        };
+        return notFound("Invalid clinic identifier.", "INVALID_CLINIC_ID");
     }
 
     const parsed = validClinicFields(input);
-
-    if (!parsed.success) {
-        return parsed;
-    }
+    if (!parsed.success) return parsed;
 
     try {
+        const existing = await prisma.clinic.findFirst({
+            where: { id, organizationId: session.organizationId },
+            select: { id: true },
+        });
+
+        if (!existing) {
+            return notFound(
+                "The clinic was not found in your organization.",
+                "CLINIC_NOT_FOUND",
+            );
+        }
+
         const clinic = await prisma.clinic.update({
-            where: { id },
+            where: { id: existing.id },
             data: parsed.data,
         });
 
         revalidatePath(MANAGEMENT_PATH);
-
-        return {
-            success: true,
-            data: mapClinic(clinic),
-        };
+        return { success: true, data: mapClinic(clinic) };
     } catch (error) {
-        if (
-            error instanceof Prisma.PrismaClientKnownRequestError &&
-            error.code === "P2025"
-        ) {
-            return {
-                success: false,
-                error: "The clinic no longer exists.",
-                code: "CLINIC_NOT_FOUND",
-            };
-        }
-
         return databaseError(
             "updateClinicAction",
             error,
-            "Unable to update the clinic. Please try again.",
+            "Unable to update the clinic. Please check the entered values and try again.",
         );
     }
 }
 
-/**
- * Activate or deactivate a clinic.
- */
 export async function toggleClinicStatusAction(
     id: string,
     isActive: boolean,
 ): Promise<ActionResult<ReturnType<typeof mapClinic>>> {
+    const session = await requirePortalSession("admin");
+
     if (!validUuid(id) || typeof isActive !== "boolean") {
-        return {
-            success: false,
-            error: "Invalid clinic identifier or status.",
-            code: "INVALID_INPUT",
-        };
+        return notFound("Invalid clinic identifier or status.", "INVALID_INPUT");
     }
 
     try {
-        const clinic = await prisma.clinic.update({
-            where: { id },
-            data: { isActive },
+        const clinic = await prisma.$transaction(async (tx) => {
+            const existing = await tx.clinic.findFirst({
+                where: { id, organizationId: session.organizationId },
+                select: { id: true },
+            });
+
+            if (!existing) throw new Error("CLINIC_NOT_FOUND");
+
+            const updatedClinic = await tx.clinic.update({
+                where: { id: existing.id },
+                data: { isActive },
+            });
+
+            // Deactivating a clinic always deactivates its services.
+            // Reactivating the clinic does not reactivate services automatically.
+            if (!isActive) {
+                await tx.service.updateMany({
+                    where: {
+                        clinicId: existing.id,
+                        organizationId: session.organizationId,
+                    },
+                    data: { isActive: false },
+                });
+            }
+
+            return updatedClinic;
+        }, {
+            maxWait: 10_000,
+            timeout: 20_000,
         });
 
         revalidatePath(MANAGEMENT_PATH);
-
-        return {
-            success: true,
-            data: mapClinic(clinic),
-        };
+        return { success: true, data: mapClinic(clinic) };
     } catch (error) {
-        if (
-            error instanceof Prisma.PrismaClientKnownRequestError &&
-            error.code === "P2025"
-        ) {
-            return {
-                success: false,
-                error: "The clinic no longer exists.",
-                code: "CLINIC_NOT_FOUND",
-            };
+        if (error instanceof Error && error.message === "CLINIC_NOT_FOUND") {
+            return notFound(
+                "The clinic was not found in your organization.",
+                "CLINIC_NOT_FOUND",
+            );
         }
 
         return databaseError(
             "toggleClinicStatusAction",
             error,
-            "Unable to change the clinic status.",
+            "Unable to change the clinic status. Please try again.",
         );
     }
 }
 
-/**
- * Create a service. New services start active.
- */
+function generateNextServiceCode(
+    specialty: string | null | undefined,
+    existingCodes: string[],
+): string {
+    const prefix = specialtyCodes.has(specialty ?? "") ? specialty! : "GEN";
+    let maxNumber = 100;
+
+    for (const code of existingCodes) {
+        const match = new RegExp(`^${prefix}-(\\d+)$`, "i").exec(code);
+        if (match) maxNumber = Math.max(maxNumber, Number(match[1]));
+    }
+
+    return `${prefix}-${maxNumber + 1}`;
+}
+
 export async function createServiceAction(
     input: CreateServiceInput,
 ): Promise<ActionResult<ReturnType<typeof mapService>>> {
+    const session = await requirePortalSession("admin");
     const clinicId = cleanText(input?.clinicId);
 
     if (!validUuid(clinicId)) {
-        return {
-            success: false,
-            error: "Select a valid clinic.",
-            code: "INVALID_CLINIC",
-        };
+        return notFound("Select a valid clinic.", "INVALID_CLINIC");
     }
 
-    const parsed = validServiceFields(input);
+    const parsed = validServiceFields(input, {
+        requireCode: false,
+    });
 
-    if (!parsed.success) {
-        return parsed;
-    }
+    if (!parsed.success) return parsed;
 
     try {
         const result = await prisma.$transaction(async (tx) => {
-            const clinic = await tx.clinic.findUnique({
-                where: { id: clinicId },
-                select: { id: true, isActive: true },
-            });
-
-            if (!clinic || !clinic.isActive) {
-                throw new Error("CLINIC_NOT_ACTIVE");
-            }
-
-            const duplicate = await tx.service.findUnique({
+            const clinic = await tx.clinic.findFirst({
                 where: {
-                    clinicId_code: {
-                        clinicId,
-                        code: parsed.data.code,
-                    },
+                    id: clinicId,
+                    organizationId: session.organizationId,
+                    isActive: true,
                 },
-                select: { id: true },
+                select: { id: true, specialty: true },
             });
 
-            if (duplicate) {
-                throw new Error("DUPLICATE_SERVICE_CODE");
-            }
+            if (!clinic) throw new Error("CLINIC_NOT_AVAILABLE");
+
+            const existingServices = await tx.service.findMany({
+                where: { organizationId: session.organizationId, clinicId },
+                select: { code: true },
+            });
+
+            // Always generate the code on the server; never trust a client-supplied code.
+            const code = generateNextServiceCode(
+                clinic.specialty,
+                existingServices.map((service) => service.code),
+            );
 
             const service = await tx.service.create({
                 data: {
+                    organizationId: session.organizationId,
                     clinicId,
-                    code: parsed.data.code,
+                    code,
                     nameEn: parsed.data.nameEn,
                     nameAr: parsed.data.nameAr,
                     basePrice: parsed.data.basePrice,
                     vatRate: new Prisma.Decimal(parsed.data.vatRate),
                     isActive: true,
                 },
-                include: {
-                    clinic: {
-                        select: {
-                            id: true,
-                            nameAr: true,
-                            nameEn: true,
-                        },
-                    },
-                },
+                include: serviceClinicInclude,
             });
 
             return mapService(service);
+        }, {
+            maxWait: 10_000,
+            timeout: 20_000,
         });
 
         revalidatePath(MANAGEMENT_PATH);
-
-        return {
-            success: true,
-            data: result,
-        };
+        return { success: true, data: result };
     } catch (error) {
-        if (error instanceof Error) {
-            if (error.message === "DUPLICATE_SERVICE_CODE") {
-                return {
-                    success: false,
-                    error: "This service code already exists in the selected clinic.",
-                    code: "DUPLICATE_SERVICE_CODE",
-                };
-            }
-
-            if (error.message === "CLINIC_NOT_ACTIVE") {
-                return {
-                    success: false,
-                    error: "The selected clinic is inactive or no longer exists.",
-                    code: "CLINIC_NOT_ACTIVE",
-                };
-            }
+        if (error instanceof Error && error.message === "CLINIC_NOT_AVAILABLE") {
+            return {
+                success: false,
+                error: "The selected clinic is inactive, unavailable, or outside your organization.",
+                code: "CLINIC_NOT_AVAILABLE",
+            };
         }
 
         if (
@@ -597,189 +614,245 @@ export async function createServiceAction(
         return databaseError(
             "createServiceAction",
             error,
-            "Unable to create the service. Please try again.",
+            "Unable to create the service. Please check the entered values and try again.",
         );
     }
 }
 
-/**
- * Update service information and pricing.
- * The clinic association is intentionally unchanged.
- */
 export async function updateServiceAction(
     id: string,
     input: UpdateServiceInput,
 ): Promise<ActionResult<ReturnType<typeof mapService>>> {
+    const session = await requirePortalSession("admin");
+
     if (!validUuid(id)) {
-        return {
-            success: false,
-            error: "Invalid service identifier.",
-            code: "INVALID_SERVICE_ID",
-        };
+        return notFound("Invalid service identifier.", "INVALID_SERVICE_ID");
+    }
+
+    const clinicId = cleanText(input?.clinicId);
+    if (!validUuid(clinicId)) {
+        return notFound("Select a valid clinic.", "INVALID_CLINIC");
     }
 
     const parsed = validServiceFields(input);
-
-    if (!parsed.success) {
-        return parsed;
-    }
+    if (!parsed.success) return parsed;
 
     try {
         const service = await prisma.$transaction(async (tx) => {
-            const existing = await tx.service.findUnique({
-                where: { id },
-                select: {
-                    id: true,
-                    clinicId: true,
+            const existing = await tx.service.findFirst({
+                where: {
+                    id,
+                    organizationId: session.organizationId,
+                    clinic: {
+                        is: { organizationId: session.organizationId },
+                    },
                 },
+                select: { id: true, code: true, clinicId: true },
             });
 
-            if (!existing) {
-                throw new Error("SERVICE_NOT_FOUND");
-            }
+            if (!existing) throw new Error("SERVICE_NOT_FOUND");
 
-            const duplicate = await tx.service.findUnique({
+            // A service can only be associated with an active clinic in the same organization.
+            const targetClinic = await tx.clinic.findFirst({
                 where: {
-                    clinicId_code: {
-                        clinicId: existing.clinicId,
-                        code: parsed.data.code,
-                    },
+                    id: clinicId,
+                    organizationId: session.organizationId,
+                    isActive: true,
                 },
                 select: { id: true },
             });
 
-            if (duplicate && duplicate.id !== id) {
-                throw new Error("DUPLICATE_SERVICE_CODE");
-            }
+            if (!targetClinic) throw new Error("CLINIC_NOT_AVAILABLE");
+
+            const existingCodes = await tx.service.findMany({
+                where: {
+                    organizationId: session.organizationId,
+                    clinicId: targetClinic.id,
+                    NOT: { id },
+                },
+                select: { code: true },
+            });
+
+            // Recalculate the service code on the server using the destination clinic's specialty
+            // and latest numbering. The client code is only a live preview, never authoritative.
+            const targetClinicDetails = await tx.clinic.findFirst({
+                where: {
+                    id: targetClinic.id,
+                    organizationId: session.organizationId,
+                    isActive: true,
+                },
+                select: { specialty: true },
+            });
+
+            if (!targetClinicDetails) throw new Error("CLINIC_NOT_AVAILABLE");
+
+            const generatedCode =
+                existing.clinicId === targetClinic.id
+                    ? existing.code
+                    : generateNextServiceCode(
+                        targetClinicDetails.specialty,
+                        existingCodes.map((service) => service.code),
+                    );
+
+            const duplicate = await tx.service.findFirst({
+                where: {
+                    organizationId: session.organizationId,
+                    clinicId: targetClinic.id,
+                    code: generatedCode,
+                    NOT: { id },
+                },
+                select: { id: true },
+            });
+
+            if (duplicate) throw new Error("DUPLICATE_SERVICE_CODE");
 
             return tx.service.update({
-                where: { id },
+                where: { id: existing.id },
                 data: {
-                    code: parsed.data.code,
+                    clinicId: targetClinic.id,
+                    code: generatedCode,
                     nameEn: parsed.data.nameEn,
                     nameAr: parsed.data.nameAr,
                     basePrice: parsed.data.basePrice,
                     vatRate: new Prisma.Decimal(parsed.data.vatRate),
                 },
-                include: {
-                    clinic: {
-                        select: {
-                            id: true,
-                            nameAr: true,
-                            nameEn: true,
-                        },
-                    },
-                },
+                include: serviceClinicInclude,
             });
+        }, {
+            maxWait: 10_000,
+            timeout: 20_000,
         });
 
         revalidatePath(MANAGEMENT_PATH);
+        return { success: true, data: mapService(service) };
 
-        return {
-            success: true,
-            data: mapService(service),
-        };
     } catch (error) {
+        console.error("[updateServiceAction] Full error:", error);
+
         if (error instanceof Error) {
             if (error.message === "SERVICE_NOT_FOUND") {
-                return {
-                    success: false,
-                    error: "The service no longer exists.",
-                    code: "SERVICE_NOT_FOUND",
-                };
+                return notFound(
+                    "The service was not found in your organization.",
+                    "SERVICE_NOT_FOUND",
+                );
+            }
+
+            if (error.message === "CLINIC_NOT_AVAILABLE") {
+                return notFound(
+                    "The selected clinic is inactive, unavailable, or outside your organization. Activate the clinic first.",
+                    "CLINIC_NOT_AVAILABLE",
+                );
             }
 
             if (error.message === "DUPLICATE_SERVICE_CODE") {
-                return {
-                    success: false,
-                    error: "This service code already exists in the selected clinic.",
-                    code: "DUPLICATE_SERVICE_CODE",
-                };
+                return notFound(
+                    "This service code already exists in the selected clinic.",
+                    "DUPLICATE_SERVICE_CODE",
+                );
             }
-        }
-
-        if (
-            error instanceof Prisma.PrismaClientKnownRequestError &&
-            error.code === "P2025"
-        ) {
-            return {
-                success: false,
-                error: "The service no longer exists.",
-                code: "SERVICE_NOT_FOUND",
-            };
         }
 
         if (
             error instanceof Prisma.PrismaClientKnownRequestError &&
             error.code === "P2002"
         ) {
-            return {
-                success: false,
-                error: "This service code already exists in the selected clinic.",
-                code: "DUPLICATE_SERVICE_CODE",
-            };
+            return notFound(
+                "This service code already exists in the selected clinic.",
+                "DUPLICATE_SERVICE_CODE",
+            );
         }
+
+        const errorMessage =
+            error instanceof Error
+                ? error.message
+                : String(error);
 
         return databaseError(
             "updateServiceAction",
             error,
-            "Unable to update the service. Please try again.",
+            process.env.NODE_ENV === "production"
+                ? "Unable to update the service. Please check the entered values and try again."
+                : `Unable to update the service: ${errorMessage}`,
         );
     }
 }
 
-/**
- * Activate or deactivate a service.
- */
 export async function toggleServiceStatusAction(
     id: string,
     isActive: boolean,
 ): Promise<ActionResult<ReturnType<typeof mapService>>> {
+    const session = await requirePortalSession("admin");
+
     if (!validUuid(id) || typeof isActive !== "boolean") {
-        return {
-            success: false,
-            error: "Invalid service identifier or status.",
-            code: "INVALID_INPUT",
-        };
+        return notFound("Invalid service identifier or status.", "INVALID_INPUT");
     }
 
     try {
-        const service = await prisma.service.update({
-            where: { id },
-            data: { isActive },
-            include: {
-                clinic: {
-                    select: {
-                        id: true,
-                        nameAr: true,
-                        nameEn: true,
+        const service = await prisma.$transaction(async (tx) => {
+            const existing = await tx.service.findFirst({
+                where: {
+                    id,
+                    organizationId: session.organizationId,
+                    clinic: {
+                        is: {
+                            organizationId: session.organizationId,
+                            // This is the server-side activation guard.
+                            ...(isActive ? { isActive: true } : {}),
+                        },
                     },
                 },
-            },
+                select: { id: true },
+            });
+
+            if (!existing) {
+                const belongsToOrg = await tx.service.findFirst({
+                    where: {
+                        id,
+                        organizationId: session.organizationId,
+                        clinic: { is: { organizationId: session.organizationId } },
+                    },
+                    select: { id: true },
+                });
+
+                if (!belongsToOrg) throw new Error("SERVICE_NOT_FOUND");
+                if (isActive) throw new Error("CLINIC_INACTIVE");
+                throw new Error("SERVICE_NOT_FOUND");
+            }
+
+            return tx.service.update({
+                where: { id: existing.id },
+                data: { isActive },
+                include: serviceClinicInclude,
+            });
+        }, {
+            maxWait: 10_000,
+            timeout: 20_000,
         });
 
         revalidatePath(MANAGEMENT_PATH);
-
-        return {
-            success: true,
-            data: mapService(service),
-        };
+        return { success: true, data: mapService(service) };
     } catch (error) {
-        if (
-            error instanceof Prisma.PrismaClientKnownRequestError &&
-            error.code === "P2025"
-        ) {
-            return {
-                success: false,
-                error: "The service no longer exists.",
-                code: "SERVICE_NOT_FOUND",
-            };
+        if (error instanceof Error) {
+            if (error.message === "SERVICE_NOT_FOUND") {
+                return notFound(
+                    "The service was not found in your organization.",
+                    "SERVICE_NOT_FOUND",
+                );
+            }
+
+            if (error.message === "CLINIC_INACTIVE") {
+                return {
+                    success: false,
+                    error: "لا يمكن تفعيل الخدمة لأن العيادة المرتبطة بها معطلة حالياً. يرجى تفعيل العيادة أولاً.",
+                    code: "CLINIC_INACTIVE",
+                };
+            }
         }
 
         return databaseError(
             "toggleServiceStatusAction",
             error,
-            "Unable to change the service status.",
+            "Unable to change the service status. Please try again.",
         );
     }
 }
