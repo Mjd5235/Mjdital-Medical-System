@@ -1,5 +1,4 @@
-
-import { PrismaClient, UserRole } from "@prisma/client";
+import { PrismaClient, UserRole, DoctorProfessionalRank, IdentityType } from "@prisma/client";
 import { hashPassword } from "../src/lib/auth/password";
 
 const prisma = new PrismaClient();
@@ -120,10 +119,14 @@ async function main() {
     throw new Error("Demo doctor user was not found.");
   }
 
-  const existingDoctor = await prisma.doctor.findUnique({
-    where: { userId: doctorUser.id },
+  const existingDoctor = await prisma.doctor.findFirst({
+    where: {
+      organizationId: organization.id,
+      scfhsLicenseNumber: "SCFHS-DEMO-0001"
+    },
   });
 
+  // البيانات الجديدة المطلوبة بناءً على تعديلات السكيما المحدثة للمستندات والرتب والنسب
   const doctorData = {
     organizationId: organization.id,
     clinicId: clinic.id,
@@ -132,7 +135,11 @@ async function main() {
     fullNameEn: doctorUser.fullNameEn,
     specialtyAr: "طب الأسنان",
     specialtyEn: "Dentistry",
+    nationalId: "1000000001", // قيمة افتراضية فريدة متوافقة مع القيد الجديد
+    identityType: IdentityType.NATIONAL_ID, // الحقل الجديد من السكيما
+    professionalRank: DoctorProfessionalRank.CONSULTANT, // حقل الرتبة المهنية الجديد
     scfhsLicenseNumber: "SCFHS-DEMO-0001",
+    commissionRate: 15.50, // حقل النسبة المئوية المضاف حديثاً
     isActive: true,
   };
 

@@ -62,7 +62,19 @@ enum AuditActionType {
   @@map("audit_action_type")
 }
 
+
+enum DoctorProfessionalRank {
+  CONSULTANT
+  SPECIALIST
+  RESIDENT
+  GENERAL_PRACTITIONER
+  REGISTRAR
+
+  @@map("doctor_professional_rank")
+}
+
 /// المؤسسة الرئيسية والمستأجر (Tenant) في النظام.
+
 model Organization {
   id        String   @id @default(uuid()) @db.Uuid
   nameAr    String   @map("name_ar")
@@ -85,10 +97,12 @@ model Organization {
   invoices           Invoice[]
   insuranceProviders InsuranceProvider[]
   services           Service[]
+  onboardingTokens   DoctorOnboardingToken[]
 
   @@index([isActive])
   @@map("organizations")
 }
+
 
 /// عيادة أو قسم داخلي تابع لمؤسسة.
 model Clinic {
@@ -123,6 +137,7 @@ model Clinic {
 }
 
 /// الخدمات المقدمة داخل العيادات.
+
 model Service {
   id             String   @id @default(uuid()) @db.Uuid
   organizationId String   @map("organization_id") @db.Uuid
@@ -138,6 +153,7 @@ model Service {
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctors      Doctor[]
 
   @@unique([organizationId, clinicId, code])
   @@index([organizationId])
@@ -145,11 +161,13 @@ model Service {
   @@map("services")
 }
 
+
 /// حساب المستخدم داخل المؤسسة، وليس داخل عيادة محددة.
+
 model User {
   id             String    @id @default(uuid()) @db.Uuid
   organizationId String    @map("organization_id") @db.Uuid
-  email          String
+  email          String    @unique
   passwordHash   String    @map("password_hash")
   fullNameAr     String    @map("full_name_ar")
   fullNameEn     String    @map("full_name_en")
@@ -164,6 +182,7 @@ model User {
   doctor       Doctor?
   auditLogs    AuditLog[]
   appointments Appointment[] @relation("AppointmentCreatedBy")
+  onboardingTokens DoctorOnboardingToken[]
 
   @@unique([organizationId, email])
   @@index([organizationId])
@@ -171,33 +190,41 @@ model User {
   @@map("users")
 }
 
+
 /// الملف المهني للطبيب، ويمكن ربطه بحساب مستخدم اختياري.
+
 model Doctor {
-  id                 String         @id @default(uuid()) @db.Uuid
-  organizationId     String         @map("organization_id") @db.Uuid
-  clinicId           String         @map("clinic_id") @db.Uuid
-  userId             String?        @unique @map("user_id") @db.Uuid
-  fullNameAr         String         @map("full_name_ar")
-  fullNameEn         String         @map("full_name_en")
-  specialtyAr        String         @map("specialty_ar")
-  specialtyEn        String         @map("specialty_en")
-  scfhsLicenseNumber String         @map("scfhs_license_number")
-  presence           DoctorPresence @default(AVAILABLE)
-  isActive           Boolean        @default(true) @map("is_active")
-  createdAt          DateTime       @default(now()) @map("created_at")
-  updatedAt          DateTime       @updatedAt @map("updated_at")
+  id                 String                @id @default(uuid()) @db.Uuid
+  organizationId     String                @map("organization_id") @db.Uuid
+  clinicId           String                @map("clinic_id") @db.Uuid
+  userId             String?               @unique @map("user_id") @db.Uuid
+  fullNameAr         String                @map("full_name_ar")
+  fullNameEn         String                @map("full_name_en")
+  specialtyAr        String                @map("specialty_ar")
+  specialtyEn        String                @map("specialty_en")
+  nationalId         String                @map("national_id")
+  identityType       IdentityType          @map("identity_type")
+  professionalRank   DoctorProfessionalRank @map("professional_rank")
+  scfhsLicenseNumber String                @map("scfhs_license_number")
+  commissionRate     Decimal               @default(0) @map("commission_rate") @db.Decimal(5, 2)
+  presence           DoctorPresence        @default(AVAILABLE)
+  isActive           Boolean               @default(true) @map("is_active")
+  createdAt          DateTime              @default(now()) @map("created_at")
+  updatedAt          DateTime              @updatedAt @map("updated_at")
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
   user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
-
+  services     Service[]
   appointments Appointment[]
 
   @@unique([organizationId, scfhsLicenseNumber])
+  @@unique([organizationId, nationalId])
   @@index([organizationId])
   @@index([organizationId, clinicId])
   @@map("doctors")
 }
+
 
 /// بيانات المرضى على مستوى المؤسسة.
 model Patient {
@@ -353,4 +380,21 @@ model Invoice {
   @@index([organizationId, clinicId])
   @@index([organizationId, patientId])
   @@map("invoices")
+}
+
+model DoctorOnboardingToken {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  tokenHash      String    @unique @map("token_hash")
+  expiresAt      DateTime  @map("expires_at")
+  usedAt         DateTime? @map("used_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([organizationId, createdAt])
+  @@map("doctor_onboarding_tokens")
 }
