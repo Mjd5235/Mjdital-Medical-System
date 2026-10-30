@@ -46,7 +46,7 @@ import {
     type CreateServiceInput,
     type UpdateClinicInput,
     type UpdateServiceInput,
-} from "@/actions/clinicsActions";
+} from "./actions";
 import AdminHeader from "@/components/AdminPortalHeader/Header";
 
 type ClinicsServicesProps = {
