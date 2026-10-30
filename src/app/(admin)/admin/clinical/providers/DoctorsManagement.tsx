@@ -57,6 +57,10 @@ import {
 
 const PAGE_SIZE = 4;
 
+type DoctorsManagementProps = {
+    initialLocale: Locale;
+};
+
 type DoctorListItem = Omit<DoctorRow, "services"> & {
     services: Array<{ id: string; name: string }>;
 };
@@ -1383,8 +1387,9 @@ function DoctorFormModal({
     );
 }
 
-export default function DoctorsManagementPage() {
-    const [locale, setLocale] = useState<Locale>("ar");
+export default function DoctorsManagementPage({ initialLocale,
+}: DoctorsManagementProps) {
+    const [locale, setLocale] = useState<Locale>(initialLocale);
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [doctors, setDoctors] = useState<DoctorRow[]>([]);
     const [options, setOptions] = useState<DoctorFormOptions>({ clinics: [], services: [] });
