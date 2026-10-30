@@ -1,4 +1,3 @@
-
 import { NextResponse, type NextRequest } from "next/server";
 import { UserRole } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
@@ -23,6 +22,13 @@ import { isLocale, LOCALE_COOKIE } from "@/lib/i18n/types";
 
 const RESET_PATH = "/doctor/reset-password";
 const DOCTOR_HOME = "/doctor/dashboard";
+const INACTIVE_PATH = "/doctor/inactive-account";
+
+type AccountStatus = {
+  isActive: boolean;
+  mustChangePassword: boolean;
+  doctor: { isActive: boolean } | null;
+};
 
 async function readSession(
   request: NextRequest,
@@ -100,6 +106,82 @@ function redirectTo(
   return response;
 }
 
+/**
+ * Sends a deactivated account to /doctor/inactive-account.
+ *
+ * The session cookie is intentionally kept: the inactive page itself verifies
+ * (against the database) that the signed-in account really is inactive, which
+ * is what restricts that page to redirected users only.
+ */
+function redirectToInactive(
+  request: NextRequest,
+  portal: Portal | null,
+): NextResponse {
+  const response = redirectTo(request, INACTIVE_PATH, portal);
+
+  response.headers.set("Cache-Control", "no-store");
+
+  return response;
+}
+
+/**
+ * Sends an authenticated session whose account no longer exists back to the
+ * login page with the stale cookie cleared (prevents redirect loops).
+ */
+function redirectToLoginClearingSession(
+  request: NextRequest,
+  portal: Portal,
+): NextResponse {
+  const response = redirectTo(request, portalLoginPath(portal), portal);
+
+  response.cookies.delete(SESSION_COOKIE);
+  response.headers.set("Cache-Control", "no-store");
+
+  return response;
+}
+
+function verificationUnavailable(): NextResponse {
+  return new NextResponse(
+    "Unable to verify account access. Please try again.",
+    {
+      status: 503,
+      headers: {
+        "Cache-Control": "no-store",
+      },
+    },
+  );
+}
+
+async function lookupAccount(
+  session: SessionUser,
+): Promise<AccountStatus | null> {
+  return prisma.user.findFirst({
+    where: {
+      id: session.userId,
+      organizationId: session.organizationId,
+    },
+    select: {
+      isActive: true,
+      mustChangePassword: true,
+      doctor: {
+        select: {
+          isActive: true,
+        },
+      },
+    },
+  });
+}
+
+function isAccountInactive(
+  role: SessionUser["role"],
+  account: AccountStatus,
+): boolean {
+  return (
+    !account.isActive ||
+    (role === UserRole.DOCTOR && !account.doctor?.isActive)
+  );
+}
+
 export async function proxy(
   request: NextRequest,
 ): Promise<NextResponse> {
@@ -118,6 +200,40 @@ export async function proxy(
 
     return response;
   };
+
+  // ---------------------------------------------------------------------
+  // /doctor/inactive-account is only reachable by an authenticated account
+  // that is genuinely inactive (i.e. someone who was redirected here).
+  // Everyone else is sent to /doctor/login.
+  // ---------------------------------------------------------------------
+  if (pathname === INACTIVE_PATH) {
+    const toLogin = (): NextResponse =>
+      redirectTo(request, portalLoginPath("doctor"), "doctor");
+
+    if (!session || !session.organizationId) {
+      return toLogin();
+    }
+
+    let account: AccountStatus | null;
+
+    try {
+      account = await lookupAccount(session);
+    } catch (error) {
+      console.error("[proxy] Account status lookup failed", error);
+
+      return verificationUnavailable();
+    }
+
+    if (!account || !isAccountInactive(session.role, account)) {
+      return toLogin();
+    }
+
+    const response = passThrough();
+
+    response.headers.set("Cache-Control", "no-store");
+
+    return response;
+  }
 
   if (!portal) {
     return passThrough();
@@ -157,57 +273,45 @@ export async function proxy(
     );
   }
 
+  // ---------------------------------------------------------------------
+  // Account activity enforcement (all authenticated roles).
+  // The database is the source of truth so that deactivation takes effect
+  // immediately, even for sessions that were issued before the suspension.
+  // ---------------------------------------------------------------------
+  let account: AccountStatus | null;
+
+  try {
+    account = await lookupAccount(session);
+  } catch (error) {
+    console.error("[proxy] Account status lookup failed", error);
+
+    return verificationUnavailable();
+  }
+
+  if (!account) {
+    // The session points to an account that no longer exists.
+    if (isLogin || isPublicPath(pathname)) {
+      return passThrough();
+    }
+
+    return redirectToLoginClearingSession(request, portal);
+  }
+
+  if (isAccountInactive(session.role, account)) {
+    // Public/login routes stay reachable (no redirect loop); every
+    // protected route is intercepted and sent to /doctor/inactive-account.
+    if (isLogin || isPublicPath(pathname)) {
+      return passThrough();
+    }
+
+    return redirectToInactive(request, portal);
+  }
+
+  // ---------------------------------------------------------------------
+  // Active account: normal flow.
+  // ---------------------------------------------------------------------
   if (session.role === UserRole.DOCTOR) {
-    let doctorAccount: {
-      isActive: boolean;
-      mustChangePassword: boolean;
-      doctor: { isActive: boolean } | null;
-    } | null;
-
-    try {
-      doctorAccount = await prisma.user.findFirst({
-        where: {
-          id: session.userId,
-          organizationId: session.organizationId,
-          role: UserRole.DOCTOR,
-        },
-        select: {
-          isActive: true,
-          mustChangePassword: true,
-          doctor: {
-            select: {
-              isActive: true,
-            },
-          },
-        },
-      });
-    } catch (error) {
-      console.error("[proxy] Doctor status lookup failed", error);
-
-      return new NextResponse(
-        "Unable to verify account access. Please try again.",
-        {
-          status: 503,
-          headers: {
-            "Cache-Control": "no-store",
-          },
-        },
-      );
-    }
-
-    if (
-      !doctorAccount ||
-      !doctorAccount.isActive ||
-      !doctorAccount.doctor?.isActive
-    ) {
-      return redirectTo(
-        request,
-        portalLoginPath("doctor"),
-        portal,
-      );
-    }
-
-    if (doctorAccount.mustChangePassword) {
+    if (account.mustChangePassword) {
       if (isReset) {
         return passThrough();
       }

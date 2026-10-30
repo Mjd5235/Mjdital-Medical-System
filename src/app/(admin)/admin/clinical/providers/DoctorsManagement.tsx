@@ -3,11 +3,13 @@
 import {
     useCallback,
     useEffect,
+    useId,
     useLayoutEffect,
     useMemo,
     useRef,
     useState,
     type FormEvent,
+    type KeyboardEvent as ReactKeyboardEvent,
     type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
@@ -16,6 +18,7 @@ import {
     Activity,
     BriefcaseMedical,
     Building2,
+    Check,
     CheckCircle2,
     ChevronDown,
     ChevronLeft,
@@ -38,7 +41,9 @@ import {
     Search,
     Stethoscope,
     Trash2,
+    UserCheck,
     UserRound,
+    UserX,
     X,
 } from "lucide-react";
 import type { Locale } from "@/lib/i18n/types";
@@ -50,6 +55,7 @@ import {
     getDoctorFormOptions,
     getDoctorsAction,
     regenerateTempPasswordAction,
+    setDoctorActiveStatusAction,
     updateDoctorAction,
     type CreateDoctorInput,
     type DoctorRow,
@@ -101,6 +107,11 @@ type Notice = {
 
 type ModalState = { mode: "create" } | { mode: "edit"; doctor: DoctorRow } | null;
 
+type DropdownOption = {
+    value: string;
+    label: string;
+};
+
 const SPECIALTIES: ReadonlyArray<{ en: string; ar: string }> = [
     { en: "Cardiology", ar: "أمراض القلب" },
     { en: "Pediatrics", ar: "طب الأطفال" },
@@ -146,6 +157,7 @@ const messages = {
         status: "Account Status",
         active: "Active",
         invited: "Invited",
+        inactive: "Inactive",
         noAccount: "No account",
         rowActions: "Row actions",
         empty: "No doctors found.",
@@ -198,6 +210,8 @@ const messages = {
         close: "Close",
         menuEdit: "Edit Practitioner",
         menuDelete: "Delete Practitioner",
+        menuDeactivate: "Deactivate Practitioner",
+        menuActivate: "Reactivate Practitioner",
         menuRegenerate: "Regenerate & Copy Temp Password",
         deleteTitle: "Delete practitioner?",
         deleteBody:
@@ -205,6 +219,9 @@ const messages = {
         deleteConfirm: "Delete permanently",
         deleting: "Deleting…",
         deleted: "Practitioner deleted successfully.",
+        deactivated:
+            "Practitioner deactivated. Their records, audit logs and files were kept, and you can reactivate the account at any time.",
+        activated: "Practitioner reactivated successfully.",
         regenerated: "New temporary password generated and copied to the clipboard.",
         copyFailed: "Password generated, but copying failed. Copy it manually:",
         generatedCopied:
@@ -248,6 +265,7 @@ const messages = {
         status: "حالة الحساب",
         active: "نشط",
         invited: "بانتظار التفعيل",
+        inactive: "معطّل",
         noAccount: "بدون حساب",
         rowActions: "إجراءات الصف",
         empty: "لا توجد نتائج.",
@@ -300,6 +318,8 @@ const messages = {
         close: "إغلاق",
         menuEdit: "تعديل الممارس",
         menuDelete: "حذف الممارس",
+        menuDeactivate: "تعطيل حساب الممارس",
+        menuActivate: "إعادة تفعيل حساب الممارس",
         menuRegenerate: "إعادة توليد ونسخ كلمة المرور المؤقتة",
         deleteTitle: "حذف الممارس؟",
         deleteBody:
@@ -307,6 +327,9 @@ const messages = {
         deleteConfirm: "حذف نهائي",
         deleting: "جارٍ الحذف…",
         deleted: "تم حذف الممارس بنجاح.",
+        deactivated:
+            "تم تعطيل حساب الممارس. تم الاحتفاظ بسجلاته وسجل التدقيق وملفاته، ويمكنك إعادة تفعيل الحساب في أي وقت.",
+        activated: "تمت إعادة تفعيل حساب الممارس بنجاح.",
         regenerated: "تم توليد كلمة مرور مؤقتة جديدة ونسخها إلى الحافظة.",
         copyFailed: "تم توليد كلمة المرور لكن تعذر نسخها. انسخها يدويًا:",
         generatedCopied: "تم توليد كلمة مرور مؤقتة لهذا الحساب ونسخها إلى الحافظة.",
@@ -350,9 +373,22 @@ const tealButton =
 const outlineButton =
     "inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 text-sm font-semibold text-slate-900 dark:text-slate-100 transition hover:border-teal-500 hover:text-teal-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50";
 
+function specialtyLabel(
+    doctor: Pick<DoctorRow, "specialty" | "specialtyAr">,
+    locale: Locale,
+): string {
+    if (locale === "en") return doctor.specialty;
+
+    const known = SPECIALTIES.find((item) => item.en === doctor.specialty);
+    return known?.ar ?? (doctor.specialtyAr || doctor.specialty);
+}
+
 function toListItem(doctor: DoctorRow, locale: Locale): DoctorListItem {
     return {
         ...doctor,
+        clinicName:
+            locale === "ar" ? doctor.clinicNameAr || doctor.clinicName : doctor.clinicName,
+        specialty: specialtyLabel(doctor, locale),
         services: doctor.services.map((service) => ({
             id: service.id,
             name: locale === "ar" ? service.nameAr : service.nameEn,
@@ -496,6 +532,305 @@ function SectionTitle({
     );
 }
 
+function Dropdown({
+    id,
+    name,
+    value,
+    onChange,
+    options,
+    placeholder,
+    disabled = false,
+    invalid = false,
+    ariaLabel,
+    icon: Icon,
+    isRtl,
+    variant = "form",
+    className = "",
+}: {
+    id?: string;
+    name?: string;
+    value: string;
+    onChange: (value: string) => void;
+    options: DropdownOption[];
+    placeholder: string;
+    disabled?: boolean;
+    invalid?: boolean;
+    ariaLabel?: string;
+    icon: typeof UserRound;
+    isRtl: boolean;
+    variant?: "form" | "filter";
+    className?: string;
+}) {
+    const [open, setOpen] = useState(false);
+    const [activeIndex, setActiveIndex] = useState(-1);
+    const [position, setPosition] = useState<{
+        top: number;
+        left: number;
+        width: number;
+    } | null>(null);
+    const buttonRef = useRef<HTMLButtonElement>(null);
+    const menuRef = useRef<HTMLDivElement>(null);
+    const listId = useId();
+
+    const selectedIndex = options.findIndex((option) => option.value === value);
+    const selected = selectedIndex >= 0 ? (options[selectedIndex] ?? null) : null;
+    const isFilter = variant === "filter";
+
+    const reposition = useCallback(() => {
+        const button = buttonRef.current;
+        const menu = menuRef.current;
+
+        if (!button || !menu) return;
+
+        const rect = button.getBoundingClientRect();
+        const height = menu.offsetHeight;
+        const margin = 8;
+        const gap = 6;
+        const spaceBelow = window.innerHeight - rect.bottom - margin;
+        const spaceAbove = rect.top - margin;
+        const placeAbove = height + gap > spaceBelow && spaceAbove > spaceBelow;
+
+        let top = placeAbove ? rect.top - height - gap : rect.bottom + gap;
+        top = Math.min(
+            Math.max(margin, top),
+            Math.max(margin, window.innerHeight - height - margin),
+        );
+
+        setPosition({ top, left: rect.left, width: rect.width });
+    }, []);
+
+    useLayoutEffect(() => {
+        if (open) reposition();
+    }, [open, reposition]);
+
+    useEffect(() => {
+        if (!open) {
+            setPosition(null);
+            return;
+        }
+
+        const onPointerDown = (event: MouseEvent | TouchEvent) => {
+            const target = event.target as Node;
+
+            if (menuRef.current?.contains(target) || buttonRef.current?.contains(target)) {
+                return;
+            }
+
+            setOpen(false);
+        };
+
+        const onScroll = (event: Event) => {
+            if (menuRef.current?.contains(event.target as Node)) return;
+            reposition();
+        };
+
+        const onResize = () => reposition();
+
+        document.addEventListener("mousedown", onPointerDown);
+        document.addEventListener("touchstart", onPointerDown);
+        window.addEventListener("resize", onResize);
+        window.addEventListener("scroll", onScroll, true);
+
+        return () => {
+            document.removeEventListener("mousedown", onPointerDown);
+            document.removeEventListener("touchstart", onPointerDown);
+            window.removeEventListener("resize", onResize);
+            window.removeEventListener("scroll", onScroll, true);
+        };
+    }, [open, reposition]);
+
+    useEffect(() => {
+        if (!open || activeIndex < 0) return;
+
+        menuRef.current
+            ?.querySelector<HTMLElement>(`[data-index="${activeIndex}"]`)
+            ?.scrollIntoView({ block: "nearest" });
+    }, [open, activeIndex]);
+
+    useEffect(() => {
+        if (disabled) setOpen(false);
+    }, [disabled]);
+
+    function openMenu() {
+        if (disabled) return;
+        setActiveIndex(selectedIndex >= 0 ? selectedIndex : options.length > 0 ? 0 : -1);
+        setOpen(true);
+    }
+
+    function closeMenu() {
+        setOpen(false);
+    }
+
+    function choose(index: number) {
+        const option = options[index];
+
+        if (!option) return;
+
+        onChange(option.value);
+        setOpen(false);
+        buttonRef.current?.focus();
+    }
+
+    function handleKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>) {
+        if (disabled) return;
+
+        const lastIndex = options.length - 1;
+
+        switch (event.key) {
+            case "ArrowDown":
+            case "ArrowUp": {
+                event.preventDefault();
+
+                if (!open) {
+                    openMenu();
+                    return;
+                }
+
+                const goDown = event.key === "ArrowDown";
+
+                setActiveIndex((current) => {
+                    if (lastIndex < 0) return -1;
+                    const next = goDown ? current + 1 : current - 1;
+                    return Math.min(Math.max(next, 0), lastIndex);
+                });
+                return;
+            }
+            case "Home":
+                if (open) {
+                    event.preventDefault();
+                    setActiveIndex(lastIndex < 0 ? -1 : 0);
+                }
+                return;
+            case "End":
+                if (open) {
+                    event.preventDefault();
+                    setActiveIndex(lastIndex);
+                }
+                return;
+            case "Enter":
+            case " ":
+                event.preventDefault();
+
+                if (!open) {
+                    openMenu();
+                } else if (activeIndex >= 0) {
+                    choose(activeIndex);
+                } else {
+                    closeMenu();
+                }
+                return;
+            case "Escape":
+                if (open) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    closeMenu();
+                }
+                return;
+            case "Tab":
+                if (open) closeMenu();
+                return;
+            default:
+                return;
+        }
+    }
+
+    return (
+        <span className="relative block">
+            <Icon
+                className={`pointer-events-none absolute top-1/2 h-5 w-5 -translate-y-1/2 ${isFilter
+                    ? "start-4 text-slate-600 dark:text-slate-300"
+                    : "start-3 text-slate-500 dark:text-slate-400"
+                    }`}
+            />
+
+            <button
+                ref={buttonRef}
+                id={id}
+                type="button"
+                role="combobox"
+                aria-haspopup="listbox"
+                aria-expanded={open}
+                aria-controls={open ? listId : undefined}
+                aria-activedescendant={open && activeIndex >= 0 ? `${listId}-${activeIndex}` : undefined}
+                aria-label={ariaLabel}
+                aria-invalid={invalid || undefined}
+                disabled={disabled}
+                onClick={() => (open ? closeMenu() : openMenu())}
+                onKeyDown={handleKeyDown}
+                onKeyUp={(event) => {
+                    if (event.key === " ") event.preventDefault();
+                }}
+                className={`${baseInput} flex cursor-pointer items-center text-start ${isFilter ? "ps-12 pe-10" : "ps-11 pe-10"
+                    } ${open ? "border-teal-500 ring-2 ring-teal-500/20" : ""} ${className}`}
+            >
+                <span
+                    className={`block min-w-0 flex-1 truncate ${selected ? "" : "text-slate-500 dark:text-slate-400"
+                        }`}
+                >
+                    {selected ? selected.label : placeholder}
+                </span>
+            </button>
+
+            <ChevronDown
+                className={`pointer-events-none absolute top-1/2 h-4 w-4 -translate-y-1/2 transition-transform ${open ? "rotate-180" : ""
+                    } ${isFilter
+                        ? "end-4 text-slate-600 dark:text-slate-300"
+                        : "end-3 text-slate-500 dark:text-slate-400"
+                    }`}
+            />
+
+            {name && <input type="hidden" name={name} value={value} />}
+
+            {open &&
+                createPortal(
+                    <div
+                        ref={menuRef}
+                        id={listId}
+                        role="listbox"
+                        aria-label={ariaLabel ?? placeholder}
+                        dir={isRtl ? "rtl" : "ltr"}
+                        style={{
+                            position: "fixed",
+                            top: position?.top ?? 0,
+                            left: position?.left ?? 0,
+                            width: position?.width ?? buttonRef.current?.offsetWidth,
+                            visibility: position ? "visible" : "hidden",
+                        }}
+                        className="z-[160] max-h-64 overflow-y-auto rounded-xl border border-slate-200 bg-white p-1.5 text-sm text-slate-900 shadow-2xl shadow-black/50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+                    >
+                        {options.map((option, index) => {
+                            const isSelected = option.value === value;
+                            const isActive = index === activeIndex;
+
+                            return (
+                                <div
+                                    key={option.value}
+                                    id={`${listId}-${index}`}
+                                    role="option"
+                                    aria-selected={isSelected}
+                                    data-index={index}
+                                    onMouseDown={(event) => event.preventDefault()}
+                                    onMouseEnter={() => setActiveIndex(index)}
+                                    onClick={() => choose(index)}
+                                    className={`flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2.5 text-start font-medium transition-colors ${isActive
+                                        ? "bg-teal-600 text-white"
+                                        : isSelected
+                                            ? "text-teal-600 dark:text-teal-400"
+                                            : "text-slate-900 dark:text-slate-100"
+                                        }`}
+                                >
+                                    <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                                    {isSelected && <Check className="h-4 w-4 shrink-0" />}
+                                </div>
+                            );
+                        })}
+                    </div>,
+                    document.body,
+                )}
+        </span>
+    );
+}
+
 function StatusBadge({
     status,
     t,
@@ -516,11 +851,17 @@ function StatusBadge({
                     wrap: "bg-sky-500/10 text-sky-400",
                     dot: "bg-sky-400",
                 }
-                : {
-                    label: t.noAccount,
-                    wrap: "bg-slate-100 text-slate-600 dark:bg-slate-500/10 dark:text-slate-400",
-                    dot: "bg-slate-500 dark:bg-slate-400",
-                };
+                : status === "INACTIVE"
+                    ? {
+                        label: t.inactive,
+                        wrap: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                        dot: "bg-amber-500 dark:bg-amber-400",
+                    }
+                    : {
+                        label: t.noAccount,
+                        wrap: "bg-slate-100 text-slate-600 dark:bg-slate-500/10 dark:text-slate-400",
+                        dot: "bg-slate-500 dark:bg-slate-400",
+                    };
 
     return (
         <span
@@ -539,6 +880,7 @@ function RowActions({
     busy,
     onEdit,
     onDelete,
+    onToggleStatus,
     onRegenerate,
 }: {
     doctor: DoctorListItem;
@@ -547,6 +889,7 @@ function RowActions({
     busy: boolean;
     onEdit: () => void;
     onDelete: () => void;
+    onToggleStatus: () => void;
     onRegenerate: () => void;
 }) {
     const [open, setOpen] = useState(false);
@@ -633,6 +976,9 @@ function RowActions({
         handler();
     };
 
+    const menuItemBase =
+        "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start font-medium transition focus:outline-none";
+
     return (
         <>
             <button
@@ -667,23 +1013,45 @@ function RowActions({
                             left: position?.left ?? 0,
                             visibility: position ? "visible" : "hidden",
                         }}
-                        className="z-[150] w-[300px] max-w-[calc(100vw-16px)] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-2 text-sm shadow-2xl shadow-black/50"
+                        className="z-[150] w-[300px] max-w-[calc(100vw-16px)] rounded-xl border border-slate-200 bg-white p-2 text-sm text-slate-900 shadow-2xl shadow-black/50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
                     >
                         <button
                             type="button"
                             role="menuitem"
                             onClick={() => choose(onEdit)}
-                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start font-medium text-slate-900 dark:text-slate-100 transition hover:bg-slate-100 dark:hover:bg-slate-800 focus:bg-slate-100 dark:focus:bg-slate-800 focus:outline-none"
+                            className={`${menuItemBase} text-slate-900 hover:bg-teal-600/10 hover:text-teal-600 focus:bg-teal-600/10 focus:text-teal-600 dark:text-slate-100 dark:hover:text-teal-400 dark:focus:text-teal-400`}
                         >
                             <Pencil className="h-5 w-5 shrink-0" strokeWidth={1.6} />
                             {t.menuEdit}
                         </button>
 
+                        {doctor.isActive ? (
+                            <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => choose(onToggleStatus)}
+                                className={`${menuItemBase} text-amber-600 hover:bg-amber-500/10 focus:bg-amber-500/10 dark:text-amber-400`}
+                            >
+                                <UserX className="h-5 w-5 shrink-0" strokeWidth={1.6} />
+                                {t.menuDeactivate}
+                            </button>
+                        ) : (
+                            <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => choose(onToggleStatus)}
+                                className={`${menuItemBase} text-teal-600 hover:bg-teal-600/10 focus:bg-teal-600/10 dark:text-teal-400`}
+                            >
+                                <UserCheck className="h-5 w-5 shrink-0" strokeWidth={1.6} />
+                                {t.menuActivate}
+                            </button>
+                        )}
+
                         <button
                             type="button"
                             role="menuitem"
                             onClick={() => choose(onDelete)}
-                            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start font-medium text-rose-400 transition hover:bg-rose-500/10 focus:bg-rose-500/10 focus:outline-none"
+                            className={`${menuItemBase} text-rose-400 hover:bg-rose-500/10 focus:bg-rose-500/10`}
                         >
                             <Trash2 className="h-5 w-5 shrink-0" strokeWidth={1.6} />
                             {t.menuDelete}
@@ -696,7 +1064,7 @@ function RowActions({
                                     type="button"
                                     role="menuitem"
                                     onClick={() => choose(onRegenerate)}
-                                    className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start font-medium text-teal-400 transition hover:bg-teal-600/10 focus:bg-teal-600/10 focus:outline-none"
+                                    className={`${menuItemBase} text-teal-400 hover:bg-teal-600/10 focus:bg-teal-600/10`}
                                 >
                                     <KeyRound className="h-5 w-5 shrink-0" strokeWidth={1.6} />
                                     {t.menuRegenerate}
@@ -856,11 +1224,17 @@ function DoctorFormModal({
     const [errors, setErrors] = useState<FormErrors>({});
     const [formError, setFormError] = useState("");
     const [clinicId, setClinicId] = useState(doctor?.clinicId ?? "");
+    const [rank, setRank] = useState<string>(doctor?.professionalRank ?? "");
+    const [specialty, setSpecialty] = useState<string>(doctor?.specialty ?? "");
     const [serviceIds, setServiceIds] = useState<string[]>(
         doctor ? doctor.services.map((service) => service.id) : [],
     );
     const [password, setPassword] = useState("");
     const [showPassword, setShowPassword] = useState(false);
+
+    // Inputs forced to dir="ltr" resolve ps-/pe- physically (start = left),
+    // so the padding must be mirrored in RTL to stay on the icon's side.
+    const ltrInputPadding = isRtl ? "ps-3 pe-11 text-end" : "ps-11 pe-3";
 
     const clinicOptions = useMemo(() => {
         if (doctor && !options.clinics.some((clinic) => clinic.id === doctor.clinicId)) {
@@ -869,7 +1243,7 @@ function DoctorFormModal({
                 {
                     id: doctor.clinicId,
                     nameEn: doctor.clinicName,
-                    nameAr: doctor.clinicName,
+                    nameAr: doctor.clinicNameAr || doctor.clinicName,
                     isActive: false,
                 },
             ];
@@ -885,6 +1259,33 @@ function DoctorFormModal({
 
         return SPECIALTIES;
     }, [doctor]);
+
+    const rankDropdownOptions = useMemo<DropdownOption[]>(
+        () =>
+            Object.values(DoctorProfessionalRank).map((item) => ({
+                value: item,
+                label: rankLabels[item][locale],
+            })),
+        [locale],
+    );
+
+    const specialtyDropdownOptions = useMemo<DropdownOption[]>(
+        () =>
+            specialtyOptions.map((item) => ({
+                value: item.en,
+                label: isRtl ? item.ar : item.en,
+            })),
+        [specialtyOptions, isRtl],
+    );
+
+    const clinicDropdownOptions = useMemo<DropdownOption[]>(
+        () =>
+            clinicOptions.map((clinic) => ({
+                value: clinic.id,
+                label: isRtl ? clinic.nameAr : clinic.nameEn,
+            })),
+        [clinicOptions, isRtl],
+    );
 
     const filteredServices = useMemo(
         () => (clinicId ? options.services.filter((service) => service.clinicId === clinicId) : []),
@@ -1076,7 +1477,7 @@ function DoctorFormModal({
                                             setPassword(event.target.value);
                                             clearError("temporaryPassword");
                                         }}
-                                        className={`${baseInput} h-12 ps-11 pe-40 ${isRtl ? "text-end" : ""}`}
+                                        className={`${baseInput} h-12 ${isRtl ? "ps-40 pe-11 text-end" : "ps-11 pe-40"}`}
                                     />
                                     <button
                                         type="button"
@@ -1127,7 +1528,7 @@ function DoctorFormModal({
                                             autoComplete="off"
                                             maxLength={10}
                                             dir="ltr"
-                                            className={`${baseInput} ps-11 ${isRtl ? "text-end" : ""}`}
+                                            className={`${baseInput} ${ltrInputPadding}`}
                                             aria-invalid={Boolean(errors.nationalId)}
                                             disabled={saving}
                                             onChange={() => clearError("nationalId")}
@@ -1150,7 +1551,7 @@ function DoctorFormModal({
                                             autoComplete="off"
                                             maxLength={50}
                                             dir="ltr"
-                                            className={`${baseInput} ps-11 ${isRtl ? "text-end" : ""}`}
+                                            className={`${baseInput} ${ltrInputPadding}`}
                                             aria-invalid={Boolean(errors.scfhsLicenseNumber)}
                                             disabled={saving}
                                             onChange={() => clearError("scfhsLicenseNumber")}
@@ -1159,53 +1560,39 @@ function DoctorFormModal({
                                 </Field>
 
                                 <Field id="doctor-rank" label={t.rank} error={errors.professionalRank}>
-                                    <span className="relative block">
-                                        <BriefcaseMedical className="pointer-events-none absolute start-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
-                                        <select
-                                            id="doctor-rank"
-                                            name="professionalRank"
-                                            defaultValue={doctor?.professionalRank ?? ""}
-                                            className={`${baseInput} appearance-none ps-11 pe-10`}
-                                            aria-invalid={Boolean(errors.professionalRank)}
-                                            disabled={saving}
-                                            onChange={() => clearError("professionalRank")}
-                                        >
-                                            <option value="" disabled>
-                                                {t.chooseRank}
-                                            </option>
-                                            {Object.values(DoctorProfessionalRank).map((rank) => (
-                                                <option key={rank} value={rank}>
-                                                    {rankLabels[rank][locale]}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <ChevronDown className="pointer-events-none absolute end-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
-                                    </span>
+                                    <Dropdown
+                                        id="doctor-rank"
+                                        name="professionalRank"
+                                        value={rank}
+                                        onChange={(next) => {
+                                            setRank(next);
+                                            clearError("professionalRank");
+                                        }}
+                                        options={rankDropdownOptions}
+                                        placeholder={t.chooseRank}
+                                        icon={BriefcaseMedical}
+                                        isRtl={isRtl}
+                                        disabled={saving}
+                                        invalid={Boolean(errors.professionalRank)}
+                                    />
                                 </Field>
 
                                 <Field id="doctor-specialty" label={t.specialty} error={errors.specialty}>
-                                    <span className="relative block">
-                                        <Stethoscope className="pointer-events-none absolute start-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
-                                        <select
-                                            id="doctor-specialty"
-                                            name="specialty"
-                                            defaultValue={doctor?.specialty ?? ""}
-                                            className={`${baseInput} appearance-none ps-11 pe-10`}
-                                            aria-invalid={Boolean(errors.specialty)}
-                                            disabled={saving}
-                                            onChange={() => clearError("specialty")}
-                                        >
-                                            <option value="" disabled>
-                                                {t.chooseSpecialty}
-                                            </option>
-                                            {specialtyOptions.map((item) => (
-                                                <option key={item.en} value={item.en}>
-                                                    {isRtl ? item.ar : item.en}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <ChevronDown className="pointer-events-none absolute end-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
-                                    </span>
+                                    <Dropdown
+                                        id="doctor-specialty"
+                                        name="specialty"
+                                        value={specialty}
+                                        onChange={(next) => {
+                                            setSpecialty(next);
+                                            clearError("specialty");
+                                        }}
+                                        options={specialtyDropdownOptions}
+                                        placeholder={t.chooseSpecialty}
+                                        icon={Stethoscope}
+                                        isRtl={isRtl}
+                                        disabled={saving}
+                                        invalid={Boolean(errors.specialty)}
+                                    />
                                 </Field>
                             </div>
                         </section>
@@ -1231,25 +1618,18 @@ function DoctorFormModal({
 
                             <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_1.35fr_.85fr]">
                                 <Field id="doctor-clinic" label={t.assignedClinic} error={errors.clinicId}>
-                                    <span className="relative block">
-                                        <Building2 className="pointer-events-none absolute start-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
-                                        <select
-                                            id="doctor-clinic"
-                                            name="clinicId"
-                                            value={clinicId}
-                                            disabled={saving || optionsLoading || clinicOptions.length === 0}
-                                            className={`${baseInput} h-12 appearance-none ps-11 pe-10`}
-                                            onChange={(event) => changeClinic(event.target.value)}
-                                        >
-                                            <option value="">{optionsLoading ? "…" : t.chooseClinic}</option>
-                                            {clinicOptions.map((clinic) => (
-                                                <option key={clinic.id} value={clinic.id}>
-                                                    {isRtl ? clinic.nameAr : clinic.nameEn}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <ChevronDown className="pointer-events-none absolute end-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
-                                    </span>
+                                    <Dropdown
+                                        id="doctor-clinic"
+                                        name="clinicId"
+                                        value={clinicId}
+                                        onChange={changeClinic}
+                                        options={clinicDropdownOptions}
+                                        placeholder={optionsLoading ? "…" : t.chooseClinic}
+                                        icon={Building2}
+                                        isRtl={isRtl}
+                                        disabled={saving || optionsLoading || clinicOptions.length === 0}
+                                        className="h-12"
+                                    />
 
                                     {!optionsLoading && clinicOptions.length === 0 && (
                                         <span className="mt-1 block text-xs text-slate-500 dark:text-slate-400">{t.noClinics}</span>
@@ -1326,7 +1706,7 @@ function DoctorFormModal({
                                             max="100"
                                             step="0.01"
                                             dir="ltr"
-                                            className={`${baseInput} h-12 ps-11 ${isRtl ? "text-end" : ""}`}
+                                            className={`${baseInput} h-12 ${ltrInputPadding}`}
                                             aria-invalid={Boolean(errors.commissionRate)}
                                             disabled={saving}
                                             onChange={() => clearError("commissionRate")}
@@ -1528,6 +1908,28 @@ export default function DoctorsManagementPage({ initialLocale,
         });
     }, [displayDoctors, query, clinicFilter, statusFilter, locale]);
 
+    const clinicFilterOptions = useMemo<DropdownOption[]>(
+        () => [
+            { value: "ALL", label: t.allClinics },
+            ...options.clinics.map((clinic) => ({
+                value: clinic.id,
+                label: isRtl ? clinic.nameAr : clinic.nameEn,
+            })),
+        ],
+        [options.clinics, t.allClinics, isRtl],
+    );
+
+    const statusFilterOptions = useMemo<DropdownOption[]>(
+        () => [
+            { value: "ALL", label: t.allStatuses },
+            { value: "ACTIVE", label: t.active },
+            { value: "INVITED", label: t.invited },
+            { value: "INACTIVE", label: t.inactive },
+            { value: "NO_ACCOUNT", label: t.noAccount },
+        ],
+        [t.allStatuses, t.active, t.invited, t.inactive, t.noAccount],
+    );
+
     const totalPages = Math.max(1, Math.ceil(filteredDoctors.length / PAGE_SIZE));
     const currentPage = Math.min(page, totalPages);
     const visibleDoctors = filteredDoctors.slice(
@@ -1655,6 +2057,36 @@ export default function DoctorsManagementPage({ initialLocale,
         }
     }
 
+    async function handleToggleStatus(doctor: DoctorRow) {
+        setNotice(null);
+        setBusyId(doctor.id);
+
+        try {
+            const result = await setDoctorActiveStatusAction(doctor.id, !doctor.isActive);
+
+            if (!result.success || !result.data) {
+                setNotice({ kind: "error", message: result.error ?? t.failed });
+                return;
+            }
+
+            const updated = result.data.doctor;
+
+            setDoctors((current) => {
+                const currentDoctors = Array.isArray(current) ? current : [];
+                return currentDoctors.map((item) => (item.id === updated.id ? updated : item));
+            });
+
+            setNotice({
+                kind: "success",
+                message: updated.isActive ? t.activated : t.deactivated,
+            });
+        } catch {
+            setNotice({ kind: "error", message: t.failed });
+        } finally {
+            setBusyId(null);
+        }
+    }
+
     async function confirmDelete() {
         if (!deleteTarget) return;
 
@@ -1745,39 +2177,29 @@ export default function DoctorsManagementPage({ initialLocale,
                                 />
                             </label>
 
-                            <label className="relative block">
-                                <Building2 className="pointer-events-none absolute start-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-600 dark:text-slate-300" />
-                                <select
-                                    value={clinicFilter}
-                                    onChange={(event) => setClinicFilter(event.target.value)}
-                                    aria-label={t.allClinics}
-                                    className={`${baseInput} h-[54px] appearance-none bg-white dark:bg-slate-900/60 ps-12 pe-10`}
-                                >
-                                    <option value="ALL">{t.allClinics}</option>
-                                    {options.clinics.map((clinic) => (
-                                        <option key={clinic.id} value={clinic.id}>
-                                            {isRtl ? clinic.nameAr : clinic.nameEn}
-                                        </option>
-                                    ))}
-                                </select>
-                                <ChevronDown className="pointer-events-none absolute end-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-600 dark:text-slate-300" />
-                            </label>
+                            <Dropdown
+                                value={clinicFilter}
+                                onChange={setClinicFilter}
+                                options={clinicFilterOptions}
+                                placeholder={t.allClinics}
+                                ariaLabel={t.allClinics}
+                                icon={Building2}
+                                isRtl={isRtl}
+                                variant="filter"
+                                className="h-[54px] bg-white dark:bg-slate-900/60"
+                            />
 
-                            <label className="relative block">
-                                <UserRound className="pointer-events-none absolute start-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-600 dark:text-slate-300" />
-                                <select
-                                    value={statusFilter}
-                                    onChange={(event) => setStatusFilter(event.target.value)}
-                                    aria-label={t.allStatuses}
-                                    className={`${baseInput} h-[54px] appearance-none bg-white dark:bg-slate-900/60 ps-12 pe-10`}
-                                >
-                                    <option value="ALL">{t.allStatuses}</option>
-                                    <option value="ACTIVE">{t.active}</option>
-                                    <option value="INVITED">{t.invited}</option>
-                                    <option value="NO_ACCOUNT">{t.noAccount}</option>
-                                </select>
-                                <ChevronDown className="pointer-events-none absolute end-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-600 dark:text-slate-300" />
-                            </label>
+                            <Dropdown
+                                value={statusFilter}
+                                onChange={setStatusFilter}
+                                options={statusFilterOptions}
+                                placeholder={t.allStatuses}
+                                ariaLabel={t.allStatuses}
+                                icon={UserRound}
+                                isRtl={isRtl}
+                                variant="filter"
+                                className="h-[54px] bg-white dark:bg-slate-900/60"
+                            />
 
                             <button
                                 type="button"
@@ -1918,6 +2340,7 @@ export default function DoctorsManagementPage({ initialLocale,
                                                                                 setDeleteError("");
                                                                                 setDeleteTarget(source);
                                                                             }}
+                                                                            onToggleStatus={() => void handleToggleStatus(source)}
                                                                             onRegenerate={() => void handleRegenerate(source)}
                                                                         />
                                                                     )}

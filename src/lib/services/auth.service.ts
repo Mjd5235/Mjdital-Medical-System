@@ -10,7 +10,6 @@ import type { Portal } from "@/lib/i18n/get-locale";
 
 export type LoginFailureCode =
   | "invalid_credentials"
-  | "inactive"
   | "unauthorized_portal"
   | "misconfigured";
 
@@ -78,10 +77,6 @@ export async function authenticatePortalUser(input: {
 
   if (!user || !verifyPassword(input.password, user.passwordHash)) {
     return { ok: false, code: "invalid_credentials" };
-  }
-
-  if (!user.isActive) {
-    return { ok: false, code: "inactive" };
   }
 
   if (!isUuid(user.id) || !isUuid(user.organizationId)) {

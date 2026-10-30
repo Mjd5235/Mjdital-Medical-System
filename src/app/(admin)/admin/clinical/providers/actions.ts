@@ -54,10 +54,11 @@ export interface DoctorRow {
     professionalRank: DoctorProfessionalRank;
     clinicId: string;
     clinicName: string;
+    clinicNameAr: string;
     commissionRate: string;
     isActive: boolean;
     mustChangePassword: boolean;
-    accountStatus: "ACTIVE" | "INVITED" | "NO_ACCOUNT";
+    accountStatus: "ACTIVE" | "INVITED" | "INACTIVE" | "NO_ACCOUNT";
     createdAt: string;
     services: Array<{
         id: string;
@@ -122,6 +123,10 @@ export interface RegeneratePasswordResultData {
     email: string;
     /** Plain-text (NOT hashed) temporary password for the admin to copy. */
     temporaryPassword: string;
+}
+
+export interface SetDoctorActiveStatusResultData {
+    doctor: DoctorRow;
 }
 
 const VALID_RANKS = new Set<string>(Object.values(DoctorProfessionalRank));
@@ -322,14 +327,17 @@ function mapDoctor(doctor: DoctorWithRelations): DoctorRow {
         professionalRank: doctor.professionalRank,
         clinicId: doctor.clinicId,
         clinicName: doctor.clinic.nameEn,
+        clinicNameAr: doctor.clinic.nameAr,
         commissionRate: doctor.commissionRate.toString(),
         isActive: doctor.isActive,
         mustChangePassword,
-        accountStatus: !doctor.user
-            ? "NO_ACCOUNT"
-            : mustChangePassword || !doctor.user.isActive
-                ? "INVITED"
-                : "ACTIVE",
+        accountStatus: !doctor.isActive
+            ? "INACTIVE"
+            : !doctor.user
+                ? "NO_ACCOUNT"
+                : mustChangePassword || !doctor.user.isActive
+                    ? "INVITED"
+                    : "ACTIVE",
         createdAt: doctor.createdAt.toISOString(),
         services: doctor.services,
     };
@@ -952,6 +960,136 @@ export async function updateDoctorAction(
             mappedTransactionError<UpdateDoctorResultData>(error) ??
             databaseError("updateDoctorAction", error)
         );
+    }
+}
+
+/**
+ * Deactivates (suspends) or reactivates a practitioner.
+ *
+ * This is a soft state change only: the doctor profile and the linked user
+ * account are flagged inactive/active. Nothing is deleted, so appointments,
+ * audit logs, services and files are fully preserved.
+ */
+export async function setDoctorActiveStatusAction(
+    doctorId: string,
+    isActive: boolean,
+): Promise<DoctorActionResult<SetDoctorActiveStatusResultData>> {
+    let session: Awaited<ReturnType<typeof requirePortalSession>>;
+
+    try {
+        session = await requirePortalSession("admin");
+    } catch (error) {
+        console.error("[setDoctorActiveStatusAction] Authorization failed", error);
+
+        return invalid(
+            "Your session has expired. Sign in and try again.",
+            "UNAUTHORIZED",
+        );
+    }
+
+    const id = cleanText(doctorId);
+
+    if (!validUuid(id)) {
+        return invalid("The selected doctor is invalid.", "INVALID_DOCTOR");
+    }
+
+    if (typeof isActive !== "boolean") {
+        return invalid("The requested status is invalid.", "INVALID_STATUS");
+    }
+
+    try {
+        const clinicIds = await getOrganizationClinicIds(
+            session.organizationId,
+        );
+
+        if (clinicIds.length === 0) {
+            return invalid(
+                "The requested record could not be found. Refresh and try again.",
+                "RECORD_NOT_FOUND",
+            );
+        }
+
+        // IMPORTANT: clinicId is required by the Doctor tenant middleware.
+        const existing = await prisma.doctor.findFirst({
+            where: {
+                id,
+                organizationId: session.organizationId,
+                clinicId: {
+                    in: clinicIds,
+                },
+            },
+            select: {
+                id: true,
+                clinicId: true,
+                userId: true,
+            },
+        });
+
+        if (!existing) {
+            return invalid(
+                "The requested record could not be found. Refresh and try again.",
+                "RECORD_NOT_FOUND",
+            );
+        }
+
+        const actorId = (
+            session as unknown as { userId?: string }
+        ).userId;
+
+        if (
+            !isActive &&
+            existing.userId &&
+            actorId &&
+            existing.userId === actorId
+        ) {
+            return invalid(
+                "You cannot deactivate the account you are currently signed in with.",
+                "CANNOT_DEACTIVATE_SELF",
+            );
+        }
+
+        const updated = await prisma.$transaction(
+            async (tx) => {
+                if (existing.userId) {
+                    await tx.user.update({
+                        where: {
+                            id: existing.userId,
+                            organizationId: session.organizationId,
+                        },
+                        data: {
+                            isActive,
+                        },
+                    });
+                }
+
+                return tx.doctor.update({
+                    where: {
+                        id: existing.id,
+                        organizationId: session.organizationId,
+                        clinicId: existing.clinicId,
+                    },
+                    data: {
+                        isActive,
+                    },
+                    include: doctorInclude,
+                });
+            },
+            {
+                maxWait: 10_000,
+                timeout: 20_000,
+            },
+        );
+
+        revalidatePath(MANAGEMENT_PATH);
+
+        return {
+            success: true,
+            data: {
+                doctor: mapDoctor(updated),
+            },
+        };
+    } catch (error) {
+        return databaseError("setDoctorActiveStatusAction", error);
     }
 }
 
