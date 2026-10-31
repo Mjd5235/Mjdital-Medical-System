@@ -1,3 +1,16 @@
+// ============================================================================
+// prisma/schema.prisma  (UPDATED — adds the `Shift` model + back-relations)
+// After pasting: run `npx prisma migrate dev --name add_shifts` (or `prisma db push`),
+// then `npx prisma generate`.
+//
+// Recommended raw-SQL guard in the generated migration (Prisma cannot express CHECKs):
+//   ALTER TABLE "shifts" ADD CONSTRAINT "shifts_time_range_chk"
+//     CHECK ("start_minute" >= 0 AND "end_minute" <= 1440 AND "end_minute" > "start_minute");
+//   ALTER TABLE "shifts" ADD CONSTRAINT "shifts_slot_chk"
+//     CHECK ("slot_duration_minutes" BETWEEN 5 AND 240);
+//   ALTER TABLE "shifts" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
+// ============================================================================
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -98,6 +111,7 @@ model Organization {
   insuranceProviders InsuranceProvider[]
   services           Service[]
   onboardingTokens   DoctorOnboardingToken[]
+  shifts             Shift[]
 
   @@index([isActive])
   @@map("organizations")
@@ -130,6 +144,7 @@ model Clinic {
   invoices           Invoice[]
   insuranceProviders InsuranceProvider[]
   services           Service[]
+  shifts             Shift[]
 
   @@index([organizationId])
   @@index([organizationId, isActive])
@@ -154,6 +169,7 @@ model Service {
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
   doctors      Doctor[]
+  shifts       Shift[]
 
   @@unique([organizationId, clinicId, code])
   @@index([organizationId])
@@ -218,12 +234,43 @@ model Doctor {
   user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
   services     Service[]
   appointments Appointment[]
+  shifts       Shift[]
 
   @@unique([organizationId, scfhsLicenseNumber])
   @@unique([organizationId, nationalId])
   @@index([organizationId])
   @@index([organizationId, clinicId])
   @@map("doctors")
+}
+
+/// جدول دوام متكرر (شفت) لطبيب داخل عيادة وخدمة محددة.
+/// - daysOfWeek: 0 = الأحد ... 6 = السبت (نفس ترتيب JavaScript Date#getDay).
+/// - startMinute / endMinute: دقائق منذ منتصف الليل بتوقيت العيادة (0..1440).
+/// - الشفتات لا تعبر منتصف الليل: endMinute > startMinute دائماً.
+model Shift {
+  id                  String   @id @default(uuid()) @db.Uuid
+  organizationId      String   @map("organization_id") @db.Uuid
+  clinicId            String   @map("clinic_id") @db.Uuid
+  doctorId            String   @map("doctor_id") @db.Uuid
+  serviceId           String   @map("service_id") @db.Uuid
+  daysOfWeek          Int[]    @map("days_of_week")
+  startMinute         Int      @map("start_minute")
+  endMinute           Int      @map("end_minute")
+  slotDurationMinutes Int      @map("slot_duration_minutes")
+  isActive            Boolean  @default(true) @map("is_active")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  doctor       Doctor       @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  service      Service      @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
+  @@index([organizationId, clinicId, isActive])
+  @@index([organizationId, doctorId, isActive])
+  @@map("shifts")
 }
 
 
@@ -337,6 +384,12 @@ model InsuranceProvider {
   clinicId       String   @map("clinic_id") @db.Uuid
   nameAr         String   @map("name_ar")
   nameEn         String   @map("name_en")
+  /// Official payer identifier registered on the NPHIES platform.
+  nphiesPayerId  String?  @map("nphies_payer_id")
+  /// 15-digit ZATCA tax (VAT) registration number.
+  taxNumber      String?  @map("tax_number") @db.VarChar(15)
+  /// Optional public logo URL shown in the payers table.
+  logoUrl        String?  @map("logo_url")
   isActive       Boolean  @default(true) @map("is_active")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
@@ -347,6 +400,8 @@ model InsuranceProvider {
   patients Patient[]
 
   @@unique([organizationId, nameEn])
+  @@unique([organizationId, nphiesPayerId])
+  @@unique([organizationId, taxNumber])
   @@index([organizationId])
   @@index([organizationId, clinicId])
   @@map("insurance_providers")
