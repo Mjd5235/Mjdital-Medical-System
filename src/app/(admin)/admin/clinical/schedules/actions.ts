@@ -1,4 +1,23 @@
 // app/admin/clinical/schedules/actions.ts
+//
+// CHANGES IN THIS REVISION
+//  - Overnight (cross-midnight) shifts: when the end time is earlier than the start time it is
+//    treated as next-day. `endMinute` is stored as start + duration (so it may exceed 1440,
+//    max 2880). Duration must be > 0 and <= 24h.
+//  - Overlap detection and "upcoming appointment" detection are now midnight-aware
+//    (weekly-timeline based).
+//  - `toggleShiftStatusAction(shiftId, nextActive?)` accepts the desired state so a repeated /
+//    stale request is idempotent instead of flipping the shift back.
+//
+// REQUIRED SQL (only if you previously applied the CHECK constraints from the first schema):
+//   ALTER TABLE "shifts" DROP CONSTRAINT IF EXISTS "shifts_time_range_chk";
+//   ALTER TABLE "shifts" ADD CONSTRAINT "shifts_time_range_chk" CHECK (
+//     "start_minute" >= 0 AND "start_minute" < 1440
+//     AND "end_minute" > "start_minute"
+//     AND "end_minute" - "start_minute" <= 1440
+//   );
+//
+// No Prisma schema changes are required.
 "use server";
 
 import { AppointmentStatus, Prisma } from "@prisma/client";
@@ -15,6 +34,7 @@ const MAX_SHIFTS = 2000;
 const MIN_SLOT_MINUTES = 5;
 const MAX_SLOT_MINUTES = 240;
 const MINUTES_IN_DAY = 24 * 60;
+const MINUTES_IN_WEEK = 7 * MINUTES_IN_DAY;
 const FALLBACK_TIMEZONE = "Asia/Riyadh";
 
 const UUID_PATTERN =
@@ -82,13 +102,18 @@ export interface ShiftRow {
     serviceId: string;
     serviceNameEn: string;
     serviceNameAr: string;
-    /** 0 = Sunday ... 6 = Saturday */
+    /** 0 = Sunday ... 6 = Saturday (the day the shift STARTS on) */
     daysOfWeek: number[];
     /** "HH:mm" (24h) */
     startTime: string;
+    /** "HH:mm" (24h) — time of day the shift ends (next day when crossesMidnight). */
     endTime: string;
+    /** Minutes since midnight of the start day (0..1439). */
     startMinute: number;
+    /** startMinute + duration. Greater than 1440 for overnight shifts (max 2880). */
     endMinute: number;
+    crossesMidnight: boolean;
+    durationMinutes: number;
     slotDurationMinutes: number;
     isActive: boolean;
     createdAt: string;
@@ -191,7 +216,9 @@ function pad(value: number): string {
 }
 
 function minutesToTime(total: number): string {
-    return `${pad(Math.floor(total / 60))}:${pad(total % 60)}`;
+    const normalized = ((total % MINUTES_IN_DAY) + MINUTES_IN_DAY) % MINUTES_IN_DAY;
+
+    return `${pad(Math.floor(normalized / 60))}:${pad(normalized % 60)}`;
 }
 
 function parseTime(value: string): number | null {
@@ -200,6 +227,40 @@ function parseTime(value: string): number | null {
     if (!match) return null;
 
     return Number(match[1]) * 60 + Number(match[2]);
+}
+
+/**
+ * Expands a recurring shift into intervals on a 7-day (Sun 00:00 → Sat 24:00)
+ * minute timeline. Overnight shifts that run past the end of the week wrap
+ * around to the beginning of the timeline.
+ */
+function weeklyIntervals(
+    days: number[],
+    startMinute: number,
+    endMinute: number,
+): Array<[number, number]> {
+    const intervals: Array<[number, number]> = [];
+
+    for (const day of days) {
+        const from = day * MINUTES_IN_DAY + startMinute;
+        const to = day * MINUTES_IN_DAY + endMinute;
+
+        if (to <= MINUTES_IN_WEEK) {
+            intervals.push([from, to]);
+        } else {
+            intervals.push([from, MINUTES_IN_WEEK]);
+            intervals.push([0, to - MINUTES_IN_WEEK]);
+        }
+    }
+
+    return intervals;
+}
+
+function intervalsOverlap(
+    a: Array<[number, number]>,
+    b: Array<[number, number]>,
+): boolean {
+    return a.some(([a0, a1]) => b.some(([b0, b1]) => a0 < b1 && b0 < a1));
 }
 
 function failure<T>(error: string, code = "INVALID_INPUT"): ShiftActionResult<T> {
@@ -314,6 +375,8 @@ function mapShift(shift: ShiftWithRelations): ShiftRow {
         endTime: minutesToTime(shift.endMinute),
         startMinute: shift.startMinute,
         endMinute: shift.endMinute,
+        crossesMidnight: shift.endMinute > MINUTES_IN_DAY,
+        durationMinutes: shift.endMinute - shift.startMinute,
         slotDurationMinutes: shift.slotDurationMinutes,
         isActive: shift.isActive,
         createdAt: shift.createdAt.toISOString(),
@@ -362,6 +425,7 @@ type ParsedShiftInput = {
     serviceId: string;
     days: number[];
     startMinute: number;
+    /** start + duration; > 1440 for overnight shifts. */
     endMinute: number;
     slot: number;
     isActive: boolean;
@@ -394,14 +458,21 @@ function parseShiftInput(
     }
 
     const startMinute = parseTime(cleanText(input?.startTime));
-    const endMinute = parseTime(cleanText(input?.endTime));
+    const parsedEnd = parseTime(cleanText(input?.endTime));
 
-    if (startMinute === null || endMinute === null) {
+    if (startMinute === null || parsedEnd === null) {
         return fail("Enter valid start and end times (HH:mm).", "INVALID_TIME");
     }
 
-    if (endMinute <= startMinute || endMinute > MINUTES_IN_DAY) {
-        return fail("The end time must be after the start time.", "INVALID_TIME_RANGE");
+    // Cross-midnight support: an end time earlier than the start belongs to the next day.
+    const endMinute = parsedEnd < startMinute ? parsedEnd + MINUTES_IN_DAY : parsedEnd;
+    const duration = endMinute - startMinute;
+
+    if (duration <= 0 || duration > MINUTES_IN_DAY) {
+        return fail(
+            "The shift duration must be greater than zero and no longer than 24 hours.",
+            "INVALID_TIME_RANGE",
+        );
     }
 
     const slot = Number(input?.slotDurationMinutes);
@@ -413,7 +484,7 @@ function parseShiftInput(
         );
     }
 
-    if (endMinute - startMinute < slot) {
+    if (duration < slot) {
         return fail("The shift must be long enough for at least one slot.", "SLOT_TOO_LONG");
     }
 
@@ -486,19 +557,25 @@ async function assertNoOverlap(
 ): Promise<void> {
     if (!v.isActive) return;
 
-    const conflict = await tx.shift.findFirst({
+    const candidates = await tx.shift.findMany({
         where: {
             organizationId,
             clinicId: v.clinicId,
             doctorId: v.doctorId,
             isActive: true,
             ...(excludeShiftId ? { id: { not: excludeShiftId } } : {}),
-            daysOfWeek: { hasSome: v.days },
-            startMinute: { lt: v.endMinute },
-            endMinute: { gt: v.startMinute },
         },
-        select: { id: true },
+        select: { daysOfWeek: true, startMinute: true, endMinute: true },
     });
+
+    const mine = weeklyIntervals(v.days, v.startMinute, v.endMinute);
+
+    const conflict = candidates.some((candidate) =>
+        intervalsOverlap(
+            mine,
+            weeklyIntervals(candidate.daysOfWeek, candidate.startMinute, candidate.endMinute),
+        ),
+    );
 
     if (conflict) throw new Error("SHIFT_OVERLAP");
 }
@@ -533,11 +610,12 @@ async function countAffectedAppointments(shift: {
     return upcoming.filter((appointment) => {
         const { day, minute } = localDayAndMinute(appointment.scheduledAt, shift.timezone);
 
-        return (
-            shift.daysOfWeek.includes(day) &&
-            minute >= shift.startMinute &&
-            minute < shift.endMinute
-        );
+        // Offset from the shift's start day; supports overnight shifts spilling into the next day.
+        return shift.daysOfWeek.some((startDay) => {
+            const offset = ((day - startDay + 7) % 7) * MINUTES_IN_DAY + minute;
+
+            return offset >= shift.startMinute && offset < shift.endMinute;
+        });
     }).length;
 }
 
@@ -621,15 +699,29 @@ async function queryShifts(
 ): Promise<ShiftRow[]> {
     if (clinicIds.length === 0) return [];
 
+    const dayFilter: Prisma.ShiftWhereInput =
+        typeof filters.dayOfWeek === "number"
+            ? {
+                OR: [
+                    { daysOfWeek: { has: filters.dayOfWeek } },
+                    // Overnight shifts that started the previous day and spill into this one.
+                    {
+                        AND: [
+                            { daysOfWeek: { has: (filters.dayOfWeek + 6) % 7 } },
+                            { endMinute: { gt: MINUTES_IN_DAY } },
+                        ],
+                    },
+                ],
+            }
+            : {};
+
     const where: Prisma.ShiftWhereInput = {
         organizationId,
         clinicId: filters.clinicId ? filters.clinicId : { in: clinicIds },
         ...(filters.doctorId ? { doctorId: filters.doctorId } : {}),
         ...(filters.status === "ACTIVE" ? { isActive: true } : {}),
         ...(filters.status === "PAUSED" ? { isActive: false } : {}),
-        ...(typeof filters.dayOfWeek === "number"
-            ? { daysOfWeek: { has: filters.dayOfWeek } }
-            : {}),
+        ...dayFilter,
     };
 
     const rows = await prisma.shift.findMany({
@@ -842,9 +934,15 @@ export async function updateShiftAction(
     }
 }
 
-/** Flips the shift between Active and Paused. Resuming re-validates conflicts. */
+/**
+ * Moves the shift to the requested state (Active / Paused). When `nextActive`
+ * is omitted the current state is flipped. Passing the desired state makes the
+ * call idempotent, so duplicated or stale requests can never toggle it back.
+ * Resuming re-validates references and schedule conflicts.
+ */
 export async function toggleShiftStatusAction(
     shiftId: string,
+    nextActive?: boolean,
 ): Promise<ShiftActionResult<ShiftMutationData>> {
     const session = await authorize();
 
@@ -873,13 +971,17 @@ export async function toggleShiftStatusAction(
                     organizationId: session.organizationId,
                     clinicId: { in: clinicIds },
                 },
+                include: shiftInclude,
             });
 
             if (!shift) throw new Error("SHIFT_NOT_FOUND");
 
-            const nextActive = !shift.isActive;
+            const target = typeof nextActive === "boolean" ? nextActive : !shift.isActive;
 
-            if (nextActive) {
+            // Already in the requested state — nothing to do.
+            if (shift.isActive === target) return shift;
+
+            if (target) {
                 const candidate = {
                     doctorId: shift.doctorId,
                     clinicId: shift.clinicId,
@@ -900,7 +1002,7 @@ export async function toggleShiftStatusAction(
                     organizationId: session.organizationId,
                     clinicId: shift.clinicId,
                 },
-                data: { isActive: nextActive },
+                data: { isActive: target },
                 include: shiftInclude,
             });
         }, SERIALIZABLE_OPTIONS);
@@ -990,7 +1092,8 @@ export async function duplicateShiftAction(
 
 /**
  * Deletes a shift. Deletion is refused while upcoming, non-cancelled
- * appointments of the same doctor still fall inside the shift's window.
+ * appointments of the same doctor still fall inside the shift's window
+ * (including the post-midnight part of overnight shifts).
  */
 export async function deleteShiftAction(
     shiftId: string,

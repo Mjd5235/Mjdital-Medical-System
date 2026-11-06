@@ -26,8 +26,8 @@ import {
     Copy,
     LayoutGrid,
     List,
-    LoaderCircle,
     MoreHorizontal,
+    Moon,
     Pause,
     Pencil,
     Play,
@@ -57,11 +57,14 @@ import {
 /*                                  Constants                                 */
 /* -------------------------------------------------------------------------- */
 
-const PAGE_SIZE = 8;
+const PAGE_SIZE = 4;
 const MIN_SLOT = 5;
 const MAX_SLOT = 240;
 const HOUR_HEIGHT = 56;
+const MINUTES_IN_DAY = 1440;
+const MINUTES_IN_WEEK = 7 * MINUTES_IN_DAY;
 const ACTIVE_HREF = "/admin/clinical/schedules";
+const TEMP_PREFIX = "temp-";
 
 const EMPTY_DATA: ShiftsPageData = {
     shifts: [],
@@ -149,10 +152,16 @@ const en = {
     errService: "Select a service.",
     errDays: "Select at least one day.",
     errTimeRequired: "Enter both a start and an end time.",
-    errTime: "End time must be after start time.",
+    errTime: "Start and end times must be different (a shift can last up to 24 hours).",
     errSlot: "Slot duration must be between {min} and {max} minutes.",
     errSlotFit: "The shift must be long enough for at least one slot.",
     errOverlap: "This doctor already has an active shift overlapping these days and times.",
+    overnightBadge: "Overnight",
+    overnightHint: "Overnight shift — ends the next day. Total duration: {duration}.",
+    durationFmt: "{h}h {m}m",
+    continuesNextDay: "Continues to the next day",
+    fromPreviousDay: "Continued from the previous day",
+    busy: "Another action is still in progress. Please wait a moment.",
     deleteTitle: "Delete this shift?",
     deleteBody:
         "This permanently removes the shift. Shifts with upcoming appointments cannot be deleted — pause them instead.",
@@ -165,17 +174,18 @@ const en = {
     duplicated: "Shift duplicated as a paused copy. Edit it, then resume it.",
     deleted: "Shift deleted.",
     failed: "The operation could not be completed. Please try again.",
+    syncing: "Syncing…",
     close: "Close",
     copyright: "All rights reserved",
     platform: "Healthcare Management Platform",
     doctorPrefix: "Dr.",
 };
 
-type Messages = { [K in keyof typeof en]: string };
-
 type SchedulesShiftsProps = {
     initialLocale: Locale;
 };
+
+type Messages = { [K in keyof typeof en]: string };
 
 const ar: Messages = {
     breadcrumbRoot: "الجداول",
@@ -252,10 +262,16 @@ const ar: Messages = {
     errService: "اختر خدمة.",
     errDays: "اختر يوماً واحداً على الأقل.",
     errTimeRequired: "أدخل وقت البدء ووقت الانتهاء.",
-    errTime: "يجب أن يكون وقت الانتهاء بعد وقت البدء.",
+    errTime: "يجب أن يختلف وقت البدء عن وقت الانتهاء (يمكن أن يمتد الشفت حتى 24 ساعة).",
     errSlot: "يجب أن تكون مدة الموعد بين {min} و{max} دقيقة.",
     errSlotFit: "يجب أن يتسع الشفت لموعد واحد على الأقل.",
     errOverlap: "لدى هذا الطبيب شفت نشط يتعارض مع هذه الأيام والأوقات.",
+    overnightBadge: "شفت ليلي",
+    overnightHint: "شفت ليلي — ينتهي في اليوم التالي. المدة الإجمالية: {duration}.",
+    durationFmt: "{h} س {m} د",
+    continuesNextDay: "يستمر إلى اليوم التالي",
+    fromPreviousDay: "مستمر من اليوم السابق",
+    busy: "هناك إجراء آخر قيد التنفيذ. يُرجى الانتظار قليلاً.",
     deleteTitle: "حذف هذا الشفت؟",
     deleteBody:
         "سيتم حذف الشفت نهائياً. لا يمكن حذف الشفتات التي تحتوي على مواعيد قادمة — أوقفها مؤقتاً بدلاً من ذلك.",
@@ -268,6 +284,7 @@ const ar: Messages = {
     duplicated: "تم تكرار الشفت كنسخة متوقفة مؤقتاً. عدّلها ثم استأنفها.",
     deleted: "تم حذف الشفت.",
     failed: "تعذّر إكمال العملية. حاول مرة أخرى.",
+    syncing: "جارٍ المزامنة…",
     close: "إغلاق",
     copyright: "جميع الحقوق محفوظة",
     platform: "منصة إدارة الرعاية الصحية",
@@ -412,13 +429,152 @@ function timeRange(shift: ShiftRow, locale: Locale) {
     return `${formatMinutes(shift.startMinute, locale)} – ${formatMinutes(shift.endMinute, locale)}`;
 }
 
-function layoutLanes(items: ShiftRow[]) {
-    const sorted = [...items].sort(
-        (a, b) => a.startMinute - b.startMinute || a.endMinute - b.endMinute,
-    );
-    const result: Array<{ shift: ShiftRow; lane: number; lanes: number }> = [];
+function parseHHmm(value: string): number | null {
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
 
-    let cluster: Array<{ shift: ShiftRow; lane: number }> = [];
+    return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
+/** Overnight-aware: end earlier than start belongs to the next day. */
+function resolveEnd(start: number, end: number) {
+    return end < start ? end + MINUTES_IN_DAY : end;
+}
+
+function formatDuration(totalMinutes: number, t: Messages) {
+    return fmt(t.durationFmt, {
+        h: Math.floor(totalMinutes / 60),
+        m: totalMinutes % 60,
+    });
+}
+
+function weeklyIntervals(days: number[], start: number, end: number): Array<[number, number]> {
+    const intervals: Array<[number, number]> = [];
+
+    for (const day of days) {
+        const from = day * MINUTES_IN_DAY + start;
+        const to = day * MINUTES_IN_DAY + end;
+
+        if (to <= MINUTES_IN_WEEK) {
+            intervals.push([from, to]);
+        } else {
+            intervals.push([from, MINUTES_IN_WEEK]);
+            intervals.push([0, to - MINUTES_IN_WEEK]);
+        }
+    }
+
+    return intervals;
+}
+
+function intervalsOverlap(a: Array<[number, number]>, b: Array<[number, number]>) {
+    return a.some(([a0, a1]) => b.some(([b0, b1]) => a0 < b1 && b0 < a1));
+}
+
+/** True when the shift is running at any point of the given weekday. */
+function shiftOccursOnDay(shift: ShiftRow, day: number) {
+    return (
+        shift.daysOfWeek.includes(day) ||
+        (shift.crossesMidnight && shift.daysOfWeek.includes((day + 6) % 7))
+    );
+}
+
+/** Optimistic (not yet confirmed by the server) rows use a temporary id. */
+function isTempId(id: string) {
+    return id.startsWith(TEMP_PREFIX);
+}
+
+function makeTempId() {
+    const random =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    return `${TEMP_PREFIX}${random}`;
+}
+
+/** Builds the row the UI shows immediately, before the server responds. */
+function buildOptimisticRow(
+    input: ShiftInput,
+    data: ShiftsPageData,
+    id: string,
+    base?: ShiftRow,
+): ShiftRow {
+    const doctor = data.doctors.find((item) => item.id === input.doctorId);
+    const clinic = data.clinics.find((item) => item.id === input.clinicId);
+    const service = data.services.find((item) => item.id === input.serviceId);
+
+    const start = parseHHmm(input.startTime) ?? base?.startMinute ?? 0;
+    const end = parseHHmm(input.endTime) ?? start;
+    const endMinute = resolveEnd(start, end);
+    const now = new Date().toISOString();
+
+    return {
+        id,
+        doctorId: input.doctorId,
+        doctorNameEn: doctor?.fullNameEn ?? base?.doctorNameEn ?? "",
+        doctorNameAr: doctor?.fullNameAr ?? base?.doctorNameAr ?? "",
+        specialtyEn: doctor?.specialtyEn ?? base?.specialtyEn ?? "",
+        specialtyAr: doctor?.specialtyAr ?? base?.specialtyAr ?? "",
+        clinicId: input.clinicId,
+        clinicNameEn: clinic?.nameEn ?? base?.clinicNameEn ?? "",
+        clinicNameAr: clinic?.nameAr ?? base?.clinicNameAr ?? "",
+        serviceId: input.serviceId,
+        serviceNameEn: service?.nameEn ?? base?.serviceNameEn ?? "",
+        serviceNameAr: service?.nameAr ?? base?.serviceNameAr ?? "",
+        daysOfWeek: [...input.daysOfWeek].sort((a, b) => a - b),
+        startTime: input.startTime,
+        endTime: input.endTime,
+        startMinute: start,
+        endMinute,
+        crossesMidnight: endMinute > MINUTES_IN_DAY,
+        durationMinutes: endMinute - start,
+        slotDurationMinutes: input.slotDurationMinutes,
+        isActive: input.isActive !== false,
+        createdAt: base?.createdAt ?? now,
+        updatedAt: now,
+    };
+}
+
+type Segment = {
+    shift: ShiftRow;
+    start: number;
+    end: number;
+    fromPrevDay: boolean;
+    continuesNextDay: boolean;
+};
+
+function segmentsForDay(shifts: ShiftRow[], day: number): Segment[] {
+    const segments: Segment[] = [];
+
+    for (const shift of shifts) {
+        if (shift.daysOfWeek.includes(day)) {
+            segments.push({
+                shift,
+                start: shift.startMinute,
+                end: Math.min(shift.endMinute, MINUTES_IN_DAY),
+                fromPrevDay: false,
+                continuesNextDay: shift.endMinute > MINUTES_IN_DAY,
+            });
+        }
+
+        if (shift.crossesMidnight && shift.daysOfWeek.includes((day + 6) % 7)) {
+            segments.push({
+                shift,
+                start: 0,
+                end: shift.endMinute - MINUTES_IN_DAY,
+                fromPrevDay: true,
+                continuesNextDay: false,
+            });
+        }
+    }
+
+    return segments;
+}
+
+function layoutLanes(items: Segment[]) {
+    const sorted = [...items].sort((a, b) => a.start - b.start || a.end - b.end);
+    const result: Array<{ segment: Segment; lane: number; lanes: number }> = [];
+
+    let cluster: Array<{ segment: Segment; lane: number }> = [];
     let laneEnds: number[] = [];
     let clusterEnd = -1;
 
@@ -431,20 +587,20 @@ function layoutLanes(items: ShiftRow[]) {
         clusterEnd = -1;
     };
 
-    for (const shift of sorted) {
-        if (cluster.length > 0 && shift.startMinute >= clusterEnd) flush();
+    for (const segment of sorted) {
+        if (cluster.length > 0 && segment.start >= clusterEnd) flush();
 
-        let lane = laneEnds.findIndex((end) => end <= shift.startMinute);
+        let lane = laneEnds.findIndex((end) => end <= segment.start);
 
         if (lane === -1) {
             lane = laneEnds.length;
-            laneEnds.push(shift.endMinute);
+            laneEnds.push(segment.end);
         } else {
-            laneEnds[lane] = shift.endMinute;
+            laneEnds[lane] = segment.end;
         }
 
-        cluster.push({ shift, lane });
-        clusterEnd = Math.max(clusterEnd, shift.endMinute);
+        cluster.push({ segment, lane });
+        clusterEnd = Math.max(clusterEnd, segment.end);
     }
 
     flush();
@@ -512,7 +668,7 @@ function StatusBadge({ active, t }: { active: boolean; t: Messages }) {
     return (
         <span
             className={cn(
-                "inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-semibold",
+                "inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-semibold transition-colors",
                 active
                     ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
                     : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
@@ -522,6 +678,15 @@ function StatusBadge({ active, t }: { active: boolean; t: Messages }) {
                 className={cn("h-2.5 w-2.5 rounded-full", active ? "bg-emerald-500" : "bg-amber-400")}
             />
             {active ? t.statusActive : t.statusPaused}
+        </span>
+    );
+}
+
+function OvernightBadge({ t }: { t: Messages }) {
+    return (
+        <span className="inline-flex items-center gap-1 rounded-md bg-indigo-500/10 px-1.5 py-0.5 text-[11px] font-semibold text-indigo-600 dark:text-indigo-300">
+            <Moon className="h-3 w-3" />
+            {t.overnightBadge}
         </span>
     );
 }
@@ -556,20 +721,44 @@ function DayChips({ days, locale }: { days: number[]; locale: Locale }) {
     );
 }
 
+function ListSkeleton({ label }: { label: string }) {
+    return (
+        <div role="status" aria-busy="true" className="divide-y divide-slate-200 dark:divide-slate-800">
+            <span className="sr-only">{label}</span>
+            {Array.from({ length: PAGE_SIZE }, (_, index) => (
+                <div key={index} className="flex animate-pulse items-center gap-4 px-5 py-4">
+                    <div className="h-11 w-11 shrink-0 rounded-full bg-slate-200 dark:bg-slate-800" />
+                    <div className="min-w-0 flex-1 space-y-2">
+                        <div className="h-3.5 w-1/3 rounded bg-slate-200 dark:bg-slate-800" />
+                        <div className="h-3 w-1/4 rounded bg-slate-200/70 dark:bg-slate-800/70" />
+                    </div>
+                    <div className="hidden h-3.5 w-28 rounded bg-slate-200 dark:bg-slate-800 md:block" />
+                    <div className="hidden h-8 w-24 rounded-lg bg-slate-200 dark:bg-slate-800 md:block" />
+                    <div className="h-8 w-20 rounded-lg bg-slate-200 dark:bg-slate-800" />
+                </div>
+            ))}
+        </div>
+    );
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              Row actions menu                              */
 /* -------------------------------------------------------------------------- */
 
 function ShiftRowActions({
     shift,
-    busy,
+    syncing,
+    disabled,
     isRtl,
     t,
     handlers,
     size = "md",
 }: {
     shift: ShiftRow;
-    busy: boolean;
+    /** A background sync for this row is in flight (non-blocking indicator only). */
+    syncing: boolean;
+    /** Only true for rows that the server has not confirmed yet (temporary ids). */
+    disabled: boolean;
     isRtl: boolean;
     t: Messages;
     handlers: RowHandlers;
@@ -579,6 +768,7 @@ function ShiftRowActions({
     const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
     const buttonRef = useRef<HTMLButtonElement>(null);
     const menuRef = useRef<HTMLDivElement>(null);
+    const openedByKeyboard = useRef(false);
 
     const reposition = useCallback(() => {
         const button = buttonRef.current;
@@ -650,14 +840,28 @@ function ShiftRowActions({
         };
     }, [open, reposition]);
 
+    // Keyboard users land on the first item; pointer users never get an item
+    // focused automatically (that is what made "Edit Shift" look permanently hovered).
     useEffect(() => {
-        if (open && position) {
-            menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+        if (!open || !position) return;
+
+        if (openedByKeyboard.current) {
+            menuRef.current
+                ?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')
+                ?.focus({ preventScroll: true });
+        } else {
+            menuRef.current?.focus({ preventScroll: true });
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [open, position === null]);
 
+    useEffect(() => {
+        if (disabled && open) setOpen(false);
+    }, [disabled, open]);
+
     const choose = (handler: (shift: ShiftRow) => void) => {
+        if (disabled) return;
+
         setOpen(false);
         handler(shift);
     };
@@ -666,7 +870,7 @@ function ShiftRowActions({
         event.stopPropagation();
 
         const items = Array.from(
-            menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [],
+            menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
         );
 
         if (items.length === 0) return;
@@ -678,7 +882,7 @@ function ShiftRowActions({
             items[(current + 1) % items.length]?.focus();
         } else if (event.key === "ArrowUp") {
             event.preventDefault();
-            items[(current - 1 + items.length) % items.length]?.focus();
+            items[current === -1 ? items.length - 1 : (current - 1 + items.length) % items.length]?.focus();
         } else if (event.key === "Home") {
             event.preventDefault();
             items[0]?.focus();
@@ -690,8 +894,19 @@ function ShiftRowActions({
         }
     };
 
+    // Shared layout only — no colours, so no item looks "hovered" by default.
     const itemBase =
-        "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm font-medium transition focus:outline-none";
+        "flex w-full items-center gap-3 rounded-lg bg-transparent px-3 py-2.5 text-start text-sm font-medium transition-colors focus:outline-none disabled:pointer-events-none disabled:opacity-50";
+
+    // One tone per action. Background shows only on real hover / keyboard focus.
+    const tone = {
+        edit: "flex w-full items-center gap-3 rounded-lg bg-transparent px-3 py-2.5 text-start text-sm font-medium text-slate-700 transition-colors hover:bg-slate-100 focus:outline-none focus-visible:bg-slate-100 disabled:pointer-events-none disabled:opacity-50 dark:text-slate-200 dark:hover:bg-slate-800/60 dark:focus-visible:bg-slate-800/60",
+        pause: "text-amber-600 hover:bg-amber-500/10 focus-visible:bg-amber-500/10 dark:text-amber-400 dark:hover:bg-amber-500/15 dark:focus-visible:bg-amber-500/15",
+        resume: "text-emerald-600 hover:bg-emerald-500/10 focus-visible:bg-emerald-500/10 dark:text-emerald-400 dark:hover:bg-emerald-500/15 dark:focus-visible:bg-emerald-500/15",
+        duplicate:
+            "text-sky-600 hover:bg-sky-500/10 focus-visible:bg-sky-500/10 dark:text-sky-400 dark:hover:bg-sky-500/15 dark:focus-visible:bg-sky-500/15",
+        delete: "text-rose-600 hover:bg-rose-500/10 focus-visible:bg-rose-500/10 dark:text-rose-400 dark:hover:bg-rose-500/15 dark:focus-visible:bg-rose-500/15",
+    } as const;
 
     return (
         <>
@@ -701,26 +916,32 @@ function ShiftRowActions({
                 aria-label={t.rowActions}
                 aria-haspopup="menu"
                 aria-expanded={open}
-                disabled={busy}
+                disabled={disabled}
                 onClick={(event) => {
                     event.stopPropagation();
+
+                    if (disabled) return;
+
+                    // detail === 0 → activated from the keyboard.
+                    openedByKeyboard.current = event.detail === 0;
                     setOpen((value) => !value);
                 }}
                 onKeyDown={(event) => event.stopPropagation()}
                 className={cn(
-                    "grid shrink-0 place-items-center rounded-lg border text-slate-600 transition focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50 dark:text-slate-300",
+                    "relative grid shrink-0 place-items-center rounded-lg border text-slate-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-300",
                     size === "md" ? "h-10 w-10" : "h-6 w-6",
                     open
                         ? "border-teal-500 bg-teal-600/10 text-teal-600 dark:text-teal-400"
                         : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800",
                 )}
             >
-                {busy ? (
-                    <LoaderCircle
-                        className={cn("animate-spin text-teal-500", size === "md" ? "h-5 w-5" : "h-3.5 w-3.5")}
+                <MoreHorizontal className={size === "md" ? "h-5 w-5" : "h-4 w-4"} />
+                {/* Non-blocking background sync indicator (never disables anything). */}
+                {syncing && (
+                    <span
+                        title={t.syncing}
+                        className="absolute end-1 top-1 h-2 w-2 animate-pulse rounded-full bg-teal-500"
                     />
-                ) : (
-                    <MoreHorizontal className={size === "md" ? "h-5 w-5" : "h-4 w-4"} />
                 )}
             </button>
 
@@ -729,6 +950,7 @@ function ShiftRowActions({
                     <div
                         ref={menuRef}
                         role="menu"
+                        tabIndex={-1}
                         dir={isRtl ? "rtl" : "ltr"}
                         onClick={(event) => event.stopPropagation()}
                         onKeyDown={onMenuKeyDown}
@@ -738,16 +960,13 @@ function ShiftRowActions({
                             left: position?.left ?? 0,
                             visibility: position ? "visible" : "hidden",
                         }}
-                        className="z-[150] w-60 max-w-[calc(100vw-16px)] rounded-xl border border-slate-200 bg-white p-2 text-slate-900 shadow-2xl shadow-black/30 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+                        className="z-[150] w-60 max-w-[calc(100vw-16px)] rounded-xl border border-slate-200 bg-white p-2 text-slate-900 shadow-2xl shadow-black/30 outline-none dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
                     >
                         <button
                             type="button"
                             role="menuitem"
                             onClick={() => choose(handlers.onEdit)}
-                            className={cn(
-                                itemBase,
-                                "hover:bg-teal-600/10 hover:text-teal-600 focus:bg-teal-600/10 focus:text-teal-600 dark:hover:text-teal-400 dark:focus:text-teal-400",
-                            )}
+                            className={cn(itemBase, tone.edit)}
                         >
                             <Pencil className="h-[18px] w-[18px] shrink-0" strokeWidth={1.7} />
                             {t.menuEdit}
@@ -757,12 +976,7 @@ function ShiftRowActions({
                             type="button"
                             role="menuitem"
                             onClick={() => choose(handlers.onToggle)}
-                            className={cn(
-                                itemBase,
-                                shift.isActive
-                                    ? "text-amber-600 hover:bg-amber-500/10 focus:bg-amber-500/10 dark:text-amber-400"
-                                    : "text-teal-600 hover:bg-teal-600/10 focus:bg-teal-600/10 dark:text-teal-400",
-                            )}
+                            className={cn(itemBase, shift.isActive ? tone.pause : tone.resume)}
                         >
                             {shift.isActive ? (
                                 <Pause className="h-[18px] w-[18px] shrink-0" strokeWidth={1.7} />
@@ -776,10 +990,7 @@ function ShiftRowActions({
                             type="button"
                             role="menuitem"
                             onClick={() => choose(handlers.onDuplicate)}
-                            className={cn(
-                                itemBase,
-                                "hover:bg-teal-600/10 hover:text-teal-600 focus:bg-teal-600/10 focus:text-teal-600 dark:hover:text-teal-400 dark:focus:text-teal-400",
-                            )}
+                            className={cn(itemBase, tone.duplicate)}
                         >
                             <Copy className="h-[18px] w-[18px] shrink-0" strokeWidth={1.7} />
                             {t.menuDuplicate}
@@ -791,10 +1002,7 @@ function ShiftRowActions({
                             type="button"
                             role="menuitem"
                             onClick={() => choose(handlers.onDelete)}
-                            className={cn(
-                                itemBase,
-                                "text-rose-500 hover:bg-rose-500/10 focus:bg-rose-500/10 dark:text-rose-400",
-                            )}
+                            className={cn(itemBase, tone.delete)}
                         >
                             <Trash2 className="h-[18px] w-[18px] shrink-0" strokeWidth={1.7} />
                             {t.menuDelete}
@@ -815,14 +1023,14 @@ function ShiftsList({
     variant,
     locale,
     t,
-    busyId,
+    syncing,
     handlers,
 }: {
     shifts: ShiftRow[];
     variant: "planner" | "templates";
     locale: Locale;
     t: Messages;
-    busyId: string | null;
+    syncing: ReadonlySet<string>;
     handlers: RowHandlers;
 }) {
     const isRtl = locale === "ar";
@@ -850,13 +1058,17 @@ function ShiftsList({
                         {shifts.map((shift) => {
                             const n = names(shift, locale);
                             const label = doctorLabel(n.doctor, locale, t);
+                            const rowSyncing = syncing.has(shift.id);
+                            const rowTemp = isTempId(shift.id);
 
                             return (
                                 <tr
                                     key={shift.id}
+                                    aria-busy={rowSyncing || undefined}
                                     className={cn(
                                         "transition-colors hover:bg-slate-50 dark:hover:bg-slate-800/40",
                                         !shift.isActive && "opacity-80",
+                                        rowTemp && "animate-pulse",
                                     )}
                                 >
                                     <td className="px-5 py-4">
@@ -885,6 +1097,11 @@ function ShiftsList({
                                         <p className="whitespace-nowrap font-medium text-slate-900 dark:text-slate-100">
                                             <bdi>{timeRange(shift, locale)}</bdi>
                                         </p>
+                                        {shift.crossesMidnight && (
+                                            <div className="mt-1.5">
+                                                <OvernightBadge t={t} />
+                                            </div>
+                                        )}
                                         {variant === "planner" && (
                                             <div className="mt-1.5">
                                                 <DayChips days={shift.daysOfWeek} locale={locale} />
@@ -902,7 +1119,8 @@ function ShiftsList({
                                     <td className="px-5 py-4">
                                         <ShiftRowActions
                                             shift={shift}
-                                            busy={busyId === shift.id}
+                                            syncing={rowSyncing}
+                                            disabled={rowTemp}
                                             isRtl={isRtl}
                                             t={t}
                                             handlers={handlers}
@@ -920,9 +1138,19 @@ function ShiftsList({
                 {shifts.map((shift) => {
                     const n = names(shift, locale);
                     const label = doctorLabel(n.doctor, locale, t);
+                    const rowSyncing = syncing.has(shift.id);
+                    const rowTemp = isTempId(shift.id);
 
                     return (
-                        <li key={shift.id} className={cn("space-y-3 p-4", !shift.isActive && "opacity-80")}>
+                        <li
+                            key={shift.id}
+                            aria-busy={rowSyncing || undefined}
+                            className={cn(
+                                "space-y-3 p-4",
+                                !shift.isActive && "opacity-80",
+                                rowTemp && "animate-pulse",
+                            )}
+                        >
                             <div className="flex items-start justify-between gap-3">
                                 <div className="flex min-w-0 items-center gap-3">
                                     <Avatar shift={shift} name={n.doctor} />
@@ -935,7 +1163,8 @@ function ShiftsList({
                                 </div>
                                 <ShiftRowActions
                                     shift={shift}
-                                    busy={busyId === shift.id}
+                                    syncing={rowSyncing}
+                                    disabled={rowTemp}
                                     isRtl={isRtl}
                                     t={t}
                                     handlers={handlers}
@@ -953,7 +1182,12 @@ function ShiftsList({
                                     <p className="font-medium text-slate-900 dark:text-slate-100">
                                         <bdi>{timeRange(shift, locale)}</bdi>
                                     </p>
-                                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                                    {shift.crossesMidnight && (
+                                        <div className="mt-1">
+                                            <OvernightBadge t={t} />
+                                        </div>
+                                    )}
+                                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
                                         {fmt(t.slotPerPatient, { n: shift.slotDurationMinutes })}
                                     </p>
                                 </div>
@@ -982,7 +1216,7 @@ function CalendarGrid({
     today,
     locale,
     t,
-    busyId,
+    syncing,
     handlers,
 }: {
     shifts: ShiftRow[];
@@ -991,7 +1225,7 @@ function CalendarGrid({
     today: Date | null;
     locale: Locale;
     t: Messages;
-    busyId: string | null;
+    syncing: ReadonlySet<string>;
     handlers: RowHandlers;
 }) {
     const isRtl = locale === "ar";
@@ -1000,18 +1234,18 @@ function CalendarGrid({
         () =>
             days.map((day) => ({
                 day,
-                items: layoutLanes(shifts.filter((shift) => shift.daysOfWeek.includes(day))),
+                items: layoutLanes(segmentsForDay(shifts, day)),
             })),
         [days, shifts],
     );
 
     const { startHour, endHour } = useMemo(() => {
-        const visible = perDay.flatMap((entry) => entry.items.map((item) => item.shift));
+        const visible = perDay.flatMap((entry) => entry.items.map((item) => item.segment));
 
         if (visible.length === 0) return { startHour: 8, endHour: 18 };
 
-        const min = Math.min(...visible.map((shift) => shift.startMinute));
-        const max = Math.max(...visible.map((shift) => shift.endMinute));
+        const min = Math.min(...visible.map((segment) => segment.start));
+        const max = Math.max(...visible.map((segment) => segment.end));
         const start = Math.max(0, Math.floor(min / 60));
         let end = Math.min(24, Math.ceil(max / 60));
 
@@ -1094,29 +1328,41 @@ function CalendarGrid({
                                 </p>
                             )}
 
-                            {items.map(({ shift, lane, lanes }) => {
+                            {items.map(({ segment, lane, lanes }) => {
+                                const { shift } = segment;
                                 const n = names(shift, locale);
-                                const top = ((shift.startMinute - startHour * 60) / 60) * HOUR_HEIGHT;
+                                const rowTemp = isTempId(shift.id);
+                                const rowSyncing = syncing.has(shift.id);
+                                const top = ((segment.start - startHour * 60) / 60) * HOUR_HEIGHT;
                                 const height = Math.max(
                                     30,
-                                    ((shift.endMinute - shift.startMinute) / 60) * HOUR_HEIGHT - 2,
+                                    ((segment.end - segment.start) / 60) * HOUR_HEIGHT - 2,
                                 );
+                                const hint = segment.fromPrevDay
+                                    ? t.fromPreviousDay
+                                    : segment.continuesNextDay
+                                        ? t.continuesNextDay
+                                        : "";
 
                                 return (
                                     <div
-                                        key={shift.id}
+                                        key={`${shift.id}-${segment.fromPrevDay ? "prev" : "own"}`}
                                         role="button"
-                                        tabIndex={0}
-                                        onClick={() => handlers.onEdit(shift)}
+                                        tabIndex={rowTemp ? -1 : 0}
+                                        aria-disabled={rowTemp || undefined}
+                                        aria-busy={rowSyncing || undefined}
+                                        onClick={() => {
+                                            if (!rowTemp) handlers.onEdit(shift);
+                                        }}
                                         onKeyDown={(event) => {
-                                            if (event.target !== event.currentTarget) return;
+                                            if (event.target !== event.currentTarget || rowTemp) return;
 
                                             if (event.key === "Enter" || event.key === " ") {
                                                 event.preventDefault();
                                                 handlers.onEdit(shift);
                                             }
                                         }}
-                                        title={`${doctorLabel(n.doctor, locale, t)} • ${timeRange(shift, locale)}`}
+                                        title={`${doctorLabel(n.doctor, locale, t)} • ${timeRange(shift, locale)}${hint ? ` • ${hint}` : ""}`}
                                         style={{
                                             top: top + 1,
                                             height,
@@ -1124,15 +1370,24 @@ function CalendarGrid({
                                             width: `calc(${100 / lanes}% - 4px)`,
                                         }}
                                         className={cn(
-                                            "absolute cursor-pointer overflow-hidden rounded-lg border border-s-4 px-2 py-1 text-xs transition hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-teal-500",
+                                            "absolute overflow-hidden rounded-lg border border-s-4 px-2 py-1 text-xs transition focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500",
+                                            rowTemp ? "cursor-default" : "cursor-pointer hover:brightness-110",
                                             paletteFor(shift.doctorId).block,
                                             !shift.isActive && "border-dashed opacity-60",
+                                            segment.fromPrevDay && "rounded-t-none border-t-dashed",
+                                            segment.continuesNextDay && "rounded-b-none",
+                                            rowTemp && "animate-pulse",
                                         )}
                                     >
                                         <div className="flex items-start justify-between gap-1">
                                             <div className="min-w-0">
-                                                <p className="truncate font-semibold leading-tight">
-                                                    {doctorLabel(n.doctor, locale, t)}
+                                                <p className="flex items-center gap-1 truncate font-semibold leading-tight">
+                                                    {shift.crossesMidnight && (
+                                                        <Moon className="h-3 w-3 shrink-0 opacity-80" />
+                                                    )}
+                                                    <span className="truncate">
+                                                        {doctorLabel(n.doctor, locale, t)}
+                                                    </span>
                                                 </p>
                                                 <p className="truncate leading-tight opacity-80">
                                                     <bdi>{timeRange(shift, locale)}</bdi>
@@ -1140,7 +1395,8 @@ function CalendarGrid({
                                             </div>
                                             <ShiftRowActions
                                                 shift={shift}
-                                                busy={busyId === shift.id}
+                                                syncing={rowSyncing}
+                                                disabled={rowTemp}
                                                 isRtl={isRtl}
                                                 t={t}
                                                 handlers={handlers}
@@ -1152,7 +1408,10 @@ function CalendarGrid({
                                                 {n.clinic} · {n.service}
                                             </p>
                                         )}
-                                        {height >= 96 && !shift.isActive && (
+                                        {height >= 96 && hint && (
+                                            <p className="mt-1 truncate text-[11px] font-medium opacity-80">{hint}</p>
+                                        )}
+                                        {height >= 116 && !shift.isActive && (
                                             <p className="mt-1 font-semibold">{t.statusPaused}</p>
                                         )}
                                     </div>
@@ -1196,56 +1455,58 @@ function Pagination({
 
     for (let value = windowStart; value <= windowEnd; value++) pages.push(value);
 
+    const isFirst = page <= 1;
+    const isLast = page >= totalPages;
+
+    // Arrow buttons: neutral when enabled, flat / dimmed / non-interactive when disabled.
     const navButton =
-        "grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition hover:border-teal-500 hover:text-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200 dark:hover:text-teal-400";
+        "grid h-10 w-10 place-items-center rounded-lg border border-slate-200 bg-white text-slate-700 transition hover:border-teal-500 hover:text-teal-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-slate-200 disabled:hover:text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:text-teal-400 dark:disabled:hover:border-slate-700 dark:disabled:hover:text-slate-200";
 
     return (
-        <div className="flex flex-col items-center justify-between gap-3 border-t border-slate-200 px-5 py-4 dark:border-slate-800 sm:flex-row">
+        <div className="flex flex-col items-center justify-between gap-3 border-t border-slate-200 bg-slate-50/70 px-5 py-4 dark:border-slate-800 dark:bg-slate-900/60 sm:flex-row">
             <p className="text-sm text-slate-500 dark:text-slate-400">
                 {fmt(t.showing, { from, to, total })}
             </p>
 
-            {totalPages > 1 && (
-                <nav aria-label={t.pagination} className="flex items-center gap-2">
-                    <button
-                        type="button"
-                        aria-label={t.prevPage}
-                        disabled={page <= 1}
-                        onClick={() => onPage(Math.max(1, page - 1))}
-                        className={navButton}
-                    >
-                        <PrevIcon className="h-4 w-4" />
-                    </button>
+            <nav aria-label={t.pagination} className="flex items-center gap-2">
+                <button
+                    type="button"
+                    aria-label={t.prevPage}
+                    disabled={isFirst}
+                    onClick={() => onPage(Math.max(1, page - 1))}
+                    className={navButton}
+                >
+                    <PrevIcon className="h-4 w-4" />
+                </button>
 
-                    {pages.map((value) => (
-                        <button
-                            key={value}
-                            type="button"
-                            aria-label={fmt(t.pageN, { n: value })}
-                            aria-current={value === page ? "page" : undefined}
-                            onClick={() => onPage(value)}
-                            className={cn(
-                                "grid h-10 min-w-10 place-items-center rounded-lg border px-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-teal-500",
-                                value === page
-                                    ? "border-teal-600 bg-teal-600 text-white"
-                                    : "border-slate-200 text-slate-700 hover:border-teal-500 hover:text-teal-600 dark:border-slate-700 dark:text-slate-200 dark:hover:text-teal-400",
-                            )}
-                        >
-                            {value}
-                        </button>
-                    ))}
-
+                {pages.map((value) => (
                     <button
+                        key={value}
                         type="button"
-                        aria-label={t.nextPage}
-                        disabled={page >= totalPages}
-                        onClick={() => onPage(Math.min(totalPages, page + 1))}
-                        className={navButton}
+                        aria-label={fmt(t.pageN, { n: value })}
+                        aria-current={value === page ? "page" : undefined}
+                        onClick={() => onPage(value)}
+                        className={cn(
+                            "grid h-10 min-w-10 place-items-center rounded-lg border px-2 text-sm font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500",
+                            value === page
+                                ? "border-teal-600 bg-teal-600 text-white"
+                                : "border-slate-200 bg-white text-slate-700 hover:border-teal-500 hover:text-teal-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:text-teal-400",
+                        )}
                     >
-                        <NextIcon className="h-4 w-4" />
+                        {value}
                     </button>
-                </nav>
-            )}
+                ))}
+
+                <button
+                    type="button"
+                    aria-label={t.nextPage}
+                    disabled={isLast}
+                    onClick={() => onPage(Math.min(totalPages, page + 1))}
+                    className={navButton}
+                >
+                    <NextIcon className="h-4 w-4" />
+                </button>
+            </nav>
         </div>
     );
 }
@@ -1284,7 +1545,8 @@ function ShiftFormModal({
     locale: Locale;
     t: Messages;
     onClose: () => void;
-    onSubmit: (input: ShiftInput, shiftId?: string) => Promise<string | null>;
+    /** Fire-and-forget: the parent applies the change optimistically and closes the modal. */
+    onSubmit: (input: ShiftInput, shiftId?: string) => void;
 }) {
     const isEdit = Boolean(shift);
     const isRtl = locale === "ar";
@@ -1314,8 +1576,6 @@ function ShiftFormModal({
             },
     );
     const [errors, setErrors] = useState<FormErrors>({});
-    const [serverError, setServerError] = useState("");
-    const [submitting, setSubmitting] = useState(false);
     const dialogRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -1323,7 +1583,7 @@ function ShiftFormModal({
         document.body.style.overflow = "hidden";
 
         const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !submitting) onClose();
+            if (event.key === "Escape") onClose();
         };
 
         document.addEventListener("keydown", onKeyDown);
@@ -1355,9 +1615,25 @@ function ShiftFormModal({
             (!doctor || doctor.serviceIds.includes(item.id)),
     );
 
+    // Live overnight / duration feedback for the time fields.
+    const timeInfo = useMemo(() => {
+        const start = parseHHmm(values.startTime);
+        const end = parseHHmm(values.endTime);
+
+        if (start === null || end === null) return null;
+
+        const resolvedEnd = resolveEnd(start, end);
+
+        return {
+            start,
+            end: resolvedEnd,
+            duration: resolvedEnd - start,
+            overnight: end < start,
+        };
+    }, [values.startTime, values.endTime]);
+
     const patch = (next: Partial<FormValues>) => {
         setValues((current) => ({ ...current, ...next }));
-        setServerError("");
     };
 
     const servicesFor = (doctorId: string, clinicId: string) => {
@@ -1419,35 +1695,40 @@ function ShiftFormModal({
         if (!values.serviceId) next.serviceId = t.errService;
         if (values.days.length === 0) next.days = t.errDays;
 
-        const startOk = /^\d{2}:\d{2}$/.test(values.startTime);
-        const endOk = /^\d{2}:\d{2}$/.test(values.endTime);
-        const toMin = (value: string) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3, 5));
+        const start = parseHHmm(values.startTime);
+        const end = parseHHmm(values.endTime);
         const slot = Number(values.slot);
+        let duration = 0;
+        let resolvedEnd = 0;
 
-        if (!startOk || !endOk) {
+        if (start === null || end === null) {
             next.time = t.errTimeRequired;
-        } else if (toMin(values.endTime) <= toMin(values.startTime)) {
-            next.time = t.errTime;
+        } else {
+            // Cross-midnight: an earlier end time means the next day.
+            resolvedEnd = resolveEnd(start, end);
+            duration = resolvedEnd - start;
+
+            if (duration <= 0 || duration > MINUTES_IN_DAY) next.time = t.errTime;
         }
 
         if (!Number.isInteger(slot) || slot < MIN_SLOT || slot > MAX_SLOT) {
             next.slot = fmt(t.errSlot, { min: MIN_SLOT, max: MAX_SLOT });
-        } else if (!next.time && startOk && endOk && toMin(values.endTime) - toMin(values.startTime) < slot) {
+        } else if (!next.time && duration < slot) {
             next.slot = t.errSlotFit;
         }
 
-        if (!next.time && !next.days && values.isActive && values.doctorId) {
-            const start = toMin(values.startTime);
-            const end = toMin(values.endTime);
+        if (!next.time && !next.days && values.isActive && values.doctorId && start !== null) {
+            const mine = weeklyIntervals(values.days, start, resolvedEnd);
 
             const conflict = allShifts.some(
                 (item) =>
                     item.id !== shift?.id &&
                     item.isActive &&
                     item.doctorId === values.doctorId &&
-                    item.daysOfWeek.some((day) => values.days.includes(day)) &&
-                    item.startMinute < end &&
-                    item.endMinute > start,
+                    intervalsOverlap(
+                        mine,
+                        weeklyIntervals(item.daysOfWeek, item.startMinute, item.endMinute),
+                    ),
             );
 
             if (conflict) next.time = t.errOverlap;
@@ -1456,40 +1737,27 @@ function ShiftFormModal({
         return next;
     };
 
-    const submit = async (event: FormEvent<HTMLFormElement>) => {
+    const submit = (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
-
-        if (submitting) return;
 
         const found = validate();
         setErrors(found);
 
         if (Object.keys(found).length > 0) return;
 
-        setSubmitting(true);
-        setServerError("");
-
-        try {
-            const error = await onSubmit(
-                {
-                    doctorId: values.doctorId,
-                    clinicId: values.clinicId,
-                    serviceId: values.serviceId,
-                    daysOfWeek: [...values.days].sort((a, b) => a - b),
-                    startTime: values.startTime,
-                    endTime: values.endTime,
-                    slotDurationMinutes: Number(values.slot),
-                    isActive: values.isActive,
-                },
-                shift?.id,
-            );
-
-            if (error) setServerError(error);
-        } catch {
-            setServerError(t.failed);
-        } finally {
-            setSubmitting(false);
-        }
+        onSubmit(
+            {
+                doctorId: values.doctorId,
+                clinicId: values.clinicId,
+                serviceId: values.serviceId,
+                daysOfWeek: [...values.days].sort((a, b) => a - b),
+                startTime: values.startTime,
+                endTime: values.endTime,
+                slotDurationMinutes: Number(values.slot),
+                isActive: values.isActive,
+            },
+            shift?.id,
+        );
     };
 
     const labelClass = "mb-2 block text-sm font-semibold text-slate-900 dark:text-slate-100";
@@ -1505,7 +1773,7 @@ function ShiftFormModal({
         <div
             className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-900/50 p-0 backdrop-blur-sm dark:bg-slate-950/80 sm:items-center sm:p-4"
             onMouseDown={(event) => {
-                if (event.target === event.currentTarget && !submitting) onClose();
+                if (event.target === event.currentTarget) onClose();
             }}
         >
             <div
@@ -1531,7 +1799,6 @@ function ShiftFormModal({
                     <button
                         type="button"
                         aria-label={t.close}
-                        disabled={submitting}
                         onClick={onClose}
                         className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
                     >
@@ -1541,16 +1808,6 @@ function ShiftFormModal({
 
                 <form onSubmit={submit} noValidate className="flex min-h-0 flex-1 flex-col">
                     <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-6 sm:px-7">
-                        {serverError && (
-                            <div
-                                role="alert"
-                                className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-sm text-rose-500"
-                            >
-                                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-                                <p>{serverError}</p>
-                            </div>
-                        )}
-
                         <div>
                             <label htmlFor="shift-doctor" className={labelClass}>
                                 {t.fieldDoctor}
@@ -1730,6 +1987,14 @@ function ShiftFormModal({
                                     </div>
                                 </div>
                             </div>
+
+                            {timeInfo?.overnight && timeInfo.duration > 0 && timeInfo.duration <= MINUTES_IN_DAY && (
+                                <p className="mt-3 flex items-start gap-2 rounded-lg bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-600 dark:text-indigo-300">
+                                    <Moon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                    {fmt(t.overnightHint, { duration: formatDuration(timeInfo.duration, t) })}
+                                </p>
+                            )}
+
                             {errorText(errors.time)}
                             {errorText(errors.slot)}
                         </fieldset>
@@ -1744,7 +2009,7 @@ function ShiftFormModal({
                                     aria-label={t.fieldActive}
                                     onClick={() => patch({ isActive: !values.isActive })}
                                     className={cn(
-                                        "relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-900",
+                                        "relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white disabled:opacity-60 dark:focus:ring-offset-slate-900",
                                         values.isActive ? "bg-teal-600" : "bg-slate-300 dark:bg-slate-700",
                                     )}
                                 >
@@ -1769,17 +2034,11 @@ function ShiftFormModal({
                     </div>
 
                     <div className="flex flex-col-reverse gap-3 border-t border-slate-200 px-5 py-4 dark:border-slate-800 sm:flex-row sm:justify-end sm:px-7">
-                        <button
-                            type="button"
-                            disabled={submitting}
-                            onClick={onClose}
-                            className={cn(outlineButton, "px-6")}
-                        >
+                        <button type="button" onClick={onClose} className={cn(outlineButton, "px-6")}>
                             {t.cancel}
                         </button>
-                        <button type="submit" disabled={submitting} className={cn(primaryButton, "px-6")}>
-                            {submitting && <LoaderCircle className="h-4 w-4 animate-spin" />}
-                            {submitting ? t.saving : isEdit ? t.saveSubmit : t.createSubmit}
+                        <button type="submit" className={cn(primaryButton, "px-6")}>
+                            {isEdit ? t.saveSubmit : t.createSubmit}
                         </button>
                     </div>
                 </form>
@@ -1816,10 +2075,23 @@ export default function SchedulesShiftsPage({ initialLocale,
 
     const [modal, setModal] = useState<ModalState>(null);
     const [deleteTarget, setDeleteTarget] = useState<ShiftRow | null>(null);
-    const [deleting, setDeleting] = useState(false);
-    const [deleteError, setDeleteError] = useState("");
-    const [busyId, setBusyId] = useState<string | null>(null);
     const [notice, setNotice] = useState<Notice | null>(null);
+
+    /**
+     * Background sync bookkeeping. Nothing here ever blocks the UI:
+     *  - `queueRef` chains server calls per shift id so two actions on the same
+     *    shift reach the server in the order the user performed them, while
+     *    actions on different shifts run fully in parallel.
+     *  - `pendingCountRef` lets a finished request know if newer optimistic
+     *    changes are still queued (so it must not overwrite them).
+     *  - `syncing` only drives a tiny pulsing dot on the affected row.
+     */
+    const queueRef = useRef(new Map<string, Promise<void>>());
+    const pendingCountRef = useRef(new Map<string, number>());
+    const [syncing, setSyncing] = useState<ReadonlySet<string>>(() => new Set<string>());
+
+    const dataRef = useRef(data);
+    dataRef.current = data;
 
     const t = messages[locale];
     const isRtl = locale === "ar";
@@ -1848,13 +2120,14 @@ export default function SchedulesShiftsPage({ initialLocale,
     useEffect(() => {
         if (!notice) return;
 
-        const timer = window.setTimeout(() => setNotice(null), 7000);
+        const timer = window.setTimeout(() => setNotice(null), 5000);
 
         return () => window.clearTimeout(timer);
     }, [notice]);
 
     /* --------------------------------- loading -------------------------------- */
 
+    // Only used for the very first load (and the explicit Retry button).
     const loadData = useCallback(async () => {
         setLoading(true);
         setLoadError("");
@@ -1902,7 +2175,7 @@ export default function SchedulesShiftsPage({ initialLocale,
     const dayCounts = useMemo(
         () =>
             Array.from({ length: 7 }, (_, day) =>
-                baseFiltered.filter((shift) => shift.daysOfWeek.includes(day)).length,
+                baseFiltered.filter((shift) => shiftOccursOnDay(shift, day)).length,
             ),
         [baseFiltered],
     );
@@ -1923,7 +2196,7 @@ export default function SchedulesShiftsPage({ initialLocale,
         return sortRows(
             selectedDay === null
                 ? baseFiltered
-                : baseFiltered.filter((shift) => shift.daysOfWeek.includes(selectedDay)),
+                : baseFiltered.filter((shift) => shiftOccursOnDay(shift, selectedDay)),
         );
     }, [tab, baseFiltered, selectedDay, sortRows]);
 
@@ -1932,13 +2205,20 @@ export default function SchedulesShiftsPage({ initialLocale,
         [selectedDay],
     );
 
+    // Client-side pagination: 4 shifts per page.
     const totalPages = Math.max(1, Math.ceil(listRows.length / PAGE_SIZE));
     const currentPage = Math.min(page, totalPages);
     const pageRows = listRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
+    // Back to page 1 whenever the filtered set changes.
     useEffect(() => {
         setPage(1);
     }, [doctorFilter, clinicFilter, selectedDay, tab, view]);
+
+    // If the last row of the last page is removed, step back to a valid page.
+    useEffect(() => {
+        setPage((value) => Math.min(value, totalPages));
+    }, [totalPages]);
 
     const weekLabel = useMemo(() => {
         if (weekOffset === 0 || !weekStart) return t.thisWeek;
@@ -1946,7 +2226,11 @@ export default function SchedulesShiftsPage({ initialLocale,
         return `${formatDate(weekStart, locale)} – ${formatDate(addDays(weekStart, 6), locale)}`;
     }, [weekOffset, weekStart, locale, t.thisWeek]);
 
-    /* -------------------------------- handlers -------------------------------- */
+    /* ------------------------- optimistic state helpers ------------------------ */
+
+    const notify = useCallback((kind: Notice["kind"], message: string) => {
+        setNotice({ kind, message });
+    }, []);
 
     const upsertShift = useCallback((row: ShiftRow) => {
         setData((current) => ({
@@ -1956,6 +2240,96 @@ export default function SchedulesShiftsPage({ initialLocale,
                 : [...current.shifts, row],
         }));
     }, []);
+
+    const patchShift = useCallback((id: string, changes: Partial<ShiftRow>) => {
+        setData((current) => ({
+            ...current,
+            shifts: current.shifts.map((shift) => (shift.id === id ? { ...shift, ...changes } : shift)),
+        }));
+    }, []);
+
+    const removeShift = useCallback((id: string) => {
+        setData((current) => ({
+            ...current,
+            shifts: current.shifts.filter((shift) => shift.id !== id),
+        }));
+    }, []);
+
+    const restoreShift = useCallback((row: ShiftRow) => {
+        setData((current) =>
+            current.shifts.some((shift) => shift.id === row.id)
+                ? current
+                : { ...current, shifts: [...current.shifts, row] },
+        );
+    }, []);
+
+    /** Swaps an optimistic temp row for the server-confirmed row (or inserts it). */
+    const replaceShift = useCallback((tempId: string, row: ShiftRow) => {
+        setData((current) => {
+            const exists = current.shifts.some((shift) => shift.id === tempId);
+
+            return {
+                ...current,
+                shifts: exists
+                    ? current.shifts.map((shift) => (shift.id === tempId ? row : shift))
+                    : [...current.shifts.filter((shift) => shift.id !== row.id), row],
+            };
+        });
+    }, []);
+
+    const markSyncing = useCallback((id: string, on: boolean) => {
+        setSyncing((current) => {
+            if (current.has(id) === on) return current;
+
+            const next = new Set(current);
+
+            if (on) next.add(id);
+            else next.delete(id);
+
+            return next;
+        });
+    }, []);
+
+    /** True when no newer request for this id is waiting behind the current one. */
+    const isLastPending = useCallback((id: string) => (pendingCountRef.current.get(id) ?? 0) <= 1, []);
+
+    /**
+     * Runs a server task in the background. Tasks for the same id are chained
+     * (so the server sees them in click order); tasks for other ids don't wait.
+     * Callers have already updated the UI optimistically.
+     */
+    const enqueue = useCallback(
+        (id: string, task: () => Promise<void>) => {
+            const counts = pendingCountRef.current;
+
+            counts.set(id, (counts.get(id) ?? 0) + 1);
+            markSyncing(id, true);
+
+            const previous = queueRef.current.get(id) ?? Promise.resolve();
+
+            const run: Promise<void> = previous
+                .then(task)
+                .catch(() => undefined)
+                .finally(() => {
+                    const left = (counts.get(id) ?? 1) - 1;
+
+                    if (left <= 0) {
+                        counts.delete(id);
+
+                        if (queueRef.current.get(id) === run) queueRef.current.delete(id);
+
+                        markSyncing(id, false);
+                    } else {
+                        counts.set(id, left);
+                    }
+                });
+
+            queueRef.current.set(id, run);
+        },
+        [markSyncing],
+    );
+
+    /* -------------------------------- handlers -------------------------------- */
 
     const changeView = (next: ViewKey) => {
         setView(next);
@@ -1967,104 +2341,186 @@ export default function SchedulesShiftsPage({ initialLocale,
         }
     };
 
-    const submitShift = async (input: ShiftInput, shiftId?: string): Promise<string | null> => {
-        const result = shiftId
-            ? await updateShiftAction({ ...input, shiftId })
-            : await createShiftAction(input);
-
-        if (!result.success || !result.data) return result.error ?? t.failed;
-
-        upsertShift(result.data.shift);
+    /** Create / edit: the modal closes and the table updates instantly. */
+    const submitShift = (input: ShiftInput, shiftId?: string) => {
         setModal(null);
-        setNotice({ kind: "success", message: shiftId ? t.updated : t.created });
 
-        return null;
-    };
+        if (shiftId) {
+            const previous = dataRef.current.shifts.find((shift) => shift.id === shiftId);
 
-    const handleToggle = useCallback(
-        async (shift: ShiftRow) => {
-            setBusyId(shift.id);
+            if (!previous || isTempId(shiftId)) return;
 
+            upsertShift(buildOptimisticRow(input, dataRef.current, shiftId, previous));
+            notify("success", t.updated);
+
+            enqueue(shiftId, async () => {
+                const rollback = (message: string) => {
+                    upsertShift(previous);
+                    notify("error", message);
+                };
+
+                try {
+                    const result = await updateShiftAction({ ...input, shiftId });
+
+                    if (!result.success || !result.data) {
+                        rollback(result.error ?? t.failed);
+                        return;
+                    }
+
+                    // Don't clobber newer optimistic changes that are still queued.
+                    if (isLastPending(shiftId)) upsertShift(result.data.shift);
+                } catch {
+                    rollback(t.failed);
+                }
+            });
+
+            return;
+        }
+
+        const tempId = makeTempId();
+
+        upsertShift(buildOptimisticRow(input, dataRef.current, tempId));
+        notify("success", t.created);
+
+        enqueue(tempId, async () => {
             try {
-                const result = await toggleShiftStatusAction(shift.id);
+                const result = await createShiftAction(input);
 
                 if (!result.success || !result.data) {
-                    setNotice({ kind: "error", message: result.error ?? t.failed });
+                    removeShift(tempId);
+                    notify("error", result.error ?? t.failed);
                     return;
                 }
 
-                upsertShift(result.data.shift);
-                setNotice({
-                    kind: "success",
-                    message: result.data.shift.isActive ? t.resumed : t.paused,
-                });
+                replaceShift(tempId, result.data.shift);
             } catch {
-                setNotice({ kind: "error", message: t.failed });
-            } finally {
-                setBusyId(null);
+                removeShift(tempId);
+                notify("error", t.failed);
             }
-        },
-        [t, upsertShift],
-    );
+        });
+    };
 
-    const handleDuplicate = useCallback(
-        async (shift: ShiftRow) => {
-            setBusyId(shift.id);
+    /** Pause / Resume: the badge flips on the very click; the server catches up silently. */
+    const handleToggle = (shift: ShiftRow) => {
+        if (isTempId(shift.id)) return;
 
+        const target = !shift.isActive;
+
+        // Instant local conflict check for resuming (same rules as the server).
+        if (target) {
+            const mine = weeklyIntervals(shift.daysOfWeek, shift.startMinute, shift.endMinute);
+
+            const conflict = dataRef.current.shifts.some(
+                (item) =>
+                    item.id !== shift.id &&
+                    item.isActive &&
+                    item.doctorId === shift.doctorId &&
+                    intervalsOverlap(
+                        mine,
+                        weeklyIntervals(item.daysOfWeek, item.startMinute, item.endMinute),
+                    ),
+            );
+
+            if (conflict) {
+                notify("error", t.errOverlap);
+                return;
+            }
+        }
+
+        patchShift(shift.id, { isActive: target });
+        notify("success", target ? t.resumed : t.paused);
+
+        enqueue(shift.id, async () => {
+            const rollback = (message: string) => {
+                // Only revert if nothing newer has changed the state in the meantime.
+                if (isLastPending(shift.id)) patchShift(shift.id, { isActive: !target });
+
+                notify("error", message);
+            };
+
+            try {
+                // The desired state is sent explicitly, so a repeated request is idempotent.
+                const result = await toggleShiftStatusAction(shift.id, target);
+
+                if (!result.success || !result.data) {
+                    rollback(result.error ?? t.failed);
+                    return;
+                }
+
+                if (isLastPending(shift.id)) upsertShift(result.data.shift);
+            } catch {
+                rollback(t.failed);
+            }
+        });
+    };
+
+    /** Duplicate: a paused copy appears instantly, then swaps to the real row. */
+    const handleDuplicate = (shift: ShiftRow) => {
+        if (isTempId(shift.id)) return;
+
+        const tempId = makeTempId();
+        const now = new Date().toISOString();
+
+        upsertShift({ ...shift, id: tempId, isActive: false, createdAt: now, updatedAt: now });
+        notify("success", t.duplicated);
+
+        enqueue(tempId, async () => {
             try {
                 const result = await duplicateShiftAction(shift.id);
 
                 if (!result.success || !result.data) {
-                    setNotice({ kind: "error", message: result.error ?? t.failed });
+                    removeShift(tempId);
+                    notify("error", result.error ?? t.failed);
                     return;
                 }
 
-                upsertShift(result.data.shift);
-                setNotice({ kind: "success", message: t.duplicated });
+                replaceShift(tempId, result.data.shift);
             } catch {
-                setNotice({ kind: "error", message: t.failed });
-            } finally {
-                setBusyId(null);
+                removeShift(tempId);
+                notify("error", t.failed);
             }
-        },
-        [t, upsertShift],
-    );
+        });
+    };
 
-    async function confirmDelete() {
+    /** Delete: the row disappears at 0ms; it is restored (with a toast) only if the server refuses. */
+    const confirmDelete = () => {
         if (!deleteTarget) return;
 
-        setDeleting(true);
-        setDeleteError("");
+        const target = deleteTarget;
 
-        try {
-            const result = await deleteShiftAction(deleteTarget.id);
+        setDeleteTarget(null);
 
-            if (!result.success) {
-                setDeleteError(result.error ?? t.failed);
-                return;
+        if (isTempId(target.id)) return;
+
+        removeShift(target.id);
+        notify("success", t.deleted);
+
+        enqueue(target.id, async () => {
+            try {
+                const result = await deleteShiftAction(target.id);
+
+                if (!result.success) {
+                    restoreShift(target);
+                    notify("error", result.error ?? t.failed);
+                }
+            } catch {
+                restoreShift(target);
+                notify("error", t.failed);
             }
-
-            const removedId = deleteTarget.id;
-
-            setData((current) => ({
-                ...current,
-                shifts: current.shifts.filter((shift) => shift.id !== removedId),
-            }));
-            setDeleteTarget(null);
-            setNotice({ kind: "success", message: t.deleted });
-        } catch {
-            setDeleteError(t.failed);
-        } finally {
-            setDeleting(false);
-        }
-    }
+        });
+    };
 
     const handlers: RowHandlers = {
-        onEdit: (shift) => setModal({ mode: "edit", shift }),
-        onToggle: (shift) => void handleToggle(shift),
-        onDuplicate: (shift) => void handleDuplicate(shift),
+        onEdit: (shift) => {
+            if (isTempId(shift.id)) return;
+
+            setModal({ mode: "edit", shift });
+        },
+        onToggle: handleToggle,
+        onDuplicate: handleDuplicate,
         onDelete: (shift) => {
-            setDeleteError("");
+            if (isTempId(shift.id)) return;
+
             setDeleteTarget(shift);
         },
     };
@@ -2121,7 +2577,7 @@ export default function SchedulesShiftsPage({ initialLocale,
                         {/* Tabs */}
                         <div
                             role="tablist"
-                            className="flex gap-2 overflow-x-auto overflow-y-hidden border-b border-slate-200 dark:border-slate-800"
+                            className="flex gap-2 overflow-y-hidden overflow-x-auto border-b border-slate-200 dark:border-slate-800"
                         >
                             {(
                                 [
@@ -2317,12 +2773,7 @@ export default function SchedulesShiftsPage({ initialLocale,
 
                         {/* Content */}
                         <section className={cn(cardClass, "overflow-hidden")}>
-                            {loading && (
-                                <div className="flex items-center justify-center gap-3 px-6 py-20 text-sm text-slate-500 dark:text-slate-400">
-                                    <LoaderCircle className="h-5 w-5 animate-spin text-teal-500" />
-                                    {t.loading}
-                                </div>
-                            )}
+                            {loading && <ListSkeleton label={t.loading} />}
 
                             {!loading && loadError && (
                                 <div
@@ -2366,7 +2817,7 @@ export default function SchedulesShiftsPage({ initialLocale,
                                     today={today}
                                     locale={locale}
                                     t={t}
-                                    busyId={busyId}
+                                    syncing={syncing}
                                     handlers={handlers}
                                 />
                             )}
@@ -2378,7 +2829,7 @@ export default function SchedulesShiftsPage({ initialLocale,
                                         variant={tab}
                                         locale={locale}
                                         t={t}
-                                        busyId={busyId}
+                                        syncing={syncing}
                                         handlers={handlers}
                                     />
                                     <Pagination
@@ -2394,7 +2845,7 @@ export default function SchedulesShiftsPage({ initialLocale,
                         </section>
 
                         <footer className="flex flex-col items-center justify-between gap-2 border-t border-slate-200/80 py-5 text-xs text-slate-400 dark:border-slate-800 sm:flex-row">
-                            <span>
+                            <span suppressHydrationWarning>
                                 © {today ? today.getFullYear() : ""} Mjdital — {t.copyright}
                             </span>
                             <span className="inline-flex items-center gap-1.5">
@@ -2423,7 +2874,7 @@ export default function SchedulesShiftsPage({ initialLocale,
                 <div
                     className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm dark:bg-slate-950/80"
                     onMouseDown={(event) => {
-                        if (event.target === event.currentTarget && !deleting) setDeleteTarget(null);
+                        if (event.target === event.currentTarget) setDeleteTarget(null);
                     }}
                 >
                     <section
@@ -2449,20 +2900,9 @@ export default function SchedulesShiftsPage({ initialLocale,
                             </div>
                         </div>
 
-                        {deleteError && (
-                            <div
-                                role="alert"
-                                className="mt-4 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-sm text-rose-500"
-                            >
-                                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-                                <p>{deleteError}</p>
-                            </div>
-                        )}
-
                         <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
                             <button
                                 type="button"
-                                disabled={deleting}
                                 onClick={() => setDeleteTarget(null)}
                                 className={cn(outlineButton, "px-6")}
                             >
@@ -2470,16 +2910,11 @@ export default function SchedulesShiftsPage({ initialLocale,
                             </button>
                             <button
                                 type="button"
-                                disabled={deleting}
-                                onClick={() => void confirmDelete()}
-                                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-slate-950"
+                                onClick={confirmDelete}
+                                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950"
                             >
-                                {deleting ? (
-                                    <LoaderCircle className="h-4 w-4 animate-spin" />
-                                ) : (
-                                    <Trash2 className="h-4 w-4" />
-                                )}
-                                {deleting ? t.deleting : t.deleteConfirm}
+                                <Trash2 className="h-4 w-4" />
+                                {t.deleteConfirm}
                             </button>
                         </div>
                     </section>

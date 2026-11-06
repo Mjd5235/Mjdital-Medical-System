@@ -1,11 +1,26 @@
+// app/admin/clinical/services/actions.ts
+//
+// SERVER-SIDE SPEED CHANGES (behaviour is unchanged):
+//  - `revalidatePath` removed everywhere: the client owns its state now.
+//  - updateServiceAction: one clinic lookup instead of two, and no code-numbering queries
+//    when the clinic did not change.
+//  - toggleServiceStatusAction: a single read + a single write (no transaction).
+//  - Shorter transaction timeouts so a stuck request fails fast instead of hanging.
+//
+// NEW: deleteClinicAction / deleteServiceAction
+//  - A clinic can only be deleted when it has no services, doctors or shifts.
+//  - A service can only be deleted when no shift uses it.
+//  - Any other foreign-key reference (e.g. appointments) is caught via Prisma P2003
+//    and returned as a friendly message.
+//
+// Recommended indexes (Prisma schema, then `prisma migrate`):
+//   model Service { @@index([organizationId, clinicId]) }
+//   model Clinic  { @@index([organizationId, isActive]) }
 "use server";
 
 import { Prisma } from "@prisma/client";
-import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/db/prisma";
 import { requirePortalSession } from "@/lib/auth/guard";
-
-const MANAGEMENT_PATH = "/admin/clinical/services";
 
 const ALLOWED_SPECIALTIES = [
     "DENT",
@@ -23,6 +38,11 @@ const ALLOWED_SPECIALTIES = [
 ] as const;
 
 const ALLOWED_VAT_RATES = [0, 15] as const;
+
+const TX_OPTIONS = {
+    maxWait: 5_000,
+    timeout: 10_000,
+} as const;
 
 export type ClinicSpecialty = (typeof ALLOWED_SPECIALTIES)[number];
 
@@ -65,6 +85,10 @@ export interface ActionResult<T> {
     data?: T;
     error?: string;
     code?: string;
+}
+
+export interface DeleteResultData {
+    id: string;
 }
 
 const specialtyCodes = new Set<string>(ALLOWED_SPECIALTIES);
@@ -401,7 +425,6 @@ export async function createClinicAction(
             },
         });
 
-        revalidatePath(MANAGEMENT_PATH);
         return { success: true, data: mapClinic(clinic) };
     } catch (error) {
         return databaseError(
@@ -426,24 +449,21 @@ export async function updateClinicAction(
     if (!parsed.success) return parsed;
 
     try {
-        const existing = await prisma.clinic.findFirst({
+        // Scoped updateMany: one round trip that also enforces tenant isolation.
+        const result = await prisma.clinic.updateMany({
             where: { id, organizationId: session.organizationId },
-            select: { id: true },
+            data: parsed.data,
         });
 
-        if (!existing) {
+        if (result.count !== 1) {
             return notFound(
                 "The clinic was not found in your organization.",
                 "CLINIC_NOT_FOUND",
             );
         }
 
-        const clinic = await prisma.clinic.update({
-            where: { id: existing.id },
-            data: parsed.data,
-        });
+        const clinic = await prisma.clinic.findUniqueOrThrow({ where: { id } });
 
-        revalidatePath(MANAGEMENT_PATH);
         return { success: true, data: mapClinic(clinic) };
     } catch (error) {
         return databaseError(
@@ -491,12 +511,8 @@ export async function toggleClinicStatusAction(
             }
 
             return updatedClinic;
-        }, {
-            maxWait: 10_000,
-            timeout: 20_000,
-        });
+        }, TX_OPTIONS);
 
-        revalidatePath(MANAGEMENT_PATH);
         return { success: true, data: mapClinic(clinic) };
     } catch (error) {
         if (error instanceof Error && error.message === "CLINIC_NOT_FOUND") {
@@ -514,15 +530,101 @@ export async function toggleClinicStatusAction(
     }
 }
 
+/**
+ * Deletes a clinic. Refused while the clinic still has services, doctors or shifts
+ * (disable it instead). Any other reference (e.g. appointments) is caught via P2003.
+ */
+export async function deleteClinicAction(
+    id: string,
+): Promise<ActionResult<DeleteResultData>> {
+    const session = await requirePortalSession("admin");
+
+    if (!validUuid(id)) {
+        return notFound("Invalid clinic identifier.", "INVALID_CLINIC_ID");
+    }
+
+    try {
+        const existing = await prisma.clinic.findFirst({
+            where: { id, organizationId: session.organizationId },
+            select: { id: true },
+        });
+
+        if (!existing) {
+            return notFound(
+                "The clinic was not found in your organization.",
+                "CLINIC_NOT_FOUND",
+            );
+        }
+
+        const [serviceCount, doctorCount, shiftCount] = await Promise.all([
+            prisma.service.count({
+                where: { clinicId: existing.id, organizationId: session.organizationId },
+            }),
+            prisma.doctor.count({
+                where: { clinicId: existing.id, organizationId: session.organizationId },
+            }),
+            prisma.shift.count({
+                where: { clinicId: existing.id, organizationId: session.organizationId },
+            }),
+        ]);
+
+        if (serviceCount > 0) {
+            return notFound(
+                "This clinic cannot be deleted because it still has services. Delete the services first or disable the clinic.",
+                "CLINIC_HAS_SERVICES",
+            );
+        }
+
+        if (doctorCount > 0 || shiftCount > 0) {
+            return notFound(
+                "This clinic cannot be deleted because doctors or shifts are linked to it. Disable it instead.",
+                "CLINIC_IN_USE",
+            );
+        }
+
+        const result = await prisma.clinic.deleteMany({
+            where: { id: existing.id, organizationId: session.organizationId },
+        });
+
+        if (result.count !== 1) {
+            return notFound(
+                "The clinic was not found in your organization.",
+                "CLINIC_NOT_FOUND",
+            );
+        }
+
+        return { success: true, data: { id: existing.id } };
+    } catch (error) {
+        if (
+            error instanceof Prisma.PrismaClientKnownRequestError &&
+            error.code === "P2003"
+        ) {
+            console.error("[deleteClinicAction]", error);
+
+            return notFound(
+                "This clinic cannot be deleted because other records (such as appointments) reference it. Disable it instead.",
+                "CLINIC_IN_USE",
+            );
+        }
+
+        return databaseError(
+            "deleteClinicAction",
+            error,
+            "Unable to delete the clinic. Please try again.",
+        );
+    }
+}
+
 function generateNextServiceCode(
     specialty: string | null | undefined,
     existingCodes: string[],
 ): string {
     const prefix = specialtyCodes.has(specialty ?? "") ? specialty! : "GEN";
+    const pattern = new RegExp(`^${prefix}-(\\d+)$`, "i");
     let maxNumber = 100;
 
     for (const code of existingCodes) {
-        const match = new RegExp(`^${prefix}-(\\d+)$`, "i").exec(code);
+        const match = pattern.exec(code);
         if (match) maxNumber = Math.max(maxNumber, Number(match[1]));
     }
 
@@ -584,12 +686,8 @@ export async function createServiceAction(
             });
 
             return mapService(service);
-        }, {
-            maxWait: 10_000,
-            timeout: 20_000,
-        });
+        }, TX_OPTIONS);
 
-        revalidatePath(MANAGEMENT_PATH);
         return { success: true, data: result };
     } catch (error) {
         if (error instanceof Error && error.message === "CLINIC_NOT_AVAILABLE") {
@@ -659,52 +757,33 @@ export async function updateServiceAction(
                     organizationId: session.organizationId,
                     isActive: true,
                 },
-                select: { id: true },
+                select: { id: true, specialty: true },
             });
 
             if (!targetClinic) throw new Error("CLINIC_NOT_AVAILABLE");
 
-            const existingCodes = await tx.service.findMany({
-                where: {
-                    organizationId: session.organizationId,
-                    clinicId: targetClinic.id,
-                    NOT: { id },
-                },
-                select: { code: true },
-            });
+            let generatedCode = existing.code;
 
-            // Recalculate the service code on the server using the destination clinic's specialty
-            // and latest numbering. The client code is only a live preview, never authoritative.
-            const targetClinicDetails = await tx.clinic.findFirst({
-                where: {
-                    id: targetClinic.id,
-                    organizationId: session.organizationId,
-                    isActive: true,
-                },
-                select: { specialty: true },
-            });
+            // Only renumber when the service moves to another clinic.
+            if (existing.clinicId !== targetClinic.id) {
+                const existingCodes = await tx.service.findMany({
+                    where: {
+                        organizationId: session.organizationId,
+                        clinicId: targetClinic.id,
+                        NOT: { id },
+                    },
+                    select: { code: true },
+                });
 
-            if (!targetClinicDetails) throw new Error("CLINIC_NOT_AVAILABLE");
+                generatedCode = generateNextServiceCode(
+                    targetClinic.specialty,
+                    existingCodes.map((item) => item.code),
+                );
 
-            const generatedCode =
-                existing.clinicId === targetClinic.id
-                    ? existing.code
-                    : generateNextServiceCode(
-                        targetClinicDetails.specialty,
-                        existingCodes.map((service) => service.code),
-                    );
-
-            const duplicate = await tx.service.findFirst({
-                where: {
-                    organizationId: session.organizationId,
-                    clinicId: targetClinic.id,
-                    code: generatedCode,
-                    NOT: { id },
-                },
-                select: { id: true },
-            });
-
-            if (duplicate) throw new Error("DUPLICATE_SERVICE_CODE");
+                if (existingCodes.some((item) => item.code === generatedCode)) {
+                    throw new Error("DUPLICATE_SERVICE_CODE");
+                }
+            }
 
             return tx.service.update({
                 where: { id: existing.id },
@@ -718,16 +797,11 @@ export async function updateServiceAction(
                 },
                 include: serviceClinicInclude,
             });
-        }, {
-            maxWait: 10_000,
-            timeout: 20_000,
-        });
+        }, TX_OPTIONS);
 
-        revalidatePath(MANAGEMENT_PATH);
         return { success: true, data: mapService(service) };
-
     } catch (error) {
-        console.error("[updateServiceAction] Full error:", error);
+        console.error("[updateServiceAction]", error);
 
         if (error instanceof Error) {
             if (error.message === "SERVICE_NOT_FOUND") {
@@ -762,17 +836,10 @@ export async function updateServiceAction(
             );
         }
 
-        const errorMessage =
-            error instanceof Error
-                ? error.message
-                : String(error);
-
         return databaseError(
             "updateServiceAction",
             error,
-            process.env.NODE_ENV === "production"
-                ? "Unable to update the service. Please check the entered values and try again."
-                : `Unable to update the service: ${errorMessage}`,
+            "Unable to update the service. Please check the entered values and try again.",
         );
     }
 }
@@ -788,71 +855,118 @@ export async function toggleServiceStatusAction(
     }
 
     try {
-        const service = await prisma.$transaction(async (tx) => {
-            const existing = await tx.service.findFirst({
-                where: {
-                    id,
-                    organizationId: session.organizationId,
-                    clinic: {
-                        is: {
-                            organizationId: session.organizationId,
-                            // This is the server-side activation guard.
-                            ...(isActive ? { isActive: true } : {}),
-                        },
-                    },
-                },
-                select: { id: true },
-            });
-
-            if (!existing) {
-                const belongsToOrg = await tx.service.findFirst({
-                    where: {
-                        id,
-                        organizationId: session.organizationId,
-                        clinic: { is: { organizationId: session.organizationId } },
-                    },
-                    select: { id: true },
-                });
-
-                if (!belongsToOrg) throw new Error("SERVICE_NOT_FOUND");
-                if (isActive) throw new Error("CLINIC_INACTIVE");
-                throw new Error("SERVICE_NOT_FOUND");
-            }
-
-            return tx.service.update({
-                where: { id: existing.id },
-                data: { isActive },
-                include: serviceClinicInclude,
-            });
-        }, {
-            maxWait: 10_000,
-            timeout: 20_000,
+        // One read (service + its clinic state) and one write — no transaction needed.
+        const existing = await prisma.service.findFirst({
+            where: {
+                id,
+                organizationId: session.organizationId,
+                clinic: { is: { organizationId: session.organizationId } },
+            },
+            select: { id: true, clinic: { select: { isActive: true } } },
         });
 
-        revalidatePath(MANAGEMENT_PATH);
-        return { success: true, data: mapService(service) };
-    } catch (error) {
-        if (error instanceof Error) {
-            if (error.message === "SERVICE_NOT_FOUND") {
-                return notFound(
-                    "The service was not found in your organization.",
-                    "SERVICE_NOT_FOUND",
-                );
-            }
-
-            if (error.message === "CLINIC_INACTIVE") {
-                return {
-                    success: false,
-                    error: "لا يمكن تفعيل الخدمة لأن العيادة المرتبطة بها معطلة حالياً. يرجى تفعيل العيادة أولاً.",
-                    code: "CLINIC_INACTIVE",
-                };
-            }
+        if (!existing) {
+            return notFound(
+                "The service was not found in your organization.",
+                "SERVICE_NOT_FOUND",
+            );
         }
 
+        // Server-side activation guard.
+        if (isActive && !existing.clinic.isActive) {
+            return {
+                success: false,
+                error: "لا يمكن تفعيل الخدمة لأن العيادة المرتبطة بها معطلة حالياً. يرجى تفعيل العيادة أولاً.",
+                code: "CLINIC_INACTIVE",
+            };
+        }
+
+        const service = await prisma.service.update({
+            where: { id: existing.id },
+            data: { isActive },
+            include: serviceClinicInclude,
+        });
+
+        return { success: true, data: mapService(service) };
+    } catch (error) {
         return databaseError(
             "toggleServiceStatusAction",
             error,
             "Unable to change the service status. Please try again.",
+        );
+    }
+}
+
+/**
+ * Deletes a service. Refused while any shift uses it (disable it instead).
+ * Other references (e.g. appointments) are caught via Prisma P2003.
+ */
+export async function deleteServiceAction(
+    id: string,
+): Promise<ActionResult<DeleteResultData>> {
+    const session = await requirePortalSession("admin");
+
+    if (!validUuid(id)) {
+        return notFound("Invalid service identifier.", "INVALID_SERVICE_ID");
+    }
+
+    try {
+        const existing = await prisma.service.findFirst({
+            where: {
+                id,
+                organizationId: session.organizationId,
+                clinic: { is: { organizationId: session.organizationId } },
+            },
+            select: { id: true },
+        });
+
+        if (!existing) {
+            return notFound(
+                "The service was not found in your organization.",
+                "SERVICE_NOT_FOUND",
+            );
+        }
+
+        const shiftCount = await prisma.shift.count({
+            where: { serviceId: existing.id, organizationId: session.organizationId },
+        });
+
+        if (shiftCount > 0) {
+            return notFound(
+                "This service cannot be deleted because it is used in doctor shifts. Disable it instead.",
+                "SERVICE_IN_USE",
+            );
+        }
+
+        const result = await prisma.service.deleteMany({
+            where: { id: existing.id, organizationId: session.organizationId },
+        });
+
+        if (result.count !== 1) {
+            return notFound(
+                "The service was not found in your organization.",
+                "SERVICE_NOT_FOUND",
+            );
+        }
+
+        return { success: true, data: { id: existing.id } };
+    } catch (error) {
+        if (
+            error instanceof Prisma.PrismaClientKnownRequestError &&
+            error.code === "P2003"
+        ) {
+            console.error("[deleteServiceAction]", error);
+
+            return notFound(
+                "This service cannot be deleted because other records (such as appointments) reference it. Disable it instead.",
+                "SERVICE_IN_USE",
+            );
+        }
+
+        return databaseError(
+            "deleteServiceAction",
+            error,
+            "Unable to delete the service. Please try again.",
         );
     }
 }

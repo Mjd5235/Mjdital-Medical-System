@@ -1,10 +1,11 @@
-
+// app/admin/clinical/services/page.tsx
 "use client";
 
 import {
     useCallback,
     useEffect,
     useMemo,
+    useRef,
     useState,
     type FormEvent,
     type ReactNode,
@@ -16,6 +17,7 @@ import {
     Check,
     ChevronDown,
     ChevronLeft,
+    CircleAlert,
     CircleDollarSign,
     ClipboardList,
     Coins,
@@ -26,6 +28,7 @@ import {
     PowerOff,
     Search,
     ShieldCheck,
+    Trash2,
     X,
 } from "lucide-react";
 
@@ -39,6 +42,8 @@ import {
     updateServiceAction,
     toggleClinicStatusAction,
     toggleServiceStatusAction,
+    deleteClinicAction,
+    deleteServiceAction,
     getClinicsData,
     getServicesData,
     type ClinicSpecialty,
@@ -94,6 +99,16 @@ type StatusTarget = {
     isActive: boolean;
 };
 
+type DeleteTarget = {
+    type: "clinic" | "service";
+    id: string;
+    name: string;
+};
+
+type Toast = { kind: "success" | "error"; message: string };
+
+const TEMP_PREFIX = "temp-";
+
 const specialties: {
     code: ClinicSpecialty;
     en: string;
@@ -111,8 +126,7 @@ const specialties: {
         { code: "OPH", en: "Ophthalmology", ar: "طب العيون", nphies: "OPH-09" },
         { code: "ENT", en: "ENT / Otolaryngology", ar: "أنف وأذن وحنجرة", nphies: "ENT-10" },
         { code: "LAB", en: "Laboratory", ar: "المختبر / التحاليل", nphies: "LAB-11" },
-        { code: "RAD", en: "Radiology", ar: "الأشعة / السونار", nphies: "RAD-12" }
-
+        { code: "RAD", en: "Radiology", ar: "الأشعة / السونار", nphies: "RAD-12" },
     ];
 
 const translations = {
@@ -170,6 +184,7 @@ const translations = {
         codeRequired: "يرجى إدخال رمز صالح.",
         clinicRequired: "يرجى اختيار عيادة نشطة.",
         serviceClinicInactive: "لا يمكن تفعيل الخدمة لأن العيادة المرتبطة بها معطلة حالياً. يرجى تفعيل العيادة أولاً.",
+        serviceClinicDisabledSelect: "لا يمكن ربط الخدمة بعيادة معطلة. يرجى تفعيل العيادة أولاً.",
         priceRequired: "يرجى إدخال سعر صالح.",
         close: "إغلاق النافذة",
         newClinic: "عيادة جديدة",
@@ -179,6 +194,18 @@ const translations = {
         editService: "تعديل الخدمة",
         enable: "تفعيل",
         disable: "تعطيل",
+        delete: "حذف",
+        deleteClinic: "حذف العيادة",
+        deleteService: "حذف الخدمة",
+        confirmDeleteTitle: "تأكيد الحذف",
+        confirmDeleteClinic: "هل أنت متأكد من حذف العيادة",
+        confirmDeleteService: "هل أنت متأكد من حذف الخدمة",
+        deleteWarning: "لا يمكن التراجع عن هذا الإجراء.",
+        deleteClinicHint: "لا يمكن حذف عيادة مرتبطة بخدمات أو أطباء أو شفتات. عطّلها بدلاً من ذلك.",
+        deleteServiceHint: "لا يمكن حذف خدمة مستخدمة في شفتات أو مواعيد. عطّلها بدلاً من ذلك.",
+        clinicHasServices: "لا يمكن حذف هذه العيادة لأنها تحتوي على خدمات. احذف الخدمات أولاً أو عطّل العيادة.",
+        deletedClinic: "تم حذف العيادة.",
+        deletedService: "تم حذف الخدمة.",
         confirm: "تأكيد العملية",
         confirmEnable: "هل أنت متأكد من تفعيل",
         confirmDisable: "هل أنت متأكد من تعطيل",
@@ -204,6 +231,7 @@ const translations = {
         tryAgain: "حاول مرة أخرى",
         notifications: "الإشعارات",
         menuOpen: "فتح القائمة الجانبية",
+        syncing: "جارٍ المزامنة…",
     },
     en: {
         greeting: "Hello, Noura",
@@ -259,6 +287,7 @@ const translations = {
         codeRequired: "Enter a valid code.",
         clinicRequired: "Select an active clinic.",
         serviceClinicInactive: "This service cannot be activated because its associated clinic is inactive. Activate the clinic first.",
+        serviceClinicDisabledSelect: "A service cannot be linked to an inactive clinic. Activate the clinic first.",
         priceRequired: "Enter a valid price.",
         close: "Close dialog",
         newClinic: "New Clinic",
@@ -268,6 +297,18 @@ const translations = {
         editService: "Edit Service",
         enable: "Enable",
         disable: "Disable",
+        delete: "Delete",
+        deleteClinic: "Delete Clinic",
+        deleteService: "Delete Service",
+        confirmDeleteTitle: "Confirm Deletion",
+        confirmDeleteClinic: "Are you sure you want to delete the clinic",
+        confirmDeleteService: "Are you sure you want to delete the service",
+        deleteWarning: "This action cannot be undone.",
+        deleteClinicHint: "A clinic linked to services, doctors or shifts cannot be deleted. Disable it instead.",
+        deleteServiceHint: "A service used in shifts or appointments cannot be deleted. Disable it instead.",
+        clinicHasServices: "This clinic cannot be deleted because it still has services. Delete the services first or disable the clinic.",
+        deletedClinic: "Clinic deleted.",
+        deletedService: "Service deleted.",
         confirm: "Confirm Action",
         confirmEnable: "Are you sure you want to enable",
         confirmDisable: "Are you sure you want to disable",
@@ -293,10 +334,9 @@ const translations = {
         tryAgain: "Try again",
         notifications: "Notifications",
         menuOpen: "Open sidebar",
+        syncing: "Syncing…",
     },
 } as const;
-
-type TranslationKey = keyof typeof translations.en;
 
 function cn(...classes: Array<string | false | null | undefined>) {
     return classes.filter(Boolean).join(" ");
@@ -322,6 +362,42 @@ function getSpecialtyLabel(code: string | null, locale: Locale) {
     return locale === "ar" ? specialty.ar : specialty.en;
 }
 
+/** Optimistic (not yet confirmed by the server) rows use a temporary id. */
+function isTempId(id: string) {
+    return id.startsWith(TEMP_PREFIX);
+}
+
+function makeTempId() {
+    const random =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    return `${TEMP_PREFIX}${random}`;
+}
+
+/** Puts a removed row back at (about) its original position after a failed delete. */
+function insertAt<T>(list: T[], item: T, index: number): T[] {
+    const next = [...list];
+
+    next.splice(Math.min(Math.max(index, 0), next.length), 0, item);
+
+    return next;
+}
+
+/** Same math the server uses (2 decimals), used to build optimistic rows. */
+function computePricing(basePrice: number, vatRate: number) {
+    const base = Math.round(basePrice * 100) / 100;
+    const vat = Math.round(base * vatRate) / 100;
+    const total = Math.round((base + vat) * 100) / 100;
+
+    return {
+        basePrice: base.toFixed(2),
+        vatAmount: vat.toFixed(2),
+        totalPrice: total.toFixed(2),
+    };
+}
+
 function Field({
     label,
     children,
@@ -338,7 +414,7 @@ function Field({
             </label>
             {children}
             {hint && (
-                <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">Error: Failed to run sql query: ERROR: 42501: must be owner of table clinics
+                <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
                     {hint}
                 </p>
             )}
@@ -348,6 +424,9 @@ function Field({
 
 const inputClass =
     "h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-white dark:disabled:bg-slate-800";
+
+const deleteButtonClass =
+    "grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-500 transition hover:border-rose-300 hover:bg-rose-50 hover:text-rose-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-400 dark:hover:border-rose-900 dark:hover:bg-rose-950/40 dark:hover:text-rose-400";
 
 export default function ClinicsServicesPage({ initialLocale,
 }: ClinicsServicesProps) {
@@ -361,15 +440,15 @@ export default function ClinicsServicesPage({ initialLocale,
 
     const [search, setSearch] = useState("");
     const [loading, setLoading] = useState(true);
-    const [submitting, setSubmitting] = useState(false);
-    const [statusSubmitting, setStatusSubmitting] = useState(false);
     const [error, setError] = useState("");
     const [success, setSuccess] = useState("");
+    const [toast, setToast] = useState<Toast | null>(null);
     const [year, setYear] = useState<number | null>(null);
 
     const [editingClinic, setEditingClinic] = useState<ClinicRow | null>(null);
     const [editingService, setEditingService] = useState<ServiceRow | null>(null);
     const [statusTarget, setStatusTarget] = useState<StatusTarget | null>(null);
+    const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
 
     const [clinicForm, setClinicForm] = useState<CreateClinicInput>({
         nameEn: "",
@@ -387,6 +466,23 @@ export default function ClinicsServicesPage({ initialLocale,
         basePrice: "",
         vatRate: 15,
     });
+
+    /**
+     * Background sync bookkeeping. Nothing here ever blocks the UI:
+     *  - `queueRef` chains server calls per record id, so two actions on the same
+     *    record reach the server in click order, while different records run in parallel.
+     *  - `pendingCountRef` lets a finished request know if newer optimistic
+     *    changes are still queued (so it must not overwrite or roll them back).
+     *  - `syncing` only drives a subtle dimming of the affected row.
+     */
+    const queueRef = useRef(new Map<string, Promise<void>>());
+    const pendingCountRef = useRef(new Map<string, number>());
+    const [syncing, setSyncing] = useState<ReadonlySet<string>>(() => new Set<string>());
+
+    const clinicsRef = useRef(clinics);
+    const servicesRef = useRef(services);
+    clinicsRef.current = clinics;
+    servicesRef.current = services;
 
     const isRtl = locale === "ar";
     const t = translations[locale];
@@ -414,6 +510,23 @@ export default function ClinicsServicesPage({ initialLocale,
         return () => observer.disconnect();
     }, []);
 
+    useEffect(() => {
+        if (!toast) return;
+
+        const timer = window.setTimeout(() => setToast(null), 6000);
+
+        return () => window.clearTimeout(timer);
+    }, [toast]);
+
+    useEffect(() => {
+        if (!success) return;
+
+        const timer = window.setTimeout(() => setSuccess(""), 5000);
+
+        return () => window.clearTimeout(timer);
+    }, [success]);
+
+    // Only used for the very first load (and the explicit "try again" link).
     const loadData = useCallback(async () => {
         setLoading(true);
         setError("");
@@ -443,27 +556,123 @@ export default function ClinicsServicesPage({ initialLocale,
     }, [loadData]);
 
     useEffect(() => {
-        if (!modal && !statusTarget) return;
+        if (!modal && !statusTarget && !deleteTarget) return;
 
         const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key !== "Escape" || submitting || statusSubmitting) {
-                return;
-            }
+            if (event.key !== "Escape") return;
 
             setModal(null);
             setEditingClinic(null);
             setEditingService(null);
             setStatusTarget(null);
+            setDeleteTarget(null);
             setError("");
         };
 
         document.addEventListener("keydown", onKeyDown);
 
         return () => document.removeEventListener("keydown", onKeyDown);
-    }, [modal, statusTarget, submitting, statusSubmitting]);
+    }, [modal, statusTarget, deleteTarget]);
 
+    /* ------------------------- optimistic infrastructure ------------------------ */
+
+    const notifyError = useCallback((message: string) => {
+        setToast({ kind: "error", message });
+    }, []);
+
+    const markSyncing = useCallback((id: string, on: boolean) => {
+        setSyncing((current) => {
+            if (current.has(id) === on) return current;
+
+            const next = new Set(current);
+
+            if (on) next.add(id);
+            else next.delete(id);
+
+            return next;
+        });
+    }, []);
+
+    /** True when no newer request for this id is waiting behind the current one. */
+    const isLastPending = useCallback(
+        (id: string) => (pendingCountRef.current.get(id) ?? 0) <= 1,
+        [],
+    );
+
+    /**
+     * Runs a server task in the background. Tasks for the same id are chained
+     * (so the server sees them in click order); tasks for other ids don't wait.
+     * Callers have already updated the UI optimistically.
+     */
+    const enqueue = useCallback(
+        (id: string, task: () => Promise<void>) => {
+            const counts = pendingCountRef.current;
+
+            counts.set(id, (counts.get(id) ?? 0) + 1);
+            markSyncing(id, true);
+
+            const previous = queueRef.current.get(id) ?? Promise.resolve();
+
+            const run: Promise<void> = previous
+                .then(task)
+                .catch(() => undefined)
+                .finally(() => {
+                    const left = (counts.get(id) ?? 1) - 1;
+
+                    if (left <= 0) {
+                        counts.delete(id);
+
+                        if (queueRef.current.get(id) === run) queueRef.current.delete(id);
+
+                        markSyncing(id, false);
+                    } else {
+                        counts.set(id, left);
+                    }
+                });
+
+            queueRef.current.set(id, run);
+        },
+        [markSyncing],
+    );
+
+    const patchClinicLocal = useCallback((row: ClinicRow) => {
+        setClinics((current) =>
+            current.map((clinic) => (clinic.id === row.id ? row : clinic)),
+        );
+    }, []);
+
+    const patchServiceLocal = useCallback((row: ServiceRow) => {
+        setServices((current) =>
+            current.map((service) => (service.id === row.id ? row : service)),
+        );
+    }, []);
+
+    /** Keeps the clinic names embedded in service rows in sync with the clinic. */
+    const syncClinicNames = useCallback(
+        (clinic: Pick<ClinicRow, "id" | "nameAr" | "nameEn">) => {
+            setServices((current) =>
+                current.map((service) =>
+                    service.clinicId === clinic.id
+                        ? {
+                            ...service,
+                            clinic: {
+                                id: clinic.id,
+                                nameAr: clinic.nameAr,
+                                nameEn: clinic.nameEn,
+                            },
+                        }
+                        : service,
+                ),
+            );
+        },
+        [],
+    );
+
+    /* --------------------------------- derived --------------------------------- */
+
+    // Temporary (unconfirmed) clinics can't own services yet.
     const activeClinics = useMemo(
-        () => clinics.filter((clinic) => clinic.isActive),
+        () => clinics.filter((clinic) => clinic.isActive && !isTempId(clinic.id)),
         [clinics],
     );
 
@@ -606,8 +815,6 @@ export default function ClinicsServicesPage({ initialLocale,
     };
 
     const closeModal = () => {
-        if (submitting) return;
-
         setModal(null);
         setEditingClinic(null);
         setEditingService(null);
@@ -615,6 +822,8 @@ export default function ClinicsServicesPage({ initialLocale,
     };
 
     const openEditClinic = (clinic: ClinicRow) => {
+        if (isTempId(clinic.id)) return;
+
         setError("");
         setSuccess("");
         setEditingClinic(clinic);
@@ -632,6 +841,8 @@ export default function ClinicsServicesPage({ initialLocale,
     };
 
     const openEditService = (service: ServiceRow) => {
+        if (isTempId(service.id)) return;
+
         setError("");
         setSuccess("");
         setEditingService(service);
@@ -653,6 +864,8 @@ export default function ClinicsServicesPage({ initialLocale,
         type: "clinic" | "service",
         item: ClinicRow | ServiceRow,
     ) => {
+        if (isTempId(item.id)) return;
+
         setError("");
         setSuccess("");
 
@@ -671,9 +884,37 @@ export default function ClinicsServicesPage({ initialLocale,
         });
     };
 
-    const handleClinicSubmit = async (
-        event: FormEvent<HTMLFormElement>,
+    const requestDelete = (
+        type: "clinic" | "service",
+        item: ClinicRow | ServiceRow,
     ) => {
+        if (isTempId(item.id)) return;
+
+        setError("");
+        setSuccess("");
+
+        // Instant client-side guard (the server enforces the same rule).
+        if (
+            type === "clinic" &&
+            servicesRef.current.some((service) => service.clinicId === item.id)
+        ) {
+            notifyError(t.clinicHasServices);
+            return;
+        }
+
+        const name =
+            type === "clinic"
+                ? clinicName(item as ClinicRow)
+                : isRtl
+                    ? (item as ServiceRow).nameAr
+                    : (item as ServiceRow).nameEn;
+
+        setDeleteTarget({ type, id: item.id, name });
+    };
+
+    /* ------------------------------ clinic mutations ------------------------------ */
+
+    const handleClinicSubmit = (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
         setError("");
         setSuccess("");
@@ -693,72 +934,129 @@ export default function ClinicsServicesPage({ initialLocale,
             return;
         }
 
-        setSubmitting(true);
+        const nameEn = clinicForm.nameEn.trim();
+        const nameAr = clinicForm.nameAr.trim();
+        const nphiesCode = clinicForm.nphiesCode.trim().toUpperCase();
+        const now = new Date().toISOString();
 
-        try {
-            if (editingClinic) {
-                const input: UpdateClinicInput = {
-                    nameEn: clinicForm.nameEn.trim(),
-                    nameAr: clinicForm.nameAr.trim(),
-                    specialty: clinicForm.specialty,
-                    nphiesCode: clinicForm.nphiesCode.trim().toUpperCase(),
-                };
+        if (editingClinic) {
+            const previous =
+                clinicsRef.current.find((clinic) => clinic.id === editingClinic.id) ??
+                editingClinic;
 
-                const result = await updateClinicAction(
-                    editingClinic.id,
-                    input,
-                );
+            if (isTempId(previous.id)) return;
 
-                if (!result.success || !result.data) {
-                    setError(result.error || t.failed);
-                    return;
-                }
+            const optimistic: ClinicRow = {
+                ...previous,
+                nameEn,
+                nameAr,
+                specialty: clinicForm.specialty,
+                nphiesCode,
+                updatedAt: now,
+            };
 
-                setClinics((current) =>
-                    current.map((clinic) =>
-                        clinic.id === result.data!.id
-                            ? (result.data as ClinicRow)
-                            : clinic,
-                    ),
-                );
-
-                setSuccess(t.updatedClinic);
-            } else {
-                const input: CreateClinicInput = {
-                    ...clinicForm,
-                    nameEn: clinicForm.nameEn.trim(),
-                    nameAr: clinicForm.nameAr.trim(),
-                    nphiesCode: clinicForm.nphiesCode.trim().toUpperCase(),
-                };
-
-                const result = await createClinicAction(input);
-
-                if (!result.success || !result.data) {
-                    setError(result.error || t.failed);
-                    return;
-                }
-
-                setClinics((current) => [
-                    result.data as ClinicRow,
-                    ...current,
-                ]);
-
-                setSuccess(t.successClinic);
-            }
-
+            // 0ms: update the row and close the dialog immediately.
+            patchClinicLocal(optimistic);
+            syncClinicNames(optimistic);
+            setSuccess(t.updatedClinic);
             setModal(null);
             setEditingClinic(null);
             setSearch("");
-        } catch {
-            setError(t.failed);
-        } finally {
-            setSubmitting(false);
+
+            const input: UpdateClinicInput = {
+                nameEn,
+                nameAr,
+                specialty: clinicForm.specialty,
+                nphiesCode,
+            };
+
+            enqueue(previous.id, async () => {
+                const rollback = (message: string) => {
+                    if (isLastPending(previous.id)) {
+                        patchClinicLocal(previous);
+                        syncClinicNames(previous);
+                    }
+
+                    setSuccess("");
+                    notifyError(message);
+                };
+
+                try {
+                    const result = await updateClinicAction(previous.id, input);
+
+                    if (!result.success || !result.data) {
+                        rollback(result.error || t.failed);
+                        return;
+                    }
+
+                    if (isLastPending(previous.id)) {
+                        const confirmed = result.data as ClinicRow;
+
+                        patchClinicLocal(confirmed);
+                        syncClinicNames(confirmed);
+                    }
+                } catch {
+                    rollback(t.failed);
+                }
+            });
+
+            return;
         }
+
+        const tempId = makeTempId();
+
+        const optimistic: ClinicRow = {
+            id: tempId,
+            nameEn,
+            nameAr,
+            specialty: clinicForm.specialty,
+            nphiesCode,
+            isActive: clinicForm.isActive,
+            createdAt: now,
+            updatedAt: now,
+        };
+
+        setClinics((current) => [optimistic, ...current]);
+        setSuccess(t.successClinic);
+        setModal(null);
+        setSearch("");
+
+        const input: CreateClinicInput = {
+            ...clinicForm,
+            nameEn,
+            nameAr,
+            nphiesCode,
+        };
+
+        enqueue(tempId, async () => {
+            const rollback = (message: string) => {
+                setClinics((current) => current.filter((clinic) => clinic.id !== tempId));
+                setSuccess("");
+                notifyError(message);
+            };
+
+            try {
+                const result = await createClinicAction(input);
+
+                if (!result.success || !result.data) {
+                    rollback(result.error || t.failed);
+                    return;
+                }
+
+                const confirmed = result.data as ClinicRow;
+
+                setClinics((current) =>
+                    current.map((clinic) => (clinic.id === tempId ? confirmed : clinic)),
+                );
+            } catch {
+                rollback(t.failed);
+            }
+        });
     };
 
-    const handleServiceSubmit = async (
-        event: FormEvent<HTMLFormElement>,
-    ) => {
+    /* ------------------------------ service mutations ----------------------------- */
+
+    const handleServiceSubmit = (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
         setError("");
         setSuccess("");
@@ -773,14 +1071,14 @@ export default function ClinicsServicesPage({ initialLocale,
             return;
         }
 
-        if (!editingService && !activeClinics.some(
-            (clinic) => clinic.id === serviceForm.clinicId,
-        )) {
-            setError(t.clinicRequired);
-            return;
-        }
+        const targetClinic = clinics.find(
+            (clinic) =>
+                clinic.id === serviceForm.clinicId &&
+                clinic.isActive &&
+                !isTempId(clinic.id),
+        );
 
-        if (!clinics.some((clinic) => clinic.id === serviceForm.clinicId && clinic.isActive)) {
+        if (!targetClinic) {
             setError(t.clinicRequired);
             return;
         }
@@ -790,160 +1088,368 @@ export default function ClinicsServicesPage({ initialLocale,
             return;
         }
 
-        setSubmitting(true);
+        const code = (
+            editingService &&
+                serviceForm.clinicId !== editingService.clinicId
+                ? generateServiceCode(serviceForm.clinicId)
+                : serviceForm.code
+        ).trim().toUpperCase();
+        const nameEn = serviceForm.nameEn.trim();
+        const nameAr = serviceForm.nameAr.trim();
+        const vatRate = Number(serviceForm.vatRate) as 0 | 15;
+        const pricing = computePricing(baseAmount, vatRate);
+        const now = new Date().toISOString();
 
-        try {
-            const code = (
-                editingService &&
-                    serviceForm.clinicId !== editingService.clinicId
-                    ? generateServiceCode(serviceForm.clinicId)
-                    : serviceForm.code
-            ).trim().toUpperCase();
-            const nameEn = serviceForm.nameEn.trim();
-            const nameAr = serviceForm.nameAr.trim();
-            const basePrice = baseAmount.toFixed(2);
-            const vatRate = Number(serviceForm.vatRate) as 0 | 15;
+        const clinicRef = {
+            id: targetClinic.id,
+            nameAr: targetClinic.nameAr,
+            nameEn: targetClinic.nameEn,
+        };
 
-            if (editingService) {
-                const input: UpdateServiceInput = {
-                    clinicId: serviceForm.clinicId,
-                    code,
-                    nameEn,
-                    nameAr,
-                    basePrice,
-                    vatRate,
-                };
+        if (editingService) {
+            const previous =
+                servicesRef.current.find((service) => service.id === editingService.id) ??
+                editingService;
 
-                const result = await updateServiceAction(
-                    editingService.id,
-                    input,
-                );
+            if (isTempId(previous.id)) return;
 
-                if (!result.success || !result.data) {
-                    setError(result.error || t.failed);
-                    return;
-                }
+            const optimistic: ServiceRow = {
+                ...previous,
+                clinicId: targetClinic.id,
+                clinic: clinicRef,
+                code,
+                nameEn,
+                nameAr,
+                basePrice: pricing.basePrice,
+                vatRate: String(vatRate),
+                vatAmount: pricing.vatAmount,
+                totalPrice: pricing.totalPrice,
+                updatedAt: now,
+            };
 
-                setServices((current) =>
-                    current.map((service) =>
-                        service.id === result.data!.id
-                            ? (result.data as ServiceRow)
-                            : service,
-                    ),
-                );
-
-                setSuccess(t.updatedService);
-            } else {
-                const input: CreateServiceInput = {
-                    clinicId: serviceForm.clinicId,
-                    code,
-                    nameEn,
-                    nameAr,
-                    basePrice,
-                    vatRate,
-                };
-
-                const result = await createServiceAction(input);
-
-                if (!result.success || !result.data) {
-                    setError(result.error || t.failed);
-                    return;
-                }
-
-                setServices((current) => [
-                    result.data as ServiceRow,
-                    ...current,
-                ]);
-
-                setSuccess(t.successService);
-            }
-
+            patchServiceLocal(optimistic);
+            setSuccess(t.updatedService);
             setModal(null);
             setEditingService(null);
             setSearch("");
-        } catch {
-            setError(t.failed);
-        } finally {
-            setSubmitting(false);
+
+            const input: UpdateServiceInput = {
+                clinicId: serviceForm.clinicId,
+                code,
+                nameEn,
+                nameAr,
+                basePrice: pricing.basePrice,
+                vatRate,
+            };
+
+            enqueue(previous.id, async () => {
+                const rollback = (message: string) => {
+                    if (isLastPending(previous.id)) patchServiceLocal(previous);
+
+                    setSuccess("");
+                    notifyError(message);
+                };
+
+                try {
+                    const result = await updateServiceAction(previous.id, input);
+
+                    if (!result.success || !result.data) {
+                        rollback(result.error || t.failed);
+                        return;
+                    }
+
+                    if (isLastPending(previous.id)) {
+                        patchServiceLocal(result.data as ServiceRow);
+                    }
+                } catch {
+                    rollback(t.failed);
+                }
+            });
+
+            return;
         }
+
+        const tempId = makeTempId();
+
+        const optimistic: ServiceRow = {
+            id: tempId,
+            clinicId: targetClinic.id,
+            clinic: clinicRef,
+            code,
+            nameEn,
+            nameAr,
+            basePrice: pricing.basePrice,
+            vatRate: String(vatRate),
+            vatAmount: pricing.vatAmount,
+            totalPrice: pricing.totalPrice,
+            isActive: true,
+            createdAt: now,
+            updatedAt: now,
+        };
+
+        setServices((current) => [optimistic, ...current]);
+        setSuccess(t.successService);
+        setModal(null);
+        setSearch("");
+
+        const input: CreateServiceInput = {
+            clinicId: serviceForm.clinicId,
+            code,
+            nameEn,
+            nameAr,
+            basePrice: pricing.basePrice,
+            vatRate,
+        };
+
+        enqueue(tempId, async () => {
+            const rollback = (message: string) => {
+                setServices((current) => current.filter((service) => service.id !== tempId));
+                setSuccess("");
+                notifyError(message);
+            };
+
+            try {
+                const result = await createServiceAction(input);
+
+                if (!result.success || !result.data) {
+                    rollback(result.error || t.failed);
+                    return;
+                }
+
+                // The server is authoritative for the generated code.
+                const confirmed = result.data as ServiceRow;
+
+                setServices((current) =>
+                    current.map((service) => (service.id === tempId ? confirmed : service)),
+                );
+            } catch {
+                rollback(t.failed);
+            }
+        });
     };
 
+    /* ------------------------------- status toggles ------------------------------- */
 
-    const handleToggleStatus = async () => {
-        if (!statusTarget || statusSubmitting) return;
+    const handleToggleStatus = () => {
+        if (!statusTarget) return;
 
-        setStatusSubmitting(true);
-        setError("");
+        const target = statusTarget;
+        const nextActive = !target.isActive;
 
-        try {
-            if (statusTarget.type === "clinic") {
-                const result = await toggleClinicStatusAction(
-                    statusTarget.id,
-                    !statusTarget.isActive,
-                );
+        if (isTempId(target.id)) {
+            setStatusTarget(null);
+            return;
+        }
 
-                if (!result.success || !result.data) {
-                    setError(result.error || t.failed);
-                    return;
-                }
+        if (target.type === "clinic") {
+            const previousClinic = clinicsRef.current.find((clinic) => clinic.id === target.id);
 
-                setClinics((current) =>
-                    current.map((clinic) =>
-                        clinic.id === result.data!.id
-                            ? (result.data as ClinicRow)
-                            : clinic,
-                    ),
-                );
+            if (!previousClinic) {
+                setStatusTarget(null);
+                return;
+            }
 
-                // إذا تم تعطيل العيادة، عطّل خدماتها في الواجهة أيضًا
-                if (statusTarget.isActive) {
-                    setServices((current) =>
-                        current.map((service) =>
-                            service.clinicId === statusTarget.id
-                                ? { ...service, isActive: false }
-                                : service,
-                        ),
-                    );
-                }
-            } else {
-                const targetService = services.find((service) => service.id === statusTarget.id);
-                const associatedClinic = targetService
-                    ? clinics.find((clinic) => clinic.id === targetService.clinicId)
-                    : undefined;
+            // Services that will be switched off together with the clinic.
+            const cascadedServiceIds = !nextActive
+                ? servicesRef.current
+                    .filter((service) => service.clinicId === target.id && service.isActive)
+                    .map((service) => service.id)
+                : [];
 
-                if (!statusTarget.isActive && (!associatedClinic || !associatedClinic.isActive)) {
-                    setError(t.serviceClinicInactive);
-                    return;
-                }
+            // 0ms: flip the clinic (and cascade) right away and close the dialog.
+            patchClinicLocal({ ...previousClinic, isActive: nextActive });
 
-                const result = await toggleServiceStatusAction(
-                    statusTarget.id,
-                    !statusTarget.isActive,
-                );
-
-                if (!result.success || !result.data) {
-                    setError(result.error || t.failed);
-                    return;
-                }
+            if (cascadedServiceIds.length > 0) {
+                const ids = new Set(cascadedServiceIds);
 
                 setServices((current) =>
                     current.map((service) =>
-                        service.id === result.data!.id
-                            ? (result.data as ServiceRow)
-                            : service,
+                        ids.has(service.id) ? { ...service, isActive: false } : service,
                     ),
                 );
             }
 
             setStatusTarget(null);
+            setError("");
             setSuccess(t.statusUpdated);
-        } catch {
-            setError(t.failed);
-        } finally {
-            setStatusSubmitting(false);
+
+            enqueue(target.id, async () => {
+                const rollback = (message: string) => {
+                    if (isLastPending(target.id)) {
+                        setClinics((current) =>
+                            current.map((clinic) =>
+                                clinic.id === target.id
+                                    ? { ...clinic, isActive: previousClinic.isActive }
+                                    : clinic,
+                            ),
+                        );
+
+                        if (cascadedServiceIds.length > 0) {
+                            const ids = new Set(cascadedServiceIds);
+
+                            setServices((current) =>
+                                current.map((service) =>
+                                    ids.has(service.id) ? { ...service, isActive: true } : service,
+                                ),
+                            );
+                        }
+                    }
+
+                    setSuccess("");
+                    notifyError(message);
+                };
+
+                try {
+                    const result = await toggleClinicStatusAction(target.id, nextActive);
+
+                    if (!result.success || !result.data) {
+                        rollback(result.error || t.failed);
+                        return;
+                    }
+
+                    if (isLastPending(target.id)) patchClinicLocal(result.data as ClinicRow);
+                } catch {
+                    rollback(t.failed);
+                }
+            });
+
+            return;
         }
+
+        const previousService = servicesRef.current.find((service) => service.id === target.id);
+
+        if (!previousService) {
+            setStatusTarget(null);
+            return;
+        }
+
+        // Same guard as the server: a service can't be activated under an inactive clinic.
+        if (nextActive) {
+            const associatedClinic = clinicsRef.current.find(
+                (clinic) => clinic.id === previousService.clinicId,
+            );
+
+            if (!associatedClinic || !associatedClinic.isActive) {
+                setError(t.serviceClinicInactive);
+                return;
+            }
+        }
+
+        patchServiceLocal({ ...previousService, isActive: nextActive });
+        setStatusTarget(null);
+        setError("");
+        setSuccess(t.statusUpdated);
+
+        enqueue(target.id, async () => {
+            const rollback = (message: string) => {
+                if (isLastPending(target.id)) {
+                    setServices((current) =>
+                        current.map((service) =>
+                            service.id === target.id
+                                ? { ...service, isActive: previousService.isActive }
+                                : service,
+                        ),
+                    );
+                }
+
+                setSuccess("");
+                notifyError(message);
+            };
+
+            try {
+                const result = await toggleServiceStatusAction(target.id, nextActive);
+
+                if (!result.success || !result.data) {
+                    rollback(result.error || t.failed);
+                    return;
+                }
+
+                if (isLastPending(target.id)) patchServiceLocal(result.data as ServiceRow);
+            } catch {
+                rollback(t.failed);
+            }
+        });
     };
 
+    /* --------------------------------- deletion ---------------------------------- */
+
+    /** The row disappears at 0ms; it is restored (with a toast) only if the server refuses. */
+    const handleConfirmDelete = () => {
+        if (!deleteTarget) return;
+
+        const target = deleteTarget;
+
+        setDeleteTarget(null);
+        setError("");
+
+        if (isTempId(target.id)) return;
+
+        if (target.type === "clinic") {
+            const index = clinicsRef.current.findIndex((clinic) => clinic.id === target.id);
+            const removed = clinicsRef.current[index];
+
+            if (!removed) return;
+
+            // Final guard in case services were added while the dialog was open.
+            if (servicesRef.current.some((service) => service.clinicId === target.id)) {
+                notifyError(t.clinicHasServices);
+                return;
+            }
+
+            setClinics((current) => current.filter((clinic) => clinic.id !== target.id));
+            setSuccess(t.deletedClinic);
+
+            enqueue(target.id, async () => {
+                const rollback = (message: string) => {
+                    setClinics((current) =>
+                        current.some((clinic) => clinic.id === removed.id)
+                            ? current
+                            : insertAt(current, removed, index),
+                    );
+                    setSuccess("");
+                    notifyError(message);
+                };
+
+                try {
+                    const result = await deleteClinicAction(target.id);
+
+                    if (!result.success) rollback(result.error || t.failed);
+                } catch {
+                    rollback(t.failed);
+                }
+            });
+
+            return;
+        }
+
+        const index = servicesRef.current.findIndex((service) => service.id === target.id);
+        const removed = servicesRef.current[index];
+
+        if (!removed) return;
+
+        setServices((current) => current.filter((service) => service.id !== target.id));
+        setSuccess(t.deletedService);
+
+        enqueue(target.id, async () => {
+            const rollback = (message: string) => {
+                setServices((current) =>
+                    current.some((service) => service.id === removed.id)
+                        ? current
+                        : insertAt(current, removed, index),
+                );
+                setSuccess("");
+                notifyError(message);
+            };
+
+            try {
+                const result = await deleteServiceAction(target.id);
+
+                if (!result.success) rollback(result.error || t.failed);
+            } catch {
+                rollback(t.failed);
+            }
+        });
+    };
 
     const currentCount =
         tab === "clinics"
@@ -954,9 +1460,12 @@ export default function ClinicsServicesPage({ initialLocale,
         tab === "clinics" ? clinics.length : services.length;
 
     const closeStatusModal = () => {
-        if (statusSubmitting) return;
         setStatusTarget(null);
         setError("");
+    };
+
+    const closeDeleteModal = () => {
+        setDeleteTarget(null);
     };
 
     return (
@@ -1158,7 +1667,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                 </div>
                             )}
 
-                            {error && !modal && !statusTarget && (
+                            {error && !modal && !statusTarget && !deleteTarget && (
                                 <div
                                     role="alert"
                                     className="mx-4 mt-4 flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300 sm:mx-5"
@@ -1215,88 +1724,112 @@ export default function ClinicsServicesPage({ initialLocale,
                                         </thead>
 
                                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                                            {filteredClinics.map((clinic) => (
-                                                <tr
-                                                    key={clinic.id}
-                                                    className="transition-colors hover:bg-slate-50/70 dark:hover:bg-slate-900/50"
-                                                >
-                                                    <td className="px-5 py-4">
-                                                        <div className="flex items-center gap-3">
-                                                            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-teal-50 text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
-                                                                <Hospital size={20} />
+                                            {filteredClinics.map((clinic) => {
+                                                const rowTemp = isTempId(clinic.id);
+                                                const rowSyncing = syncing.has(clinic.id);
+
+                                                return (
+                                                    <tr
+                                                        key={clinic.id}
+                                                        aria-busy={rowSyncing || undefined}
+                                                        title={rowSyncing ? t.syncing : undefined}
+                                                        className={cn(
+                                                            "transition-colors hover:bg-slate-50/70 dark:hover:bg-slate-900/50",
+                                                            rowTemp && "animate-pulse",
+                                                            rowSyncing && !rowTemp && "opacity-80",
+                                                        )}
+                                                    >
+                                                        <td className="px-5 py-4">
+                                                            <div className="flex items-center gap-3">
+                                                                <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-teal-50 text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
+                                                                    <Hospital size={20} />
+                                                                </div>
+                                                                <div className="min-w-0">
+                                                                    <p className="font-semibold text-slate-800 dark:text-slate-100">
+                                                                        {clinicName(clinic)}
+                                                                    </p>
+                                                                    <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                                        {isRtl ? clinic.nameEn : clinic.nameAr}
+                                                                    </p>
+                                                                </div>
                                                             </div>
-                                                            <div className="min-w-0">
-                                                                <p className="font-semibold text-slate-800 dark:text-slate-100">
-                                                                    {clinicName(clinic)}
-                                                                </p>
-                                                                <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                                                                    {isRtl ? clinic.nameEn : clinic.nameAr}
-                                                                </p>
-                                                            </div>
-                                                        </div>
-                                                    </td>
+                                                        </td>
 
-                                                    <td className="whitespace-nowrap px-4 py-4 text-slate-600 dark:text-slate-300">
-                                                        {getSpecialtyLabel(clinic.specialty, locale)}
-                                                    </td>
+                                                        <td className="whitespace-nowrap px-4 py-4 text-slate-600 dark:text-slate-300">
+                                                            {getSpecialtyLabel(clinic.specialty, locale)}
+                                                        </td>
 
-                                                    <td className="whitespace-nowrap px-4 py-4">
-                                                        <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
-                                                            {clinic.nphiesCode || "—"}
-                                                        </span>
-                                                    </td>
+                                                        <td className="whitespace-nowrap px-4 py-4">
+                                                            <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                                                                {clinic.nphiesCode || "—"}
+                                                            </span>
+                                                        </td>
 
-                                                    <td className="whitespace-nowrap px-5 py-4">
-                                                        <span
-                                                            className={cn(
-                                                                "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold",
-                                                                clinic.isActive
-                                                                    ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
-                                                                    : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
-                                                            )}
-                                                        >
+                                                        <td className="whitespace-nowrap px-5 py-4">
                                                             <span
                                                                 className={cn(
-                                                                    "h-2 w-2 rounded-full",
-                                                                    clinic.isActive ? "bg-emerald-500" : "bg-slate-400",
-                                                                )}
-                                                            />
-                                                            {clinic.isActive ? t.active : t.inactive}
-                                                        </span>
-                                                    </td>
-
-                                                    <td className="whitespace-nowrap px-5 py-4">
-                                                        <div className="flex items-center gap-2">
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => openEditClinic(clinic)}
-                                                                title={t.edit}
-                                                                aria-label={`${t.editClinic}: ${clinicName(clinic)}`}
-                                                                className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-600 transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 dark:border-slate-700 dark:text-slate-300 dark:hover:border-teal-900 dark:hover:bg-teal-950/40 dark:hover:text-teal-400"
-                                                            >
-                                                                <Pencil size={16} />
-                                                            </button>
-
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => requestStatusChange("clinic", clinic)}
-                                                                title={clinic.isActive ? t.disable : t.enable}
-                                                                aria-label={`${clinic.isActive ? t.disable : t.enable}: ${clinicName(clinic)}`}
-                                                                className={cn(
-                                                                    "grid h-9 w-9 place-items-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2",
+                                                                    "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors",
                                                                     clinic.isActive
-                                                                        ? "border-rose-200 text-rose-600 hover:bg-rose-50 focus-visible:ring-rose-500 dark:border-rose-900 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                                                                        : "border-emerald-200 text-emerald-700 hover:bg-emerald-50 focus-visible:ring-emerald-500 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950/40",
+                                                                        ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
+                                                                        : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
                                                                 )}
                                                             >
-                                                                {clinic.isActive
-                                                                    ? <PowerOff size={16} />
-                                                                    : <Power size={16} />}
-                                                            </button>
-                                                        </div>
-                                                    </td>
-                                                </tr>
-                                            ))}
+                                                                <span
+                                                                    className={cn(
+                                                                        "h-2 w-2 rounded-full",
+                                                                        clinic.isActive ? "bg-emerald-500" : "bg-slate-400",
+                                                                    )}
+                                                                />
+                                                                {clinic.isActive ? t.active : t.inactive}
+                                                            </span>
+                                                        </td>
+
+                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                            <div className="flex items-center gap-2">
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={rowTemp}
+                                                                    onClick={() => openEditClinic(clinic)}
+                                                                    title={t.edit}
+                                                                    aria-label={`${t.editClinic}: ${clinicName(clinic)}`}
+                                                                    className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-600 transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:border-teal-900 dark:hover:bg-teal-950/40 dark:hover:text-teal-400"
+                                                                >
+                                                                    <Pencil size={16} />
+                                                                </button>
+
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={rowTemp}
+                                                                    onClick={() => requestStatusChange("clinic", clinic)}
+                                                                    title={clinic.isActive ? t.disable : t.enable}
+                                                                    aria-label={`${clinic.isActive ? t.disable : t.enable}: ${clinicName(clinic)}`}
+                                                                    className={cn(
+                                                                        "grid h-9 w-9 place-items-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                                                                        clinic.isActive
+                                                                            ? "border-rose-200 text-rose-600 hover:bg-rose-50 focus-visible:ring-rose-500 dark:border-rose-900 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                                                                            : "border-emerald-200 text-emerald-700 hover:bg-emerald-50 focus-visible:ring-emerald-500 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950/40",
+                                                                    )}
+                                                                >
+                                                                    {clinic.isActive
+                                                                        ? <PowerOff size={16} />
+                                                                        : <Power size={16} />}
+                                                                </button>
+
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={rowTemp}
+                                                                    onClick={() => requestDelete("clinic", clinic)}
+                                                                    title={t.delete}
+                                                                    aria-label={`${t.deleteClinic}: ${clinicName(clinic)}`}
+                                                                    className={deleteButtonClass}
+                                                                >
+                                                                    <Trash2 size={16} />
+                                                                </button>
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
 
                                             {filteredClinics.length === 0 && (
                                                 <tr>
@@ -1323,107 +1856,131 @@ export default function ClinicsServicesPage({ initialLocale,
                                         </thead>
 
                                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                                            {filteredServices.map((service) => (
-                                                <tr
-                                                    key={service.id}
-                                                    className="transition-colors hover:bg-slate-50/70 dark:hover:bg-slate-900/50"
-                                                >
-                                                    <td className="whitespace-nowrap px-5 py-4">
-                                                        <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
-                                                            {service.code}
-                                                        </span>
-                                                    </td>
+                                            {filteredServices.map((service) => {
+                                                const rowTemp = isTempId(service.id);
+                                                const rowSyncing = syncing.has(service.id);
 
-                                                    <td className="whitespace-nowrap px-4 py-4 text-slate-600 dark:text-slate-300">
-                                                        {clinicName(service.clinic)}
-                                                    </td>
+                                                return (
+                                                    <tr
+                                                        key={service.id}
+                                                        aria-busy={rowSyncing || undefined}
+                                                        title={rowSyncing ? t.syncing : undefined}
+                                                        className={cn(
+                                                            "transition-colors hover:bg-slate-50/70 dark:hover:bg-slate-900/50",
+                                                            rowTemp && "animate-pulse",
+                                                            rowSyncing && !rowTemp && "opacity-80",
+                                                        )}
+                                                    >
+                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                            <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                                                                {service.code}
+                                                            </span>
+                                                        </td>
 
-                                                    <td className="px-4 py-4">
-                                                        <p className="font-semibold text-slate-800 dark:text-slate-100">
-                                                            {isRtl ? service.nameAr : service.nameEn}
-                                                        </p>
-                                                        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                                                            {isRtl ? service.nameEn : service.nameAr}
-                                                        </p>
-                                                    </td>
+                                                        <td className="whitespace-nowrap px-4 py-4 text-slate-600 dark:text-slate-300">
+                                                            {clinicName(service.clinic)}
+                                                        </td>
 
-                                                    <td className="whitespace-nowrap px-4 py-4 text-slate-700 dark:text-slate-300">
-                                                        {money(service.basePrice, locale)} {t.sar}
-                                                    </td>
+                                                        <td className="px-4 py-4">
+                                                            <p className="font-semibold text-slate-800 dark:text-slate-100">
+                                                                {isRtl ? service.nameAr : service.nameEn}
+                                                            </p>
+                                                            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                                {isRtl ? service.nameEn : service.nameAr}
+                                                            </p>
+                                                        </td>
 
-                                                    <td className="whitespace-nowrap px-4 py-4">
-                                                        <span
-                                                            className={cn(
-                                                                "rounded-full px-2.5 py-1.5 text-xs font-semibold",
-                                                                Number(service.vatRate) === 0
-                                                                    ? "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-                                                                    : "bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-400",
-                                                            )}
-                                                        >
-                                                            {money(service.vatRate, locale)}%
-                                                        </span>
-                                                    </td>
+                                                        <td className="whitespace-nowrap px-4 py-4 text-slate-700 dark:text-slate-300">
+                                                            {money(service.basePrice, locale)} {t.sar}
+                                                        </td>
 
-                                                    <td className="whitespace-nowrap px-5 py-4">
-                                                        <p className="font-bold text-teal-700 dark:text-teal-400">
-                                                            {money(service.totalPrice, locale)} {t.sar}
-                                                        </p>
-                                                        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                                                            {t.taxAmount}: {money(service.vatAmount, locale)}
-                                                        </p>
-                                                    </td>
-
-                                                    <td className="whitespace-nowrap px-4 py-4">
-                                                        <span
-                                                            className={cn(
-                                                                "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold",
-                                                                service.isActive
-                                                                    ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
-                                                                    : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
-                                                            )}
-                                                        >
+                                                        <td className="whitespace-nowrap px-4 py-4">
                                                             <span
                                                                 className={cn(
-                                                                    "h-2 w-2 rounded-full",
-                                                                    service.isActive ? "bg-emerald-500" : "bg-slate-400",
+                                                                    "rounded-full px-2.5 py-1.5 text-xs font-semibold",
+                                                                    Number(service.vatRate) === 0
+                                                                        ? "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                                                                        : "bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-400",
                                                                 )}
-                                                            />
-                                                            {service.isActive ? t.active : t.inactive}
-                                                        </span>
-                                                    </td>
-
-                                                    <td className="whitespace-nowrap px-5 py-4">
-                                                        <div className="flex items-center gap-2">
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => openEditService(service)}
-                                                                title={t.edit}
-                                                                aria-label={`${t.editService}: ${service.nameEn}`}
-                                                                className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-600 transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 dark:border-slate-700 dark:text-slate-300 dark:hover:border-teal-900 dark:hover:bg-teal-950/40 dark:hover:text-teal-400"
                                                             >
-                                                                <Pencil size={16} />
-                                                            </button>
+                                                                {money(service.vatRate, locale)}%
+                                                            </span>
+                                                        </td>
 
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => requestStatusChange("service", service)}
-                                                                title={service.isActive ? t.disable : t.enable}
-                                                                aria-label={`${service.isActive ? t.disable : t.enable}: ${service.nameEn}`}
+                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                            <p className="font-bold text-teal-700 dark:text-teal-400">
+                                                                {money(service.totalPrice, locale)} {t.sar}
+                                                            </p>
+                                                            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                                {t.taxAmount}: {money(service.vatAmount, locale)}
+                                                            </p>
+                                                        </td>
+
+                                                        <td className="whitespace-nowrap px-4 py-4">
+                                                            <span
                                                                 className={cn(
-                                                                    "grid h-9 w-9 place-items-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2",
+                                                                    "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors",
                                                                     service.isActive
-                                                                        ? "border-rose-200 text-rose-600 hover:bg-rose-50 focus-visible:ring-rose-500 dark:border-rose-900 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                                                                        : "border-emerald-200 text-emerald-700 hover:bg-emerald-50 focus-visible:ring-emerald-500 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950/40",
+                                                                        ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
+                                                                        : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
                                                                 )}
                                                             >
-                                                                {service.isActive
-                                                                    ? <PowerOff size={16} />
-                                                                    : <Power size={16} />}
-                                                            </button>
-                                                        </div>
-                                                    </td>
-                                                </tr>
-                                            ))}
+                                                                <span
+                                                                    className={cn(
+                                                                        "h-2 w-2 rounded-full",
+                                                                        service.isActive ? "bg-emerald-500" : "bg-slate-400",
+                                                                    )}
+                                                                />
+                                                                {service.isActive ? t.active : t.inactive}
+                                                            </span>
+                                                        </td>
+
+                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                            <div className="flex items-center gap-2">
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={rowTemp}
+                                                                    onClick={() => openEditService(service)}
+                                                                    title={t.edit}
+                                                                    aria-label={`${t.editService}: ${service.nameEn}`}
+                                                                    className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-600 transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:border-teal-900 dark:hover:bg-teal-950/40 dark:hover:text-teal-400"
+                                                                >
+                                                                    <Pencil size={16} />
+                                                                </button>
+
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={rowTemp}
+                                                                    onClick={() => requestStatusChange("service", service)}
+                                                                    title={service.isActive ? t.disable : t.enable}
+                                                                    aria-label={`${service.isActive ? t.disable : t.enable}: ${service.nameEn}`}
+                                                                    className={cn(
+                                                                        "grid h-9 w-9 place-items-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                                                                        service.isActive
+                                                                            ? "border-rose-200 text-rose-600 hover:bg-rose-50 focus-visible:ring-rose-500 dark:border-rose-900 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                                                                            : "border-emerald-200 text-emerald-700 hover:bg-emerald-50 focus-visible:ring-emerald-500 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950/40",
+                                                                    )}
+                                                                >
+                                                                    {service.isActive
+                                                                        ? <PowerOff size={16} />
+                                                                        : <Power size={16} />}
+                                                                </button>
+
+                                                                <button
+                                                                    type="button"
+                                                                    disabled={rowTemp}
+                                                                    onClick={() => requestDelete("service", service)}
+                                                                    title={t.delete}
+                                                                    aria-label={`${t.deleteService}: ${service.nameEn}`}
+                                                                    className={deleteButtonClass}
+                                                                >
+                                                                    <Trash2 size={16} />
+                                                                </button>
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
 
                                             {filteredServices.length === 0 && (
                                                 <tr>
@@ -1495,9 +2052,8 @@ export default function ClinicsServicesPage({ initialLocale,
                             <button
                                 type="button"
                                 onClick={closeModal}
-                                disabled={submitting}
                                 aria-label={t.close}
-                                className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 disabled:opacity-50 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+                                className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
                             >
                                 <X size={19} />
                             </button>
@@ -1651,20 +2207,15 @@ export default function ClinicsServicesPage({ initialLocale,
                                     <button
                                         type="button"
                                         onClick={closeModal}
-                                        disabled={submitting}
-                                        className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                        className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
                                     >
                                         {t.cancel}
                                     </button>
 
                                     <button
                                         type="submit"
-                                        disabled={submitting}
-                                        className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700 disabled:cursor-wait disabled:opacity-60"
+                                        className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700"
                                     >
-                                        {submitting && (
-                                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                                        )}
                                         {editingClinic ? t.saveChanges : t.saveClinic}
                                     </button>
                                 </div>
@@ -1744,9 +2295,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                                 }));
 
                                                 if (selectedClinic && !selectedClinic.isActive) {
-                                                    setError(
-                                                        "لا يمكن ربط الخدمة بعيادة معطلة. يرجى تفعيل العيادة أولاً.",
-                                                    );
+                                                    setError(t.serviceClinicDisabledSelect);
                                                 } else {
                                                     setError("");
                                                 }
@@ -1760,7 +2309,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                                 <option
                                                     key={clinic.id}
                                                     value={clinic.id}
-                                                    disabled={!clinic.isActive}
+                                                    disabled={!clinic.isActive || isTempId(clinic.id)}
                                                 >
                                                     {clinicName(clinic)}{!clinic.isActive ? ` (${t.inactive})` : ""}
                                                 </option>
@@ -1885,8 +2434,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                     <button
                                         type="button"
                                         onClick={closeModal}
-                                        disabled={submitting}
-                                        className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                        className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
                                     >
                                         {t.cancel}
                                     </button>
@@ -1894,15 +2442,11 @@ export default function ClinicsServicesPage({ initialLocale,
                                     <button
                                         type="submit"
                                         disabled={
-                                            submitting ||
                                             !validBaseAmount ||
                                             (!editingService && activeClinics.length === 0)
                                         }
                                         className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
                                     >
-                                        {submitting && (
-                                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                                        )}
                                         {editingService ? t.saveChanges : t.saveService}
                                     </button>
                                 </div>
@@ -1918,10 +2462,7 @@ export default function ClinicsServicesPage({ initialLocale,
                     <div
                         className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4 backdrop-blur-[3px]"
                         onMouseDown={(event) => {
-                            if (
-                                event.target === event.currentTarget &&
-                                !statusSubmitting
-                            ) {
+                            if (event.target === event.currentTarget) {
                                 closeStatusModal();
                             }
                         }}
@@ -1969,9 +2510,8 @@ export default function ClinicsServicesPage({ initialLocale,
                                 <button
                                     type="button"
                                     aria-label={t.close}
-                                    disabled={statusSubmitting}
                                     onClick={closeStatusModal}
-                                    className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 disabled:opacity-50 dark:hover:bg-slate-800"
+                                    className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 dark:hover:bg-slate-800"
                                 >
                                     <X size={18} />
                                 </button>
@@ -1989,27 +2529,23 @@ export default function ClinicsServicesPage({ initialLocale,
                             <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
                                 <button
                                     type="button"
-                                    disabled={statusSubmitting}
                                     onClick={closeStatusModal}
-                                    className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                    className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
                                 >
                                     {t.cancel}
                                 </button>
 
                                 <button
                                     type="button"
-                                    disabled={statusSubmitting}
-                                    onClick={() => void handleToggleStatus()}
+                                    onClick={handleToggleStatus}
                                     className={cn(
-                                        "inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-bold text-white transition disabled:cursor-wait disabled:opacity-60",
+                                        "inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-bold text-white transition",
                                         statusTarget.isActive
                                             ? "bg-rose-600 hover:bg-rose-700"
                                             : "bg-emerald-600 hover:bg-emerald-700",
                                     )}
                                 >
-                                    {statusSubmitting ? (
-                                        <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                                    ) : statusTarget.isActive ? (
+                                    {statusTarget.isActive ? (
                                         <PowerOff size={16} />
                                     ) : (
                                         <Power size={16} />
@@ -2022,6 +2558,121 @@ export default function ClinicsServicesPage({ initialLocale,
                     </div>
                 )
             }
+
+            {deleteTarget && (
+                <div
+                    className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4 backdrop-blur-[3px]"
+                    onMouseDown={(event) => {
+                        if (event.target === event.currentTarget) closeDeleteModal();
+                    }}
+                >
+                    <section
+                        role="alertdialog"
+                        aria-modal="true"
+                        aria-labelledby="delete-dialog-title"
+                        aria-describedby="delete-dialog-description"
+                        className="my-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-950 sm:p-6"
+                    >
+                        <div className="flex items-start gap-3">
+                            <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-400">
+                                <Trash2 size={21} />
+                            </div>
+
+                            <div className="min-w-0 flex-1">
+                                <h2
+                                    id="delete-dialog-title"
+                                    className="text-lg font-extrabold text-slate-900 dark:text-white"
+                                >
+                                    {t.confirmDeleteTitle}
+                                </h2>
+
+                                <p
+                                    id="delete-dialog-description"
+                                    className="mt-2 break-words text-sm leading-7 text-slate-600 dark:text-slate-300"
+                                >
+                                    {deleteTarget.type === "clinic"
+                                        ? t.confirmDeleteClinic
+                                        : t.confirmDeleteService}{" "}
+                                    <span className="font-bold text-slate-900 dark:text-white">
+                                        {deleteTarget.name}
+                                    </span>
+                                    ؟
+                                </p>
+
+                                <p className="mt-1 text-xs font-semibold text-rose-600 dark:text-rose-400">
+                                    {t.deleteWarning}
+                                </p>
+
+                                <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
+                                    {deleteTarget.type === "clinic"
+                                        ? t.deleteClinicHint
+                                        : t.deleteServiceHint}
+                                </p>
+                            </div>
+
+                            <button
+                                type="button"
+                                aria-label={t.close}
+                                onClick={closeDeleteModal}
+                                className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 dark:hover:bg-slate-800"
+                            >
+                                <X size={18} />
+                            </button>
+                        </div>
+
+                        <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                            <button
+                                type="button"
+                                onClick={closeDeleteModal}
+                                className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                            >
+                                {t.cancel}
+                            </button>
+
+                            <button
+                                type="button"
+                                autoFocus
+                                onClick={handleConfirmDelete}
+                                className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-rose-600 px-5 text-sm font-bold text-white transition hover:bg-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-950"
+                            >
+                                <Trash2 size={16} />
+                                {t.delete}
+                            </button>
+                        </div>
+                    </section>
+                </div>
+            )}
+
+            {toast && (
+                <div
+                    role="status"
+                    aria-live="polite"
+                    className={cn(
+                        "fixed bottom-6 z-[200] flex max-w-md items-start gap-3 rounded-xl border bg-white p-4 text-sm shadow-2xl shadow-black/30 dark:bg-slate-900",
+                        isRtl ? "left-6" : "right-6",
+                        toast.kind === "success" ? "border-teal-600/40" : "border-rose-500/40",
+                    )}
+                >
+                    {toast.kind === "success" ? (
+                        <Check size={20} className="mt-0.5 shrink-0 text-teal-500" />
+                    ) : (
+                        <CircleAlert size={20} className="mt-0.5 shrink-0 text-rose-500" />
+                    )}
+
+                    <p className="min-w-0 flex-1 break-words text-slate-900 dark:text-slate-100">
+                        {toast.message}
+                    </p>
+
+                    <button
+                        type="button"
+                        onClick={() => setToast(null)}
+                        aria-label={t.close}
+                        className="rounded-md p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+                    >
+                        <X size={16} />
+                    </button>
+                </div>
+            )}
 
             <style jsx global>{`
                 .dashboard-card {

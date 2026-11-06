@@ -1,9 +1,68 @@
 // ============================================================================
-// prisma/schema.prisma  (UPDATED — adds the `Shift` model + back-relations)
-// After pasting: run `npx prisma migrate dev --name add_shifts` (or `prisma db push`),
-// then `npx prisma generate`.
+// prisma/schema.prisma  (UPDATED — adds the Center Settings module)
 //
-// Recommended raw-SQL guard in the generated migration (Prisma cannot express CHECKs):
+// What changed vs. the previous schema:
+//   1. NEW enum   `CenterFacilityType` (MOH / NPHIES facility classification).
+//   2. NEW model  `CenterSettings`     (ONE row per Organization — branding, legal info,
+//                                       Saudi National Address, MOH/NPHIES identifiers, contact).
+//                                       Used by app/admin/settings/page.tsx + actions.ts
+//                                       (getCenterSettingsAction / saveCenterSettingsAction /
+//                                       uploadCenterAssetAction).
+//   3. `Organization` gets the back-relation `centerSettings CenterSettings?`.
+//   4. Everything else (Pricing & Taxes, Policies, Doctors, Shifts, ...) is UNCHANGED.
+//
+// Design notes:
+//   - `organizationId` is UNIQUE: exactly one settings row per tenant (upsert-safe).
+//   - `version` is an optimistic-concurrency counter. The action updates with
+//     `WHERE organization_id = ? AND version = ?` so two admins cannot silently overwrite
+//     each other. version = 0 on the client means "no row yet" (create path).
+//   - `taxRegistrationNumber`, `mohLicenseNumber`, `nphiesFacilityId` are globally UNIQUE
+//     (nullable): one ZATCA VAT number / MOH license / NPHIES facility ID cannot be claimed by
+//     two tenants. Postgres allows many NULLs, so new organizations are not blocked.
+//   - `Organization.nameAr / nameEn / vatNumber / city` are kept untouched for backwards
+//     compatibility. CenterSettings is the source of truth for the Center Settings page; if you
+//     want them mirrored, do it inside saveCenterSettingsAction in one transaction.
+//   - logoUrl / faviconUrl hold PUBLIC Supabase Storage URLs of the `center-branding` bucket.
+//     The action only accepts URLs inside `<bucket>/<organizationId>/` (tenant isolation).
+//
+// After pasting: run `npx prisma migrate dev --name add_center_settings`
+// (or `prisma db push`), then `npx prisma generate`.
+//
+// Supabase setup required by actions.ts:
+//   - Create a PUBLIC Storage bucket named `center-branding`.
+//   - Env vars: NEXT_PUBLIC_SUPABASE_URL (or SUPABASE_URL) and SUPABASE_SERVICE_ROLE_KEY.
+//
+// Recommended raw-SQL guards in the generated migration (Prisma cannot express CHECKs):
+//   ALTER TABLE "center_settings" ADD CONSTRAINT "center_settings_version_chk"
+//     CHECK ("version" >= 1);
+//   ALTER TABLE "center_settings" ADD CONSTRAINT "center_settings_tax_number_chk"
+//     CHECK ("tax_registration_number" IS NULL OR "tax_registration_number" ~ '^3[0-9]{13}3$');
+//   ALTER TABLE "center_settings" ADD CONSTRAINT "center_settings_national_address_chk"
+//     CHECK (("postal_code" IS NULL OR "postal_code" ~ '^[0-9]{5}$')
+//        AND ("additional_number" IS NULL OR "additional_number" ~ '^[0-9]{4}$')
+//        AND ("building_number" IS NULL OR "building_number" ~ '^[0-9]{4}$'));
+//   ALTER TABLE "center_settings" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
+//
+// Earlier recommended guards for the Pricing & Taxes module (kept for reference):
+//   -- Back-fill first: UPDATE "services" SET "vat_category" = 'CITIZEN_MEDICAL_EXEMPT' WHERE "vat_rate" = 0;
+//   ALTER TABLE "service_prices" ADD CONSTRAINT "service_prices_price_chk"
+//     CHECK ("price_ex_vat" > 0 AND "price_incl_vat" >= "price_ex_vat");
+//   ALTER TABLE "service_prices" ADD CONSTRAINT "service_prices_vat_chk"
+//     CHECK (("vat_category" = 'STANDARD' AND "vat_rate" = 15)
+//         OR ("vat_category" = 'CITIZEN_MEDICAL_EXEMPT' AND "vat_rate" = 0));
+//   ALTER TABLE "services" ADD CONSTRAINT "services_vat_chk"
+//     CHECK (("vat_category" = 'STANDARD' AND "vat_rate" = 15)
+//         OR ("vat_category" = 'CITIZEN_MEDICAL_EXEMPT' AND "vat_rate" = 0));
+//   ALTER TABLE "service_prices" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
+//
+// Earlier recommended guards for `insurance_policies` (kept for reference):
+//   ALTER TABLE "insurance_policies" ADD CONSTRAINT "insurance_policies_copay_chk"
+//     CHECK ("copay_value" >= 0 AND ("copay_type" <> 'PERCENTAGE' OR "copay_value" <= 100));
+//   ALTER TABLE "insurance_policies" ADD CONSTRAINT "insurance_policies_max_share_chk"
+//     CHECK ("max_patient_share" IS NULL OR "max_patient_share" >= 0);
+//   ALTER TABLE "insurance_policies" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
+//
+// Earlier recommended guards for `shifts` (kept for reference):
 //   ALTER TABLE "shifts" ADD CONSTRAINT "shifts_time_range_chk"
 //     CHECK ("start_minute" >= 0 AND "end_minute" <= 1440 AND "end_minute" > "start_minute");
 //   ALTER TABLE "shifts" ADD CONSTRAINT "shifts_slot_chk"
@@ -86,6 +145,42 @@ enum DoctorProfessionalRank {
   @@map("doctor_professional_rank")
 }
 
+/// طريقة احتساب مشاركة المريض في التكلفة (Co-pay).
+/// - PERCENTAGE: نسبة مئوية من قيمة الخدمة (مع سقف أعلى اختياري لحصة المريض).
+/// - FIXED_AMOUNT: مبلغ ثابت بالريال السعودي لكل زيارة/خدمة.
+enum PolicyCopayType {
+  PERCENTAGE
+  FIXED_AMOUNT
+
+  @@map("policy_copay_type")
+}
+
+/// فئة ضريبة القيمة المضافة (ZATCA) المطبقة على سعر الخدمة.
+/// - STANDARD: النسبة الأساسية 15%.
+/// - CITIZEN_MEDICAL_EXEMPT: 0% — إعفاء الخدمات الطبية المقدمة للمواطنين السعوديين.
+/// نسبة الضريبة تُحدَّد دائماً من الخادم بناءً على الفئة، ولا تُقبل من العميل.
+enum VatCategory {
+  STANDARD
+  CITIZEN_MEDICAL_EXEMPT
+
+  @@map("vat_category")
+}
+
+/// نوع المنشأة الصحية (يظهر في قائمة "Facility Type" ضمن صفحة إعدادات المركز).
+/// يُستخدم لتصنيف المنشأة لدى وزارة الصحة ومنصة نفيس (NPHIES).
+enum CenterFacilityType {
+  HOSPITAL
+  SPECIALIZED_MEDICAL_CENTER
+  MEDICAL_COMPLEX
+  GENERAL_CLINIC
+  DENTAL_CENTER
+  DIAGNOSTIC_CENTER
+  DAY_SURGERY_CENTER
+  HOME_HEALTHCARE
+
+  @@map("center_facility_type")
+}
+
 /// المؤسسة الرئيسية والمستأجر (Tenant) في النظام.
 
 model Organization {
@@ -101,6 +196,7 @@ model Organization {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
+  centerSettings     CenterSettings?
   users              User[]
   clinics            Clinic[]
   doctors            Doctor[]
@@ -109,12 +205,62 @@ model Organization {
   auditLogs          AuditLog[]
   invoices           Invoice[]
   insuranceProviders InsuranceProvider[]
+  insurancePolicies  InsurancePolicy[]
   services           Service[]
+  servicePrices      ServicePrice[]
   onboardingTokens   DoctorOnboardingToken[]
   shifts             Shift[]
 
   @@index([isActive])
   @@map("organizations")
+}
+
+/// إعدادات المركز (سجل واحد فقط لكل مؤسسة): الهوية البصرية، المعلومات القانونية،
+/// العنوان الوطني السعودي، معرّفات وزارة الصحة ونفيس، وبيانات التواصل.
+/// - version: عدّاد للتحكم في التزامن (Optimistic Concurrency) — يزداد مع كل حفظ ناجح.
+/// - taxRegistrationNumber: الرقم الضريبي (15 رقماً، يبدأ وينتهي بـ 3) المطلوب لهيئة الزكاة (ZATCA).
+/// - postalCode (5 أرقام) / additionalNumber (4 أرقام) / buildingNumber (4 أرقام): العنوان الوطني.
+/// - mohLicenseNumber / nphiesFacilityId: معرّفات فريدة عالمياً لمنع تسجيل المنشأة لدى مستأجرين مختلفين.
+/// - logoUrl / faviconUrl: روابط عامة من Supabase Storage (bucket: center-branding) داخل مجلد المؤسسة فقط.
+/// جميع الحقول اختيارية على مستوى قاعدة البيانات (مؤسسة جديدة بلا إعدادات)،
+/// بينما يفرض الخادم اكتمالها عند الحفظ.
+model CenterSettings {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @unique @map("organization_id") @db.Uuid
+
+  version Int @default(1)
+
+  // Branding & Identity
+  logoUrl     String? @map("logo_url") @db.VarChar(512)
+  faviconUrl  String? @map("favicon_url") @db.VarChar(512)
+  tradeNameAr String? @map("trade_name_ar") @db.VarChar(120)
+  tradeNameEn String? @map("trade_name_en") @db.VarChar(120)
+
+  // Legal Information & National Address (ZATCA)
+  taxRegistrationNumber String? @unique @map("tax_registration_number") @db.VarChar(15)
+  streetName            String? @map("street_name") @db.VarChar(127)
+  district              String? @db.VarChar(127)
+  city                  String? @db.VarChar(127)
+  postalCode            String? @map("postal_code") @db.VarChar(5)
+  additionalNumber      String? @map("additional_number") @db.VarChar(4)
+  buildingNumber        String? @map("building_number") @db.VarChar(4)
+
+  // Medical Identifiers (MOH & NPHIES)
+  mohLicenseNumber String?             @unique @map("moh_license_number") @db.VarChar(50)
+  nphiesFacilityId String?             @unique @map("nphies_facility_id") @db.VarChar(50)
+  facilityType     CenterFacilityType? @map("facility_type")
+
+  // Contact Information (phone is stored normalised, e.g. +966112345678)
+  phone      String? @db.VarChar(20)
+  email      String? @db.VarChar(254)
+  websiteUrl String? @map("website_url") @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@map("center_settings")
 }
 
 
@@ -143,7 +289,9 @@ model Clinic {
   auditLogs          AuditLog[]
   invoices           Invoice[]
   insuranceProviders InsuranceProvider[]
+  insurancePolicies  InsurancePolicy[]
   services           Service[]
+  servicePrices      ServicePrice[]
   shifts             Shift[]
 
   @@index([organizationId])
@@ -152,29 +300,69 @@ model Clinic {
 }
 
 /// الخدمات المقدمة داخل العيادات.
+/// - basePrice: سعر الكاش الأساسي (بدون ضريبة).
+/// - vatRate / vatCategory: ضريبة سعر الكاش (15% قياسي أو 0% إعفاء طبي للمواطنين).
+/// - prices: أسعار العقود التأمينية لنفس الخدمة (ServicePrice).
 
 model Service {
-  id             String   @id @default(uuid()) @db.Uuid
-  organizationId String   @map("organization_id") @db.Uuid
-  clinicId       String   @map("clinic_id") @db.Uuid
+  id             String      @id @default(uuid()) @db.Uuid
+  organizationId String      @map("organization_id") @db.Uuid
+  clinicId       String      @map("clinic_id") @db.Uuid
   code           String
-  nameAr         String   @map("name_ar")
-  nameEn         String   @map("name_en")
-  basePrice      Decimal  @map("base_price") @db.Decimal(12, 2)
-  vatRate        Decimal  @default(15.00) @map("vat_rate") @db.Decimal(5, 2)
-  isActive       Boolean  @default(true) @map("is_active")
-  createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @updatedAt @map("updated_at")
+  nameAr         String      @map("name_ar")
+  nameEn         String      @map("name_en")
+  basePrice      Decimal     @map("base_price") @db.Decimal(12, 2)
+  vatRate        Decimal     @default(15.00) @map("vat_rate") @db.Decimal(5, 2)
+  vatCategory    VatCategory @default(STANDARD) @map("vat_category")
+  isActive       Boolean     @default(true) @map("is_active")
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
 
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
-  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic         @relation(fields: [clinicId], references: [id], onDelete: Restrict)
   doctors      Doctor[]
   shifts       Shift[]
+  prices       ServicePrice[]
 
   @@unique([organizationId, clinicId, code])
   @@index([organizationId])
   @@index([organizationId, clinicId])
+  @@index([organizationId, isActive])
   @@map("services")
+}
+
+/// سعر خدمة بموجب عقد تأميني (Payer Contract / Policy).
+/// - priceExVat: السعر قبل الضريبة.
+/// - vatCategory / vatRate: لقطة الضريبة وقت الحفظ (المصدر: الخادم فقط).
+/// - priceInclVat: السعر شامل الضريبة (يُحسب في الخادم بتقريب HALF_UP لخانتين).
+/// - (serviceId, policyId) فريد: سعر واحد لكل خدمة داخل كل وثيقة.
+/// الفواتير الصادرة تحتفظ بمبالغها الخاصة، لذا حذف السعر لا يغيّر الفواتير السابقة.
+model ServicePrice {
+  id             String      @id @default(uuid()) @db.Uuid
+  organizationId String      @map("organization_id") @db.Uuid
+  clinicId       String      @map("clinic_id") @db.Uuid
+  serviceId      String      @map("service_id") @db.Uuid
+  policyId       String      @map("policy_id") @db.Uuid
+  priceExVat     Decimal     @map("price_ex_vat") @db.Decimal(12, 2)
+  vatCategory    VatCategory @default(STANDARD) @map("vat_category")
+  vatRate        Decimal     @default(15.00) @map("vat_rate") @db.Decimal(5, 2)
+  priceInclVat   Decimal     @map("price_incl_vat") @db.Decimal(12, 2)
+  isActive       Boolean     @default(true) @map("is_active")
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic          @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  service      Service         @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  policy       InsurancePolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@unique([serviceId, policyId])
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
+  @@index([organizationId, serviceId])
+  @@index([organizationId, policyId])
+  @@index([organizationId, isActive])
+  @@map("service_prices")
 }
 
 
@@ -288,6 +476,8 @@ model Patient {
   gender                Gender?
   phone                 String?
   insuranceProviderId   String?      @map("insurance_provider_id") @db.Uuid
+  /// Optional link to the insurance policy / tier the patient is enrolled in.
+  insurancePolicyId     String?      @map("insurance_policy_id") @db.Uuid
   insuranceMemberId     String?      @map("insurance_member_id")
   insuranceApprovalCode String?      @map("insurance_approval_code")
   copayPercentage       Decimal?     @map("copay_percentage") @db.Decimal(5, 2)
@@ -298,6 +488,7 @@ model Patient {
   organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   clinic            Clinic             @relation(fields: [clinicId], references: [id], onDelete: Restrict)
   insuranceProvider InsuranceProvider? @relation(fields: [insuranceProviderId], references: [id], onDelete: SetNull)
+  insurancePolicy   InsurancePolicy?   @relation(fields: [insurancePolicyId], references: [id], onDelete: Restrict)
 
   appointments Appointment[]
   invoices     Invoice[]
@@ -307,6 +498,7 @@ model Patient {
   @@index([organizationId])
   @@index([organizationId, clinicId])
   @@index([organizationId, insuranceProviderId])
+  @@index([organizationId, insurancePolicyId])
   @@map("patients")
 }
 
@@ -398,6 +590,7 @@ model InsuranceProvider {
   clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
 
   patients Patient[]
+  policies InsurancePolicy[]
 
   @@unique([organizationId, nameEn])
   @@unique([organizationId, nphiesPayerId])
@@ -405,6 +598,45 @@ model InsuranceProvider {
   @@index([organizationId])
   @@index([organizationId, clinicId])
   @@map("insurance_providers")
+}
+
+/// وثيقة / فئة تأمينية (Plan / Tier) مرتبطة بشركة تأمين، مع قواعد مشاركة المريض.
+/// - policyNumber: رقم الوثيقة / العقد الرسمي المطلوب للتكامل مع منصة NPHIES (فريد داخل المؤسسة).
+/// - copayType = PERCENTAGE: copayValue نسبة (0..100) و maxPatientShare سقف اختياري بالريال.
+/// - copayType = FIXED_AMOUNT: copayValue مبلغ ثابت بالريال و maxPatientShare = null.
+/// - expiryDate: تاريخ انتهاء العقد (تاريخ فقط بدون وقت).
+/// - servicePrices: أسعار الخدمات المتعاقد عليها ضمن هذه الوثيقة.
+model InsurancePolicy {
+  id              String          @id @default(uuid()) @db.Uuid
+  organizationId  String          @map("organization_id") @db.Uuid
+  clinicId        String          @map("clinic_id") @db.Uuid
+  providerId      String          @map("provider_id") @db.Uuid
+  nameEn          String          @map("name_en")
+  nameAr          String?         @map("name_ar")
+  policyNumber    String          @map("policy_number") @db.VarChar(60)
+  copayType       PolicyCopayType @default(PERCENTAGE) @map("copay_type")
+  copayValue      Decimal         @map("copay_value") @db.Decimal(12, 2)
+  maxPatientShare Decimal?        @map("max_patient_share") @db.Decimal(12, 2)
+  expiryDate      DateTime?       @map("expiry_date") @db.Date
+  isActive        Boolean         @default(true) @map("is_active")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  clinic       Clinic            @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  provider     InsuranceProvider @relation(fields: [providerId], references: [id], onDelete: Restrict)
+
+  patients      Patient[]
+  servicePrices ServicePrice[]
+
+  @@unique([providerId, policyNumber])
+  @@index([organizationId])
+  @@index([organizationId, clinicId])
+  @@index([organizationId, providerId])
+  @@index([organizationId, policyNumber])
+  @@index([organizationId, isActive])
+  @@index([organizationId, expiryDate])
+  @@map("insurance_policies")
 }
 
 /// الفواتير مع الحقول الأساسية اللازمة للتكامل المستقبلي مع ZATCA.

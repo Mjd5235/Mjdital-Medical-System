@@ -1,7 +1,22 @@
 "use client";
 
+/**
+ * Performance notes
+ * -----------------
+ * - Every mutation (create, edit, delete, activate/deactivate) updates the UI in the same frame
+ *   and syncs with the server in the background. A failure restores the previous state and shows
+ *   an error toast.
+ * - Server calls for the same row run in order (per-row queue), so rapid clicks never race.
+ * - No router.refresh() and no blocking spinners. The only spinner left is the tiny one for
+ *   "regenerate password", which has to wait for the server because the server creates the password.
+ * - Optional server-side win: remove `revalidatePath(MANAGEMENT_PATH)` from the actions in
+ *   ./actions.ts. This client component owns its data, and each revalidation makes every Server
+ *   Action response heavier and slower because it re-renders the route.
+ */
+
 import {
     useCallback,
+    useDeferredValue,
     useEffect,
     useId,
     useLayoutEffect,
@@ -13,7 +28,7 @@ import {
     type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { DoctorProfessionalRank } from "@prisma/client";
+import { DoctorProfessionalRank, IdentityType } from "@prisma/client";
 import {
     Activity,
     BriefcaseMedical,
@@ -62,6 +77,10 @@ import {
 } from "./actions";
 
 const PAGE_SIZE = 4;
+const TOAST_MS = 8000;
+const MAX_TOASTS = 3;
+const OPTIONS_STALE_MS = 60_000;
+const TEMP_ID_PREFIX = "tmp-";
 
 type DoctorsManagementProps = {
     initialLocale: Locale;
@@ -69,6 +88,7 @@ type DoctorsManagementProps = {
 
 type DoctorListItem = Omit<DoctorRow, "services"> & {
     services: Array<{ id: string; name: string }>;
+    searchText: string;
 };
 
 type DoctorFormOptions = {
@@ -105,12 +125,16 @@ type Notice = {
     message: string;
 };
 
+type ToastItem = Notice & { id: number };
+
 type ModalState = { mode: "create" } | { mode: "edit"; doctor: DoctorRow } | null;
 
 type DropdownOption = {
     value: string;
     label: string;
 };
+
+const EMPTY_OPTIONS: DoctorFormOptions = { clinics: [], services: [] };
 
 const SPECIALTIES: ReadonlyArray<{ en: string; ar: string }> = [
     { en: "Cardiology", ar: "أمراض القلب" },
@@ -383,17 +407,46 @@ function specialtyLabel(
     return known?.ar ?? (doctor.specialtyAr || doctor.specialty);
 }
 
+// Rows keep their object identity until they change, so the localized list item
+// (and its pre-computed search text) is only rebuilt for rows that actually changed.
+const listItemCache = new WeakMap<DoctorRow, { locale: Locale; item: DoctorListItem }>();
+
 function toListItem(doctor: DoctorRow, locale: Locale): DoctorListItem {
-    return {
+    const cached = listItemCache.get(doctor);
+
+    if (cached && cached.locale === locale) return cached.item;
+
+    const clinicName =
+        locale === "ar" ? doctor.clinicNameAr || doctor.clinicName : doctor.clinicName;
+    const specialty = specialtyLabel(doctor, locale);
+    const services = doctor.services.map((service) => ({
+        id: service.id,
+        name: locale === "ar" ? service.nameAr : service.nameEn,
+    }));
+
+    const searchText = [
+        doctor.fullName,
+        doctor.email ?? "",
+        doctor.nationalId,
+        doctor.scfhsLicenseNumber,
+        specialty,
+        clinicName,
+        ...services.map((service) => service.name),
+    ]
+        .join(" ")
+        .toLocaleLowerCase(locale);
+
+    const item: DoctorListItem = {
         ...doctor,
-        clinicName:
-            locale === "ar" ? doctor.clinicNameAr || doctor.clinicName : doctor.clinicName,
-        specialty: specialtyLabel(doctor, locale),
-        services: doctor.services.map((service) => ({
-            id: service.id,
-            name: locale === "ar" ? service.nameAr : service.nameEn,
-        })),
+        clinicName,
+        specialty,
+        services,
+        searchText,
     };
+
+    listItemCache.set(doctor, { locale, item });
+
+    return item;
 }
 
 function displayName(name: string, locale: Locale): string {
@@ -482,6 +535,124 @@ async function copyText(text: string): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Optimistic-UI helpers                                              */
+/* ------------------------------------------------------------------ */
+
+function makeTempId(): string {
+    const random =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    return `${TEMP_ID_PREFIX}${random}`;
+}
+
+function isTempId(id: string): boolean {
+    return id.startsWith(TEMP_ID_PREFIX);
+}
+
+// Mirrors the status rules used by the server (mapDoctor in actions.ts).
+function deriveAccountStatus(
+    isActive: boolean,
+    hasUser: boolean,
+    mustChangePassword: boolean,
+): DoctorRow["accountStatus"] {
+    if (!isActive) return "INACTIVE";
+    if (!hasUser) return "NO_ACCOUNT";
+    return mustChangePassword ? "INVITED" : "ACTIVE";
+}
+
+// Builds the row that is shown instantly, before the server confirms the change.
+function buildOptimisticRow(
+    input: CreateDoctorInput,
+    base: DoctorRow | null,
+    id: string,
+    options: DoctorFormOptions,
+): DoctorRow {
+    const clinic = options.clinics.find((item) => item.id === input.clinicId);
+    const fallbackClinic = base && base.clinicId === input.clinicId ? base : null;
+
+    const services: DoctorRow["services"] = [];
+
+    for (const serviceId of input.serviceIds) {
+        const found =
+            options.services.find((item) => item.id === serviceId) ??
+            base?.services.find((item) => item.id === serviceId);
+
+        if (found) {
+            services.push({
+                id: found.id,
+                nameEn: found.nameEn,
+                nameAr: found.nameAr,
+                code: found.code,
+            });
+        }
+    }
+
+    services.sort((a, b) => a.nameEn.localeCompare(b.nameEn));
+
+    const isActive = base?.isActive ?? true;
+    const mustChangePassword = input.temporaryPassword
+        ? true
+        : (base?.mustChangePassword ?? true);
+
+    return {
+        id,
+        userId: base?.userId ?? null,
+        email: input.email,
+        firstName: input.firstName,
+        lastName: input.lastName,
+        fullName: `${input.firstName} ${input.lastName}`.trim(),
+        specialty: input.specialty,
+        specialtyAr: input.specialtyAr ?? input.specialty,
+        nationalId: input.nationalId,
+        identityType: input.nationalId.startsWith("1")
+            ? IdentityType.NATIONAL_ID
+            : IdentityType.IQAMA,
+        scfhsLicenseNumber: input.scfhsLicenseNumber,
+        professionalRank: input.professionalRank,
+        clinicId: input.clinicId,
+        clinicName: clinic?.nameEn ?? fallbackClinic?.clinicName ?? "",
+        clinicNameAr: clinic?.nameAr ?? fallbackClinic?.clinicNameAr ?? "",
+        commissionRate: String(input.commissionRate),
+        isActive,
+        mustChangePassword,
+        accountStatus: deriveAccountStatus(isActive, true, mustChangePassword),
+        createdAt: base?.createdAt ?? new Date().toISOString(),
+        services,
+    };
+}
+
+async function fetchAllDoctors(): Promise<{ rows: DoctorRow[] } | { error: string | null }> {
+    const first = await getDoctorsAction({ page: 1, pageSize: 100 });
+
+    if (!first.success || !first.data) {
+        return { error: first.error ?? null };
+    }
+
+    const rows: DoctorRow[] = Array.isArray(first.data.doctors) ? [...first.data.doctors] : [];
+    const totalPages = first.data.totalPages ?? 1;
+
+    if (totalPages > 1) {
+        const rest = await Promise.all(
+            Array.from({ length: totalPages - 1 }, (_, index) =>
+                getDoctorsAction({ page: index + 2, pageSize: 100 }),
+            ),
+        );
+
+        for (const result of rest) {
+            if (!result.success || !result.data) {
+                return { error: result.error ?? null };
+            }
+
+            rows.push(...result.data.doctors);
+        }
+    }
+
+    return { rows };
 }
 
 function Field({
@@ -873,11 +1044,43 @@ function StatusBadge({
     );
 }
 
+function SkeletonRows() {
+    return (
+        <>
+            {Array.from({ length: PAGE_SIZE }, (_, row) => (
+                <tr key={row} className="animate-pulse">
+                    <td className="px-6 py-5 align-middle">
+                        <div className="flex items-center gap-4">
+                            <div className="h-12 w-12 shrink-0 rounded-full bg-slate-200 dark:bg-slate-800" />
+                            <div className="space-y-2">
+                                <div className="h-4 w-36 rounded bg-slate-200 dark:bg-slate-800" />
+                                <div className="h-3 w-24 rounded bg-slate-200 dark:bg-slate-800" />
+                            </div>
+                        </div>
+                    </td>
+                    {[96, 96, 112, 160, 48, 96].map((width, cell) => (
+                        <td key={cell} className="px-4 py-5 align-middle">
+                            <div
+                                className="h-4 rounded bg-slate-200 dark:bg-slate-800"
+                                style={{ width }}
+                            />
+                        </td>
+                    ))}
+                    <td className="px-4 py-5 align-middle">
+                        <div className="ms-auto h-11 w-11 rounded-lg bg-slate-200 dark:bg-slate-800" />
+                    </td>
+                </tr>
+            ))}
+        </>
+    );
+}
+
 function RowActions({
     doctor,
     t,
     isRtl,
     busy,
+    disabled,
     onEdit,
     onDelete,
     onToggleStatus,
@@ -887,6 +1090,7 @@ function RowActions({
     t: Messages;
     isRtl: boolean;
     busy: boolean;
+    disabled: boolean;
     onEdit: () => void;
     onDelete: () => void;
     onToggleStatus: () => void;
@@ -987,7 +1191,7 @@ function RowActions({
                 aria-label={t.rowActions}
                 aria-haspopup="menu"
                 aria-expanded={open}
-                disabled={busy}
+                disabled={busy || disabled}
                 onClick={() => setOpen((value) => !value)}
                 className={`grid h-11 w-11 place-items-center rounded-lg border text-slate-600 dark:text-slate-300 transition focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50 ${open
                     ? "border-teal-500 bg-teal-600/10 text-teal-400"
@@ -1214,13 +1418,12 @@ function DoctorFormModal({
     locale: Locale;
     t: Messages;
     onClose: () => void;
-    onSubmit: (input: CreateDoctorInput) => Promise<string | null>;
+    onSubmit: (input: CreateDoctorInput) => void;
     onReloadOptions: () => void;
 }) {
     const isEdit = Boolean(doctor);
     const isRtl = locale === "ar";
 
-    const [saving, setSaving] = useState(false);
     const [errors, setErrors] = useState<FormErrors>({});
     const [formError, setFormError] = useState("");
     const [clinicId, setClinicId] = useState(doctor?.clinicId ?? "");
@@ -1294,12 +1497,12 @@ function DoctorFormModal({
 
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !saving) onClose();
+            if (event.key === "Escape") onClose();
         };
 
         document.addEventListener("keydown", onKeyDown);
         return () => document.removeEventListener("keydown", onKeyDown);
-    }, [saving, onClose]);
+    }, [onClose]);
 
     const clearError = (key: keyof FormErrors) =>
         setErrors((current) => (current[key] ? { ...current, [key]: undefined } : current));
@@ -1323,7 +1526,9 @@ function DoctorFormModal({
         clearError("serviceIds");
     }
 
-    async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    // Validation stays synchronous. Once it passes, the parent applies the change
+    // optimistically, closes this modal in the same frame and syncs in the background.
+    function handleSubmit(event: FormEvent<HTMLFormElement>) {
         event.preventDefault();
         setFormError("");
 
@@ -1345,23 +1550,14 @@ function DoctorFormModal({
 
         if (!validation.input) return;
 
-        setSaving(true);
-
-        try {
-            const error = await onSubmit(validation.input);
-            if (error) setFormError(error);
-        } catch {
-            setFormError(t.failed);
-        } finally {
-            setSaving(false);
-        }
+        onSubmit(validation.input);
     }
 
     return (
         <div
             className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 dark:bg-slate-950/80 p-3 backdrop-blur-sm sm:p-6"
             onMouseDown={(event) => {
-                if (event.target === event.currentTarget && !saving) onClose();
+                if (event.target === event.currentTarget) onClose();
             }}
         >
             <section
@@ -1382,7 +1578,6 @@ function DoctorFormModal({
                         <button
                             type="button"
                             aria-label={t.close}
-                            disabled={saving}
                             onClick={onClose}
                             className="rounded-lg p-2 text-slate-600 dark:text-slate-300 transition hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white disabled:opacity-40"
                         >
@@ -1408,7 +1603,6 @@ function DoctorFormModal({
                                             maxLength={254}
                                             placeholder={t.emailPlaceholder}
                                             aria-invalid={Boolean(errors.email)}
-                                            disabled={saving}
                                             onChange={() => clearError("email")}
                                         />
                                     </span>
@@ -1426,7 +1620,6 @@ function DoctorFormModal({
                                             autoComplete="off"
                                             maxLength={100}
                                             aria-invalid={Boolean(errors.firstName)}
-                                            disabled={saving}
                                             onChange={() => clearError("firstName")}
                                         />
                                     </span>
@@ -1444,7 +1637,6 @@ function DoctorFormModal({
                                             autoComplete="off"
                                             maxLength={100}
                                             aria-invalid={Boolean(errors.lastName)}
-                                            disabled={saving}
                                             onChange={() => clearError("lastName")}
                                         />
                                     </span>
@@ -1472,7 +1664,6 @@ function DoctorFormModal({
                                             isEdit ? t.tempPasswordEditPlaceholder : t.tempPasswordPlaceholder
                                         }
                                         aria-invalid={Boolean(errors.temporaryPassword)}
-                                        disabled={saving}
                                         onChange={(event) => {
                                             setPassword(event.target.value);
                                             clearError("temporaryPassword");
@@ -1482,7 +1673,6 @@ function DoctorFormModal({
                                     <button
                                         type="button"
                                         aria-label={showPassword ? t.hidePassword : t.showPassword}
-                                        disabled={saving}
                                         onClick={() => setShowPassword((value) => !value)}
                                         className="absolute end-[108px] top-1/2 -translate-y-1/2 rounded-md p-1.5 text-slate-600 dark:text-slate-300 transition hover:text-teal-400 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50"
                                     >
@@ -1494,7 +1684,6 @@ function DoctorFormModal({
                                     </button>
                                     <button
                                         type="button"
-                                        disabled={saving}
                                         onClick={handleGenerate}
                                         className="absolute end-2 top-1/2 h-9 -translate-y-1/2 rounded-md border border-teal-500 px-4 text-sm font-semibold text-teal-400 transition hover:bg-teal-600/10 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50"
                                     >
@@ -1530,7 +1719,6 @@ function DoctorFormModal({
                                             dir="ltr"
                                             className={`${baseInput} ${ltrInputPadding}`}
                                             aria-invalid={Boolean(errors.nationalId)}
-                                            disabled={saving}
                                             onChange={() => clearError("nationalId")}
                                         />
                                     </span>
@@ -1553,7 +1741,6 @@ function DoctorFormModal({
                                             dir="ltr"
                                             className={`${baseInput} ${ltrInputPadding}`}
                                             aria-invalid={Boolean(errors.scfhsLicenseNumber)}
-                                            disabled={saving}
                                             onChange={() => clearError("scfhsLicenseNumber")}
                                         />
                                     </span>
@@ -1572,7 +1759,6 @@ function DoctorFormModal({
                                         placeholder={t.chooseRank}
                                         icon={BriefcaseMedical}
                                         isRtl={isRtl}
-                                        disabled={saving}
                                         invalid={Boolean(errors.professionalRank)}
                                     />
                                 </Field>
@@ -1590,7 +1776,6 @@ function DoctorFormModal({
                                         placeholder={t.chooseSpecialty}
                                         icon={Stethoscope}
                                         isRtl={isRtl}
-                                        disabled={saving}
                                         invalid={Boolean(errors.specialty)}
                                     />
                                 </Field>
@@ -1627,7 +1812,7 @@ function DoctorFormModal({
                                         placeholder={optionsLoading ? "…" : t.chooseClinic}
                                         icon={Building2}
                                         isRtl={isRtl}
-                                        disabled={saving || optionsLoading || clinicOptions.length === 0}
+                                        disabled={optionsLoading || clinicOptions.length === 0}
                                         className="h-12"
                                     />
 
@@ -1636,7 +1821,7 @@ function DoctorFormModal({
                                     )}
                                 </Field>
 
-                                <fieldset className="min-w-0" disabled={saving}>
+                                <fieldset className="min-w-0">
                                     <legend className="mb-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
                                         {t.offeredServices}
                                         <span className="ms-1 text-teal-400">*</span>
@@ -1708,7 +1893,6 @@ function DoctorFormModal({
                                             dir="ltr"
                                             className={`${baseInput} h-12 ${ltrInputPadding}`}
                                             aria-invalid={Boolean(errors.commissionRate)}
-                                            disabled={saving}
                                             onChange={() => clearError("commissionRate")}
                                         />
                                     </span>
@@ -1730,7 +1914,6 @@ function DoctorFormModal({
                     <footer className="flex flex-col-reverse gap-3 border-t border-slate-200/80 dark:border-slate-700/70 px-5 py-5 sm:flex-row sm:justify-end sm:px-7">
                         <button
                             type="button"
-                            disabled={saving}
                             onClick={onClose}
                             className={`${outlineButton} h-12 px-8`}
                         >
@@ -1740,25 +1923,14 @@ function DoctorFormModal({
                         <button
                             type="submit"
                             disabled={
-                                saving ||
                                 optionsLoading ||
                                 Boolean(optionsError) ||
                                 clinicOptions.length === 0
                             }
                             className={`${tealButton} h-12 px-6`}
                         >
-                            {saving ? (
-                                <LoaderCircle className="h-4 w-4 animate-spin" />
-                            ) : (
-                                <CheckCircle2 className="h-4 w-4" />
-                            )}
-                            {saving
-                                ? isEdit
-                                    ? t.savingEdit
-                                    : t.saving
-                                : isEdit
-                                    ? t.saveEdit
-                                    : t.save}
+                            <CheckCircle2 className="h-4 w-4" />
+                            {isEdit ? t.saveEdit : t.save}
                         </button>
                     </footer>
                 </form>
@@ -1772,7 +1944,7 @@ export default function DoctorsManagementPage({ initialLocale,
     const [locale, setLocale] = useState<Locale>(initialLocale);
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [doctors, setDoctors] = useState<DoctorRow[]>([]);
-    const [options, setOptions] = useState<DoctorFormOptions>({ clinics: [], services: [] });
+    const [options, setOptions] = useState<DoctorFormOptions>(EMPTY_OPTIONS);
     const [loading, setLoading] = useState(true);
     const [optionsLoading, setOptionsLoading] = useState(true);
     const [loadError, setLoadError] = useState("");
@@ -1783,13 +1955,26 @@ export default function DoctorsManagementPage({ initialLocale,
     const [page, setPage] = useState(1);
     const [modal, setModal] = useState<ModalState>(null);
     const [deleteTarget, setDeleteTarget] = useState<DoctorRow | null>(null);
-    const [deleting, setDeleting] = useState(false);
-    const [deleteError, setDeleteError] = useState("");
     const [busyId, setBusyId] = useState<string | null>(null);
-    const [notice, setNotice] = useState<Notice | null>(null);
+    const [toasts, setToasts] = useState<ToastItem[]>([]);
 
     const t = messages[locale];
     const isRtl = locale === "ar";
+
+    // Always-fresh mirrors so background tasks never read stale closures.
+    const tRef = useRef<Messages>(t);
+    const doctorsRef = useRef<DoctorRow[]>([]);
+    const optionsRef = useRef<DoctorFormOptions>(EMPTY_OPTIONS);
+    const optionsLoadedRef = useRef(false);
+    const optionsFetchedAtRef = useRef(0);
+    const optionsInflightRef = useRef(false);
+    const doctorsInflightRef = useRef(false);
+    const queueRef = useRef(new Map<string, Promise<void>>());
+    const toastIdRef = useRef(0);
+
+    useEffect(() => {
+        tRef.current = t;
+    }, [t]);
 
     useEffect(() => {
         const root = document.documentElement;
@@ -1805,108 +1990,259 @@ export default function DoctorsManagementPage({ initialLocale,
         return () => observer.disconnect();
     }, []);
 
-    useEffect(() => {
-        if (!notice) return;
+    /* ---------------------------- toasts ---------------------------- */
 
-        const timer = window.setTimeout(() => setNotice(null), 8000);
-        return () => window.clearTimeout(timer);
-    }, [notice]);
+    const dismissNotice = useCallback((id: number) => {
+        setToasts((current) => current.filter((item) => item.id !== id));
+    }, []);
+
+    const pushNotice = useCallback(
+        (notice: Notice): number => {
+            const id = ++toastIdRef.current;
+
+            setToasts((current) => [...current.slice(-(MAX_TOASTS - 1)), { ...notice, id }]);
+            window.setTimeout(() => dismissNotice(id), TOAST_MS);
+
+            return id;
+        },
+        [dismissNotice],
+    );
+
+    /* ------------------------ local data store ----------------------- */
+
+    // Single entry point for every local change: updates the ref synchronously
+    // (so rapid actions see the latest rows) and schedules the React render.
+    const updateDoctors = useCallback(
+        (updater: (current: DoctorRow[]) => DoctorRow[]): DoctorRow[] => {
+            const next = updater(doctorsRef.current);
+
+            doctorsRef.current = next;
+            setDoctors(next);
+
+            return next;
+        },
+        [],
+    );
+
+    // Server calls for the same row run strictly in order.
+    const enqueue = useCallback((id: string, task: () => Promise<void>) => {
+        const previous = queueRef.current.get(id) ?? Promise.resolve();
+        const next: Promise<void> = previous
+            .then(task)
+            .catch(() => undefined)
+            .then(() => {
+                if (queueRef.current.get(id) === next) queueRef.current.delete(id);
+            });
+
+        queueRef.current.set(id, next);
+    }, []);
+
+    /* ----------------------------- loaders --------------------------- */
 
     const loadDoctors = useCallback(async () => {
-        setLoading(true);
+        if (doctorsInflightRef.current) return;
+
+        doctorsInflightRef.current = true;
+
+        const blocking = doctorsRef.current.length === 0;
+
+        if (blocking) setLoading(true);
         setLoadError("");
 
         try {
-            const first = await getDoctorsAction({ page: 1, pageSize: 100 });
+            const result = await fetchAllDoctors();
 
-            if (!first.success || !first.data) {
-                setLoadError(first.error ?? t.loadFailed);
-                setDoctors([]);
+            if ("rows" in result) {
+                updateDoctors((current) => [
+                    ...current.filter((item) => isTempId(item.id)),
+                    ...result.rows,
+                ]);
+            } else {
+                setLoadError(result.error ?? tRef.current.loadFailed);
+                updateDoctors(() => []);
+            }
+        } catch {
+            setLoadError(tRef.current.loadFailed);
+            updateDoctors(() => []);
+        } finally {
+            doctorsInflightRef.current = false;
+            setLoading(false);
+        }
+    }, [updateDoctors]);
+
+    // Silent reconciliation with the server, used only after a conflicting rollback.
+    const resyncDoctors = useCallback(async () => {
+        try {
+            const result = await fetchAllDoctors();
+
+            if ("rows" in result) {
+                updateDoctors((current) => [
+                    ...current.filter((item) => isTempId(item.id)),
+                    ...result.rows,
+                ]);
+            }
+        } catch {
+            // Keep the current local state if the background sync fails.
+        }
+    }, [updateDoctors]);
+
+    // `background` refreshes never show loaders and are skipped while the cache is fresh.
+    const loadOptions = useCallback(
+        async (background = false) => {
+            const hasData = optionsLoadedRef.current;
+
+            if (
+                background &&
+                hasData &&
+                Date.now() - optionsFetchedAtRef.current < OPTIONS_STALE_MS
+            ) {
                 return;
             }
 
-            const rows = [...first.data.doctors];
+            if (optionsInflightRef.current) return;
 
-            for (let nextPage = 2; nextPage <= first.data.totalPages; nextPage++) {
-                const next = await getDoctorsAction({ page: nextPage, pageSize: 100 });
+            optionsInflightRef.current = true;
 
-                if (!next.success || !next.data) {
-                    setLoadError(next.error ?? t.loadFailed);
-                    setDoctors([]);
+            const showBlocking = !background || !hasData;
+
+            if (showBlocking) {
+                setOptionsLoading(true);
+                setOptionsError("");
+            }
+
+            try {
+                const result = await getDoctorFormOptions();
+
+                if (!result.success || !result.data) {
+                    if (showBlocking) {
+                        setOptionsError(result.error ?? tRef.current.optionsError);
+
+                        if (!optionsLoadedRef.current) {
+                            optionsRef.current = EMPTY_OPTIONS;
+                            setOptions(EMPTY_OPTIONS);
+                        }
+                    }
                     return;
                 }
 
-                rows.push(...next.data.doctors);
+                optionsRef.current = result.data;
+                optionsLoadedRef.current = true;
+                optionsFetchedAtRef.current = Date.now();
+                setOptions(result.data);
+                setOptionsError("");
+            } catch {
+                if (showBlocking) {
+                    setOptionsError(tRef.current.optionsError);
+
+                    if (!optionsLoadedRef.current) {
+                        optionsRef.current = EMPTY_OPTIONS;
+                        setOptions(EMPTY_OPTIONS);
+                    }
+                }
+            } finally {
+                optionsInflightRef.current = false;
+
+                if (showBlocking) setOptionsLoading(false);
             }
+        },
+        [],
+    );
 
-            setDoctors(rows);
-        } catch {
-            setLoadError(t.loadFailed);
-            setDoctors([]);
-        } finally {
-            setLoading(false);
-        }
-    }, [t.loadFailed]);
-
-    const loadOptions = useCallback(async () => {
-        setOptionsLoading(true);
-        setOptionsError("");
-
-        try {
-            const result = await getDoctorFormOptions();
-
-            if (!result.success || !result.data) {
-                setOptionsError(result.error ?? t.optionsError);
-                setOptions({ clinics: [], services: [] });
-                return;
-            }
-
-            setOptions(result.data);
-        } catch {
-            setOptionsError(t.optionsError);
-            setOptions({ clinics: [], services: [] });
-        } finally {
-            setOptionsLoading(false);
-        }
-    }, [t.optionsError]);
-
+    // Loaders are stable (no locale dependency), so this runs exactly once on mount.
     useEffect(() => {
         void loadDoctors();
         void loadOptions();
     }, [loadDoctors, loadOptions]);
 
-    // Keep the UI resilient if a Server Action returns an unexpected payload shape.
-    // The state is intended to contain DoctorRow[], but runtime data is not guaranteed.
-    const safeDoctors = Array.isArray(doctors) ? doctors : [];
+    /* --------------------- optimistic settle / rollback -------------- */
+
+    const settleRow = useCallback(
+        (optimistic: DoctorRow, confirmed: DoctorRow) => {
+            // Only replace the row if no newer optimistic change has superseded it.
+            updateDoctors((list) => list.map((item) => (item === optimistic ? confirmed : item)));
+        },
+        [updateDoctors],
+    );
+
+    const rollbackRow = useCallback(
+        (optimistic: DoctorRow, previous: DoctorRow, toastId: number, message: string) => {
+            dismissNotice(toastId);
+
+            const next = updateDoctors((list) =>
+                list.map((item) => (item === optimistic ? previous : item)),
+            );
+
+            // A newer local change superseded this one: reconcile with the server.
+            if (!next.includes(previous)) void resyncDoctors();
+
+            pushNotice({ kind: "error", message });
+        },
+        [dismissNotice, pushNotice, resyncDoctors, updateDoctors],
+    );
+
+    const removeTempRow = useCallback(
+        (tempId: string, toastId: number, message: string) => {
+            dismissNotice(toastId);
+            updateDoctors((list) => list.filter((item) => item.id !== tempId));
+            pushNotice({ kind: "error", message });
+        },
+        [dismissNotice, pushNotice, updateDoctors],
+    );
+
+    const restoreDeletedRow = useCallback(
+        (snapshot: DoctorRow, index: number, toastId: number, message: string) => {
+            dismissNotice(toastId);
+            updateDoctors((list) => {
+                if (list.some((item) => item.id === snapshot.id)) return list;
+
+                const next = [...list];
+                next.splice(Math.min(Math.max(index, 0), next.length), 0, snapshot);
+
+                return next;
+            });
+            pushNotice({ kind: "error", message });
+        },
+        [dismissNotice, pushNotice, updateDoctors],
+    );
+
+    const announceGeneratedPassword = useCallback(
+        async (email: string | null, password: string, base: string) => {
+            const copied = await copyText(`Email: ${email ?? ""} | Temporary Password: ${password}`);
+            const current = tRef.current;
+
+            pushNotice(
+                copied
+                    ? { kind: "success", message: `${base} ${current.generatedCopied}` }
+                    : { kind: "error", message: `${base} ${current.copyFailed} ${password}` },
+            );
+        },
+        [pushNotice],
+    );
+
+    /* ---------------------------- derived data ----------------------- */
+
+    const deferredQuery = useDeferredValue(query);
 
     const displayDoctors = useMemo(
-        () => safeDoctors.map((doctor) => toListItem(doctor, locale)),
-        [safeDoctors, locale],
+        () => doctors.map((doctor) => toListItem(doctor, locale)),
+        [doctors, locale],
+    );
+
+    const doctorById = useMemo(
+        () => new Map(doctors.map((doctor) => [doctor.id, doctor] as const)),
+        [doctors],
     );
 
     const filteredDoctors = useMemo(() => {
-        const normalized = query.trim().toLocaleLowerCase(locale);
+        const normalized = deferredQuery.trim().toLocaleLowerCase(locale);
 
-        return displayDoctors.filter((doctor) => {
-            const searchable = [
-                doctor.fullName,
-                doctor.email ?? "",
-                doctor.nationalId,
-                doctor.scfhsLicenseNumber,
-                doctor.specialty,
-                doctor.clinicName,
-                ...doctor.services.map((service) => service.name),
-            ]
-                .join(" ")
-                .toLocaleLowerCase(locale);
-
-            return (
-                (!normalized || searchable.includes(normalized)) &&
+        return displayDoctors.filter(
+            (doctor) =>
+                (!normalized || doctor.searchText.includes(normalized)) &&
                 (clinicFilter === "ALL" || doctor.clinicId === clinicFilter) &&
-                (statusFilter === "ALL" || doctor.accountStatus === statusFilter)
-            );
-        });
-    }, [displayDoctors, query, clinicFilter, statusFilter, locale]);
+                (statusFilter === "ALL" || doctor.accountStatus === statusFilter),
+        );
+    }, [displayDoctors, deferredQuery, clinicFilter, statusFilter, locale]);
 
     const clinicFilterOptions = useMemo<DropdownOption[]>(
         () => [
@@ -1937,184 +2273,225 @@ export default function DoctorsManagementPage({ initialLocale,
         currentPage * PAGE_SIZE,
     );
 
-    useEffect(() => {
+    /* ------------------------ filter handlers ------------------------ */
+
+    // Page resets happen in the handlers, so there is no extra effect-driven re-render.
+    function changeQuery(value: string) {
+        setQuery(value);
         setPage(1);
-    }, [query, clinicFilter, statusFilter]);
+    }
+
+    function changeClinicFilter(value: string) {
+        setClinicFilter(value);
+        setPage(1);
+    }
+
+    function changeStatusFilter(value: string) {
+        setStatusFilter(value);
+        setPage(1);
+    }
+
+    function resetFilters() {
+        setQuery("");
+        setClinicFilter("ALL");
+        setStatusFilter("ALL");
+        setPage(1);
+    }
+
+    /* -------------------------- modal handlers ----------------------- */
+
+    const closeModal = useCallback(() => setModal(null), []);
 
     function openCreate() {
-        setNotice(null);
         setModal({ mode: "create" });
-        void loadOptions();
+        void loadOptions(true);
     }
 
     function openEdit(doctor: DoctorRow) {
-        setNotice(null);
         setModal({ mode: "edit", doctor });
-        void loadOptions();
+        void loadOptions(true);
     }
 
-    async function announceGeneratedPassword(email: string | null, password: string, base: string) {
-        const copied = await copyText(`Email: ${email ?? ""} | Temporary Password: ${password}`);
+    /* ----------------------- optimistic mutations -------------------- */
 
-        setNotice(
-            copied
-                ? { kind: "success", message: `${base} ${t.generatedCopied}` }
-                : { kind: "error", message: `${base} ${t.copyFailed} ${password}` },
-        );
-    }
+    function submitDoctor(input: CreateDoctorInput) {
+        const currentModal = modal;
 
-    async function submitDoctor(input: CreateDoctorInput): Promise<string | null> {
-        setNotice(null);
+        // Close instantly — the row below is already updated in this same frame.
+        setModal(null);
 
-        try {
-            if (modal?.mode === "edit") {
-                const result = await updateDoctorAction({ ...input, doctorId: modal.doctor.id });
+        if (currentModal?.mode === "edit") {
+            const base =
+                doctorsRef.current.find((item) => item.id === currentModal.doctor.id) ??
+                currentModal.doctor;
+            const optimistic = buildOptimisticRow(input, base, base.id, optionsRef.current);
+
+            updateDoctors((list) => list.map((item) => (item.id === base.id ? optimistic : item)));
+
+            const toastId = pushNotice({ kind: "success", message: t.updated });
+
+            enqueue(base.id, async () => {
+                try {
+                    const result = await updateDoctorAction({ ...input, doctorId: base.id });
+
+                    if (!result.success || !result.data) {
+                        rollbackRow(optimistic, base, toastId, result.error ?? tRef.current.failed);
+                        return;
+                    }
+
+                    const updated = result.data.doctor;
+
+                    settleRow(optimistic, updated);
+
+                    if (result.data.generatedPassword) {
+                        await announceGeneratedPassword(
+                            updated.email,
+                            result.data.generatedPassword,
+                            tRef.current.updated,
+                        );
+                    }
+                } catch {
+                    rollbackRow(optimistic, base, toastId, tRef.current.failed);
+                }
+            });
+
+            return;
+        }
+
+        const tempId = makeTempId();
+        const optimistic = buildOptimisticRow(input, null, tempId, optionsRef.current);
+
+        updateDoctors((list) => [optimistic, ...list]);
+        setPage(1);
+
+        const toastId = pushNotice({ kind: "success", message: t.success });
+
+        enqueue(tempId, async () => {
+            try {
+                const result = await createDoctorAction(input);
 
                 if (!result.success || !result.data) {
-                    return result.error ?? t.failed;
+                    removeTempRow(tempId, toastId, result.error ?? tRef.current.failed);
+                    return;
                 }
 
-                const updated = result.data.doctor;
+                const created: DoctorRow = {
+                    ...result.data.doctor,
+                    accountStatus: "INVITED",
+                    mustChangePassword: true,
+                };
 
-                setDoctors((current) => {
-                    const currentDoctors = Array.isArray(current) ? current : [];
-                    return currentDoctors.map((doctor) =>
-                        doctor.id === updated.id ? updated : doctor,
-                    );
-                });
-                setModal(null);
+                updateDoctors((list) =>
+                    list.map((item) => (item.id === tempId ? created : item)),
+                );
 
                 if (result.data.generatedPassword) {
                     await announceGeneratedPassword(
-                        updated.email,
+                        created.email,
                         result.data.generatedPassword,
-                        t.updated,
+                        tRef.current.success,
                     );
-                } else {
-                    setNotice({ kind: "success", message: t.updated });
+                }
+            } catch {
+                removeTempRow(tempId, toastId, tRef.current.failed);
+            }
+        });
+    }
+
+    function handleToggleStatus(doctor: DoctorRow) {
+        if (isTempId(doctor.id)) return;
+
+        const current = doctorsRef.current.find((item) => item.id === doctor.id) ?? doctor;
+        const nextActive = !current.isActive;
+        const optimistic: DoctorRow = {
+            ...current,
+            isActive: nextActive,
+            accountStatus: deriveAccountStatus(
+                nextActive,
+                current.email !== null,
+                current.mustChangePassword,
+            ),
+        };
+
+        updateDoctors((list) => list.map((item) => (item.id === current.id ? optimistic : item)));
+
+        const toastId = pushNotice({
+            kind: "success",
+            message: nextActive ? t.activated : t.deactivated,
+        });
+
+        enqueue(current.id, async () => {
+            try {
+                const result = await setDoctorActiveStatusAction(current.id, nextActive);
+
+                if (!result.success || !result.data) {
+                    rollbackRow(optimistic, current, toastId, result.error ?? tRef.current.failed);
+                    return;
                 }
 
-                return null;
+                settleRow(optimistic, result.data.doctor);
+            } catch {
+                rollbackRow(optimistic, current, toastId, tRef.current.failed);
             }
-
-            const result = await createDoctorAction(input);
-
-            if (!result.success || !result.data) {
-                return result.error ?? t.failed;
-            }
-
-            const created: DoctorRow = {
-                ...result.data.doctor,
-                accountStatus: "INVITED",
-                mustChangePassword: true,
-            };
-
-            setDoctors((current) => {
-                const currentDoctors = Array.isArray(current) ? current : [];
-                return [
-                    created,
-                    ...currentDoctors.filter((doctor) => doctor.id !== created.id),
-                ];
-            });
-            setModal(null);
-
-            if (result.data.generatedPassword) {
-                await announceGeneratedPassword(created.email, result.data.generatedPassword, t.success);
-            } else {
-                setNotice({ kind: "success", message: t.success });
-            }
-
-            return null;
-        } catch {
-            return t.failed;
-        }
+        });
     }
 
-    async function handleRegenerate(doctor: DoctorRow) {
-        setNotice(null);
-        setBusyId(doctor.id);
-
-        try {
-            const result = await regenerateTempPasswordAction(doctor.id);
-
-            if (!result.success || !result.data) {
-                setNotice({ kind: "error", message: result.error ?? t.failed });
-                return;
-            }
-
-            const { email, temporaryPassword } = result.data;
-            const copied = await copyText(`Email: ${email} | Temporary Password: ${temporaryPassword}`);
-
-            setNotice(
-                copied
-                    ? { kind: "success", message: t.regenerated }
-                    : { kind: "error", message: `${t.copyFailed} ${temporaryPassword}` },
-            );
-        } catch {
-            setNotice({ kind: "error", message: t.failed });
-        } finally {
-            setBusyId(null);
-        }
-    }
-
-    async function handleToggleStatus(doctor: DoctorRow) {
-        setNotice(null);
-        setBusyId(doctor.id);
-
-        try {
-            const result = await setDoctorActiveStatusAction(doctor.id, !doctor.isActive);
-
-            if (!result.success || !result.data) {
-                setNotice({ kind: "error", message: result.error ?? t.failed });
-                return;
-            }
-
-            const updated = result.data.doctor;
-
-            setDoctors((current) => {
-                const currentDoctors = Array.isArray(current) ? current : [];
-                return currentDoctors.map((item) => (item.id === updated.id ? updated : item));
-            });
-
-            setNotice({
-                kind: "success",
-                message: updated.isActive ? t.activated : t.deactivated,
-            });
-        } catch {
-            setNotice({ kind: "error", message: t.failed });
-        } finally {
-            setBusyId(null);
-        }
-    }
-
-    async function confirmDelete() {
+    function confirmDelete() {
         if (!deleteTarget) return;
 
-        setDeleting(true);
-        setDeleteError("");
+        const target = deleteTarget;
+        const index = doctorsRef.current.findIndex((item) => item.id === target.id);
+        const snapshot = index >= 0 ? (doctorsRef.current[index] as DoctorRow) : target;
 
-        try {
-            const result = await deleteDoctorAction(deleteTarget.id);
+        // Dialog closes and the row disappears immediately.
+        setDeleteTarget(null);
+        updateDoctors((list) => list.filter((item) => item.id !== target.id));
 
-            if (!result.success) {
-                setDeleteError(result.error ?? t.failed);
-                return;
+        const toastId = pushNotice({ kind: "success", message: t.deleted });
+
+        enqueue(target.id, async () => {
+            try {
+                const result = await deleteDoctorAction(target.id);
+
+                // A record that is already gone on the server is the outcome we wanted.
+                if (!result.success && result.code !== "RECORD_NOT_FOUND") {
+                    restoreDeletedRow(snapshot, index, toastId, result.error ?? tRef.current.failed);
+                }
+            } catch {
+                restoreDeletedRow(snapshot, index, toastId, tRef.current.failed);
             }
+        });
+    }
 
-            const removedId = deleteTarget.id;
+    // The only action that must wait for the server: the password is generated there.
+    function handleRegenerate(doctor: DoctorRow) {
+        if (isTempId(doctor.id)) return;
 
-            setDoctors((current) =>
-                (Array.isArray(current) ? current : []).filter(
-                    (doctor) => doctor.id !== removedId,
-                ),
-            );
-            setDeleteTarget(null);
-            setNotice({ kind: "success", message: t.deleted });
-        } catch {
-            setDeleteError(t.failed);
-        } finally {
-            setDeleting(false);
-        }
+        setBusyId(doctor.id);
+
+        enqueue(doctor.id, async () => {
+            try {
+                const result = await regenerateTempPasswordAction(doctor.id);
+
+                if (!result.success || !result.data) {
+                    pushNotice({ kind: "error", message: result.error ?? tRef.current.failed });
+                    return;
+                }
+
+                const { email, temporaryPassword } = result.data;
+                const copied = await copyText(`Email: ${email} | Temporary Password: ${temporaryPassword}`);
+
+                pushNotice(
+                    copied
+                        ? { kind: "success", message: tRef.current.regenerated }
+                        : { kind: "error", message: `${tRef.current.copyFailed} ${temporaryPassword}` },
+                );
+            } catch {
+                pushNotice({ kind: "error", message: tRef.current.failed });
+            } finally {
+                setBusyId((current) => (current === doctor.id ? null : current));
+            }
+        });
     }
 
     const showingFrom = filteredDoctors.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
@@ -2170,7 +2547,7 @@ export default function DoctorsManagementPage({ initialLocale,
                                 <Search className="pointer-events-none absolute start-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-600 dark:text-slate-300" />
                                 <input
                                     value={query}
-                                    onChange={(event) => setQuery(event.target.value)}
+                                    onChange={(event) => changeQuery(event.target.value)}
                                     placeholder={t.search}
                                     aria-label={t.search}
                                     className={`${baseInput} h-[54px] bg-white dark:bg-slate-900/60 ps-12`}
@@ -2179,7 +2556,7 @@ export default function DoctorsManagementPage({ initialLocale,
 
                             <Dropdown
                                 value={clinicFilter}
-                                onChange={setClinicFilter}
+                                onChange={changeClinicFilter}
                                 options={clinicFilterOptions}
                                 placeholder={t.allClinics}
                                 ariaLabel={t.allClinics}
@@ -2191,7 +2568,7 @@ export default function DoctorsManagementPage({ initialLocale,
 
                             <Dropdown
                                 value={statusFilter}
-                                onChange={setStatusFilter}
+                                onChange={changeStatusFilter}
                                 options={statusFilterOptions}
                                 placeholder={t.allStatuses}
                                 ariaLabel={t.allStatuses}
@@ -2204,11 +2581,7 @@ export default function DoctorsManagementPage({ initialLocale,
                             <button
                                 type="button"
                                 title={t.resetFilters}
-                                onClick={() => {
-                                    setQuery("");
-                                    setClinicFilter("ALL");
-                                    setStatusFilter("ALL");
-                                }}
+                                onClick={resetFilters}
                                 className={`${outlineButton} h-[54px] bg-white dark:bg-slate-900/60 px-6`}
                             >
                                 <Filter className="h-5 w-5" />
@@ -2233,6 +2606,9 @@ export default function DoctorsManagementPage({ initialLocale,
                                 <>
                                     <div className="overflow-x-auto">
                                         <table className="w-full min-w-[1100px] border-collapse text-start">
+                                            <caption className="sr-only">
+                                                {loading ? t.loading : t.title}
+                                            </caption>
                                             <thead>
                                                 <tr className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-sm font-bold text-slate-900 dark:text-slate-100">
                                                     <th className="px-6 py-5 text-start align-middle">{t.profile}</th>
@@ -2248,16 +2624,12 @@ export default function DoctorsManagementPage({ initialLocale,
                                                 </tr>
                                             </thead>
 
-                                            <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                                            <tbody
+                                                aria-busy={loading}
+                                                className="divide-y divide-slate-200 dark:divide-slate-800"
+                                            >
                                                 {loading ? (
-                                                    <tr>
-                                                        <td colSpan={8} className="h-56 text-center align-middle">
-                                                            <LoaderCircle className="mx-auto h-7 w-7 animate-spin text-teal-500" />
-                                                            <span className="mt-3 block text-sm text-slate-500 dark:text-slate-400">
-                                                                {t.loading}
-                                                            </span>
-                                                        </td>
-                                                    </tr>
+                                                    <SkeletonRows />
                                                 ) : visibleDoctors.length === 0 ? (
                                                     <tr>
                                                         <td
@@ -2269,12 +2641,14 @@ export default function DoctorsManagementPage({ initialLocale,
                                                     </tr>
                                                 ) : (
                                                     visibleDoctors.map((doctor) => {
-                                                        const source = doctors.find((item) => item.id === doctor.id);
+                                                        const source = doctorById.get(doctor.id);
+                                                        const pendingCreate = isTempId(doctor.id);
 
                                                         return (
                                                             <tr
                                                                 key={doctor.id}
-                                                                className="transition hover:bg-slate-100 dark:hover:bg-slate-800/30"
+                                                                className={`transition hover:bg-slate-100 dark:hover:bg-slate-800/30 ${pendingCreate ? "opacity-70" : ""
+                                                                    }`}
                                                             >
                                                                 <td className="px-6 py-5 align-middle">
                                                                     <div className="flex items-center gap-4">
@@ -2335,13 +2709,11 @@ export default function DoctorsManagementPage({ initialLocale,
                                                                             t={t}
                                                                             isRtl={isRtl}
                                                                             busy={busyId === doctor.id}
+                                                                            disabled={pendingCreate}
                                                                             onEdit={() => openEdit(source)}
-                                                                            onDelete={() => {
-                                                                                setDeleteError("");
-                                                                                setDeleteTarget(source);
-                                                                            }}
-                                                                            onToggleStatus={() => void handleToggleStatus(source)}
-                                                                            onRegenerate={() => void handleRegenerate(source)}
+                                                                            onDelete={() => setDeleteTarget(source)}
+                                                                            onToggleStatus={() => handleToggleStatus(source)}
+                                                                            onRegenerate={() => handleRegenerate(source)}
                                                                         />
                                                                     )}
                                                                 </td>
@@ -2418,7 +2790,7 @@ export default function DoctorsManagementPage({ initialLocale,
                     optionsError={optionsError}
                     locale={locale}
                     t={t}
-                    onClose={() => setModal(null)}
+                    onClose={closeModal}
                     onSubmit={submitDoctor}
                     onReloadOptions={() => void loadOptions()}
                 />
@@ -2428,7 +2800,7 @@ export default function DoctorsManagementPage({ initialLocale,
                 <div
                     className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/40 dark:bg-slate-950/80 p-4 backdrop-blur-sm"
                     onMouseDown={(event) => {
-                        if (event.target === event.currentTarget && !deleting) setDeleteTarget(null);
+                        if (event.target === event.currentTarget) setDeleteTarget(null);
                     }}
                 >
                     <section
@@ -2453,20 +2825,9 @@ export default function DoctorsManagementPage({ initialLocale,
                             </div>
                         </div>
 
-                        {deleteError && (
-                            <div
-                                role="alert"
-                                className="mt-4 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-sm text-rose-400"
-                            >
-                                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-                                <p>{deleteError}</p>
-                            </div>
-                        )}
-
                         <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
                             <button
                                 type="button"
-                                disabled={deleting}
                                 onClick={() => setDeleteTarget(null)}
                                 className={`${outlineButton} h-11 px-6`}
                             >
@@ -2475,47 +2836,47 @@ export default function DoctorsManagementPage({ initialLocale,
 
                             <button
                                 type="button"
-                                disabled={deleting}
-                                onClick={() => void confirmDelete()}
+                                onClick={confirmDelete}
                                 className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
                             >
-                                {deleting ? (
-                                    <LoaderCircle className="h-4 w-4 animate-spin" />
-                                ) : (
-                                    <Trash2 className="h-4 w-4" />
-                                )}
-                                {deleting ? t.deleting : t.deleteConfirm}
+                                <Trash2 className="h-4 w-4" />
+                                {t.deleteConfirm}
                             </button>
                         </div>
                     </section>
                 </div>
             )}
 
-            {notice && (
-                <div
-                    role="status"
-                    aria-live="polite"
-                    className={`fixed bottom-6 end-6 z-[200] flex max-w-md items-start gap-3 rounded-xl border bg-white dark:bg-slate-900 p-4 text-sm shadow-2xl shadow-black/50 ${notice.kind === "success" ? "border-teal-600/40" : "border-rose-500/40"
-                        }`}
-                >
-                    {notice.kind === "success" ? (
-                        <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-teal-500" />
-                    ) : (
-                        <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-400" />
-                    )}
-
-                    <p className="min-w-0 flex-1 break-words text-slate-900 dark:text-slate-100">{notice.message}</p>
-
-                    <button
-                        type="button"
-                        onClick={() => setNotice(null)}
-                        aria-label={t.close}
-                        className="rounded-md p-1 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white"
+            <div
+                role="status"
+                aria-live="polite"
+                className="pointer-events-none fixed bottom-6 end-6 z-[200] flex flex-col items-end gap-3"
+            >
+                {toasts.map((toast) => (
+                    <div
+                        key={toast.id}
+                        className={`pointer-events-auto flex max-w-md items-start gap-3 rounded-xl border bg-white dark:bg-slate-900 p-4 text-sm shadow-2xl shadow-black/50 ${toast.kind === "success" ? "border-teal-600/40" : "border-rose-500/40"
+                            }`}
                     >
-                        <X className="h-4 w-4" />
-                    </button>
-                </div>
-            )}
+                        {toast.kind === "success" ? (
+                            <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-teal-500" />
+                        ) : (
+                            <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-400" />
+                        )}
+
+                        <p className="min-w-0 flex-1 break-words text-slate-900 dark:text-slate-100">{toast.message}</p>
+
+                        <button
+                            type="button"
+                            onClick={() => dismissNotice(toast.id)}
+                            aria-label={t.close}
+                            className="rounded-md p-1 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white"
+                        >
+                            <X className="h-4 w-4" />
+                        </button>
+                    </div>
+                ))}
+            </div>
         </div>
     );
 }

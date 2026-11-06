@@ -1,5 +1,20 @@
 "use client";
 
+/**
+ * Performance & motion notes
+ * --------------------------
+ * - Every mutation (create, edit, toggle status, delete) updates the UI in the same frame and
+ *   syncs with the server in the background. Per-row queues keep server calls in order.
+ *   On failure the previous state is restored, an error toast appears, and (for create/edit)
+ *   the form reopens with the user's input and any server field errors, so nothing is lost.
+ * - No router.refresh() and no blocking spinners.
+ * - Modals, the delete dialog, dropdown menus, rows and toasts animate in and out using
+ *   Tailwind transitions only (no extra dependencies) and respect `prefers-reduced-motion`.
+ * - Optional server-side win: remove `revalidatePath(MANAGEMENT_PATH)` from ./actions.ts.
+ *   This page owns its data, and each revalidation makes every Server Action response
+ *   heavier and slower.
+ */
+
 import {
     useCallback,
     useDeferredValue,
@@ -22,7 +37,6 @@ import {
     CircleAlert,
     Check,
     Filter,
-    LoaderCircle,
     MoreHorizontal,
     Pencil,
     Plus,
@@ -56,26 +70,43 @@ const PAGE_SIZE = 4;
 const FETCH_PAGE_SIZE = 100;
 const ACTIVE_HREF = "/admin/insurance/payers";
 
+/** Animation timings (ms). Keep in sync with the Tailwind duration classes below. */
+const MODAL_MS = 200;
+const MENU_MS = 150;
+const ROW_EXIT_MS = 200;
+const TOAST_MS = 6000;
+const TOAST_EXIT_MS = 200;
+const MAX_TOASTS = 3;
+
+const TEMP_ID_PREFIX = "tmp-";
+
 /** Mirrors the server-side ZATCA rule: 15 digits, starts and ends with 3. */
 const TAX_NUMBER_PATTERN = /^3\d{13}3$/;
 const NPHIES_ID_PATTERN = /^[A-Z0-9][A-Z0-9._-]{1,39}$/;
-
 
 type InsurancePayersProps = {
     initialLocale: Locale;
 };
 
-type ModalState = { mode: "create" } | { mode: "edit"; payer: PayerRow } | null;
+type ModalDraft = {
+    /** Values to restore in the form (used when a background save fails). */
+    draft?: PayerFormInput;
+    fieldErrors?: PayerFieldErrors;
+    formError?: string;
+};
+
+type ModalRequest =
+    | ({ mode: "create" } & ModalDraft)
+    | ({ mode: "edit"; payer: PayerRow } & ModalDraft);
+
+type ModalState = (ModalRequest & { nonce: number }) | null;
 
 type Notice = {
     kind: "success" | "error";
     message: string;
 };
 
-type SubmitOutcome = {
-    error?: string;
-    fieldErrors?: PayerFieldErrors;
-} | null;
+type ToastItem = Notice & { id: number; leaving: boolean };
 
 const messages = {
     en: {
@@ -235,13 +266,13 @@ type Messages = (typeof messages)[Locale];
 /* -------------------------------------------------------------------------- */
 
 const baseInput =
-    "h-12 w-full rounded-xl border border-slate-200 bg-white px-4 text-sm text-slate-900 outline-none transition placeholder:text-slate-500 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-100";
+    "h-12 w-full rounded-xl border border-slate-200 bg-white px-4 text-sm text-slate-900 outline-none transition duration-150 ease-out motion-reduce:transition-none placeholder:text-slate-500 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-100";
 
 const tealButton =
-    "inline-flex items-center justify-center gap-2 rounded-xl bg-teal-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-slate-950";
+    "inline-flex items-center justify-center gap-2 rounded-xl bg-teal-600 px-5 py-2.5 text-sm font-semibold text-white transition duration-150 ease-out motion-reduce:transition-none hover:bg-teal-500 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-slate-950";
 
 const outlineButton =
-    "inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 text-sm font-semibold text-slate-900 transition hover:border-teal-500 hover:text-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:focus:ring-offset-slate-950";
+    "inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 text-sm font-semibold text-slate-900 transition duration-150 ease-out motion-reduce:transition-none hover:border-teal-500 hover:text-teal-500 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:focus:ring-offset-slate-950";
 
 const AVATAR_COLORS = [
     "bg-sky-600",
@@ -313,6 +344,160 @@ function sortPayers(rows: PayerRow[]): PayerRow[] {
     });
 }
 
+function makeTempId(): string {
+    const random =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    return `${TEMP_ID_PREFIX}${random}`;
+}
+
+function isTempId(id: string): boolean {
+    return id.startsWith(TEMP_ID_PREFIX);
+}
+
+function normalizeCompanyName(value: string): string {
+    return value.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+/** Builds the row shown instantly, before the server confirms the change. */
+function buildOptimisticPayer(
+    input: PayerFormInput,
+    base: PayerRow | null,
+    id: string,
+): PayerRow {
+    let nameAr = normalizeCompanyName(input.nameAr);
+    let nameEn = normalizeCompanyName(input.nameEn);
+
+    // Same fallback the server applies when only one name is provided.
+    if (!nameAr) nameAr = nameEn;
+    if (!nameEn) nameEn = nameAr;
+
+    return {
+        id,
+        nameAr,
+        nameEn,
+        nphiesPayerId: input.nphiesPayerId,
+        taxNumber: input.taxNumber,
+        logoUrl: base?.logoUrl ?? null,
+        isActive: input.isActive ?? base?.isActive ?? true,
+        patientCount: base?.patientCount ?? 0,
+        createdAt: base?.createdAt ?? new Date().toISOString(),
+    };
+}
+
+async function fetchAllPayers(): Promise<
+    { rows: PayerRow[] } | { error: string | null }
+> {
+    const first = await getPayersAction({ page: 1, pageSize: FETCH_PAGE_SIZE });
+
+    if (!first.success || !first.data) {
+        return { error: first.error ?? null };
+    }
+
+    const rows: PayerRow[] = Array.isArray(first.data.payers)
+        ? [...first.data.payers]
+        : [];
+    const remaining = Math.max(0, (first.data.totalPages ?? 1) - 1);
+
+    if (remaining > 0) {
+        const rest = await Promise.all(
+            Array.from({ length: remaining }, (_, index) =>
+                getPayersAction({ page: index + 2, pageSize: FETCH_PAGE_SIZE }),
+            ),
+        );
+
+        for (const result of rest) {
+            if (!result.success || !result.data) {
+                return { error: result.error ?? null };
+            }
+
+            rows.push(...result.data.payers);
+        }
+    }
+
+    return { rows };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Animation hooks (Tailwind transitions, no extra dependencies)              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Keeps an element mounted while its exit transition plays.
+ * - `mounted`: render the element.
+ * - `visible`: apply the "shown" classes (flips one frame after mounting so the
+ *   enter transition actually runs, and flips back immediately on close).
+ */
+function usePresence(open: boolean, duration: number) {
+    const [lingering, setLingering] = useState(false);
+    const [visible, setVisible] = useState(false);
+    const [prevOpen, setPrevOpen] = useState(open);
+
+    if (prevOpen !== open) {
+        setPrevOpen(open);
+        setLingering(!open);
+    }
+
+    useEffect(() => {
+        if (open) {
+            let inner = 0;
+            const outer = requestAnimationFrame(() => {
+                inner = requestAnimationFrame(() => setVisible(true));
+            });
+
+            return () => {
+                cancelAnimationFrame(outer);
+                cancelAnimationFrame(inner);
+            };
+        }
+
+        setVisible(false);
+
+        const timer = window.setTimeout(() => setLingering(false), duration);
+
+        return () => window.clearTimeout(timer);
+    }, [open, duration]);
+
+    return { mounted: open || lingering, visible: open && visible };
+}
+
+/**
+ * Same idea for content-bearing dialogs: keeps the last non-null value around
+ * while the exit transition plays, so the dialog never empties mid-animation.
+ */
+function useHeldValue<T>(value: T | null, duration: number) {
+    const [held, setHeld] = useState<T | null>(value);
+    const [visible, setVisible] = useState(false);
+
+    if (value !== null && held !== value) {
+        setHeld(value);
+    }
+
+    useEffect(() => {
+        if (value !== null) {
+            let inner = 0;
+            const outer = requestAnimationFrame(() => {
+                inner = requestAnimationFrame(() => setVisible(true));
+            });
+
+            return () => {
+                cancelAnimationFrame(outer);
+                cancelAnimationFrame(inner);
+            };
+        }
+
+        setVisible(false);
+
+        const timer = window.setTimeout(() => setHeld(null), duration);
+
+        return () => window.clearTimeout(timer);
+    }, [value, duration]);
+
+    return { held: value ?? held, visible: value !== null && visible };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Small UI components                                                        */
 /* -------------------------------------------------------------------------- */
@@ -347,13 +532,13 @@ function PayerAvatar({ payer, name }: { payer: PayerRow; name: string }) {
 function StatusBadge({ isActive, t }: { isActive: boolean; t: Messages }) {
     return (
         <span
-            className={`inline-flex items-center gap-2.5 whitespace-nowrap rounded-lg px-4 py-2 text-sm font-semibold transition-colors ${isActive
+            className={`inline-flex items-center gap-2.5 whitespace-nowrap rounded-lg px-4 py-2 text-sm font-semibold transition-colors duration-200 ease-out motion-reduce:transition-none ${isActive
                 ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
                 : "bg-slate-500/10 text-slate-600 dark:bg-slate-500/15 dark:text-slate-400"
                 }`}
         >
             <span
-                className={`h-2.5 w-2.5 rounded-full ${isActive
+                className={`h-2.5 w-2.5 rounded-full transition-colors duration-200 ease-out motion-reduce:transition-none ${isActive
                     ? "bg-emerald-500 dark:bg-emerald-400"
                     : "bg-slate-400 dark:bg-slate-500"
                     }`}
@@ -382,11 +567,11 @@ function Toggle({
             aria-label={label}
             disabled={disabled}
             onClick={() => onChange(!checked)}
-            className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-slate-900 ${checked ? "bg-teal-600" : "bg-slate-300 dark:bg-slate-700"
+            className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors duration-200 ease-out motion-reduce:transition-none focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-slate-900 ${checked ? "bg-teal-600" : "bg-slate-300 dark:bg-slate-700"
                 }`}
         >
             <span
-                className={`inline-block h-5 w-5 rounded-full bg-white shadow transition-transform ${checked
+                className={`inline-block h-5 w-5 rounded-full bg-white shadow transition-transform duration-200 ease-out motion-reduce:transition-none ${checked
                     ? "translate-x-6 rtl:-translate-x-6"
                     : "translate-x-1 rtl:-translate-x-1"
                     }`}
@@ -459,6 +644,7 @@ function StatusFilterSelect({
     const [highlight, setHighlight] = useState(0);
     const rootRef = useRef<HTMLDivElement>(null);
     const listId = useId();
+    const { mounted, visible } = usePresence(open, MENU_MS);
 
     const selectedIndex = Math.max(
         0,
@@ -528,28 +714,31 @@ function StatusFilterSelect({
                 aria-label={ariaLabel}
                 aria-haspopup="listbox"
                 aria-expanded={open}
-                aria-controls={listId}
+                aria-controls={open ? listId : undefined}
                 onKeyDown={onKeyDown}
                 onClick={() => {
                     setHighlight(selectedIndex);
                     setOpen((current) => !current);
                 }}
-                className="flex h-[54px] w-full items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-5 text-start text-sm font-medium text-slate-900 transition hover:border-teal-500 focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/20 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-100"
+                className="flex h-[54px] w-full items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-5 text-start text-sm font-medium text-slate-900 transition duration-150 ease-out motion-reduce:transition-none hover:border-teal-500 focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/20 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-100"
             >
                 <span className="truncate">{selected?.label}</span>
                 <ChevronDown
-                    className={`h-4 w-4 shrink-0 text-slate-500 transition-transform dark:text-slate-300 ${open ? "rotate-180" : ""
+                    className={`h-4 w-4 shrink-0 text-slate-500 transition-transform duration-200 ease-out motion-reduce:transition-none dark:text-slate-300 ${open ? "rotate-180" : ""
                         }`}
                 />
             </button>
 
-            {open && (
+            {mounted && (
                 <ul
                     id={listId}
                     role="listbox"
                     dir={isRtl ? "rtl" : "ltr"}
                     aria-label={ariaLabel}
-                    className="absolute inset-x-0 top-full z-40 mt-2 overflow-hidden rounded-xl border border-slate-200 bg-white p-1.5 shadow-2xl shadow-black/40 dark:border-slate-700 dark:bg-slate-900"
+                    className={`absolute inset-x-0 top-full z-40 mt-2 origin-top overflow-hidden rounded-xl border border-slate-200 bg-white p-1.5 shadow-2xl shadow-black/40 transition duration-150 ease-out motion-reduce:transition-none dark:border-slate-700 dark:bg-slate-900 ${visible
+                        ? "translate-y-0 scale-100 opacity-100"
+                        : "pointer-events-none -translate-y-1 scale-95 opacity-0"
+                        }`}
                 >
                     {options.map((option, index) => {
                         const isSelected = option.value === value;
@@ -561,7 +750,7 @@ function StatusFilterSelect({
                                 aria-selected={isSelected}
                                 onMouseEnter={() => setHighlight(index)}
                                 onClick={() => choose(index)}
-                                className={`flex cursor-pointer items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${index === highlight
+                                className={`flex cursor-pointer items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors duration-150 ease-out motion-reduce:transition-none ${index === highlight
                                     ? "bg-teal-600/10 text-teal-600 dark:text-teal-400"
                                     : "text-slate-900 dark:text-slate-100"
                                     }`}
@@ -581,7 +770,7 @@ function RowActions({
     payer,
     t,
     isRtl,
-    busy,
+    disabled,
     onEdit,
     onToggleStatus,
     onDelete,
@@ -589,17 +778,20 @@ function RowActions({
     payer: PayerRow;
     t: Messages;
     isRtl: boolean;
-    busy: boolean;
+    disabled: boolean;
     onEdit: () => void;
     onToggleStatus: () => void;
     onDelete: () => void;
 }) {
     const [open, setOpen] = useState(false);
-    const [position, setPosition] = useState<{ top: number; left: number } | null>(
-        null,
-    );
+    const [position, setPosition] = useState<{
+        top: number;
+        left: number;
+        above: boolean;
+    } | null>(null);
     const buttonRef = useRef<HTMLButtonElement>(null);
     const menuRef = useRef<HTMLDivElement>(null);
+    const { mounted, visible } = usePresence(open, MENU_MS);
 
     const reposition = useCallback(() => {
         const button = buttonRef.current;
@@ -621,29 +813,30 @@ function RowActions({
 
         const spaceBelow = window.innerHeight - rect.bottom - margin;
         const spaceAbove = rect.top - margin;
+        const above = !(height + gap <= spaceBelow || spaceBelow >= spaceAbove);
 
-        let top =
-            height + gap <= spaceBelow || spaceBelow >= spaceAbove
-                ? rect.bottom + gap
-                : rect.top - height - gap;
+        let top = above ? rect.top - height - gap : rect.bottom + gap;
 
         top = Math.min(
             Math.max(margin, top),
             Math.max(margin, window.innerHeight - height - margin),
         );
 
-        setPosition({ top, left });
+        setPosition({ top, left, above });
     }, [isRtl]);
 
     useLayoutEffect(() => {
         if (open) reposition();
     }, [open, reposition]);
 
+    // Reset only after the exit transition has finished, so the menu does not
+    // vanish mid-animation.
     useEffect(() => {
-        if (!open) {
-            setPosition(null);
-            return;
-        }
+        if (!mounted) setPosition(null);
+    }, [mounted]);
+
+    useEffect(() => {
+        if (!open) return;
 
         const onPointerDown = (event: MouseEvent | TouchEvent) => {
             const target = event.target as Node;
@@ -688,7 +881,7 @@ function RowActions({
     };
 
     const itemBase =
-        "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm font-medium transition focus:outline-none";
+        "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm font-medium transition-colors duration-150 ease-out motion-reduce:transition-none focus:outline-none";
 
     return (
         <>
@@ -698,21 +891,17 @@ function RowActions({
                 aria-label={t.rowActions}
                 aria-haspopup="menu"
                 aria-expanded={open}
-                disabled={busy}
+                disabled={disabled}
                 onClick={() => setOpen((value) => !value)}
-                className={`grid h-11 w-11 place-items-center rounded-lg border text-slate-600 transition focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50 dark:text-slate-300 ${open
+                className={`grid h-11 w-11 place-items-center rounded-lg border text-slate-600 transition duration-150 ease-out motion-reduce:transition-none active:scale-95 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50 dark:text-slate-300 ${open
                     ? "border-teal-500 bg-teal-600/10 text-teal-500"
                     : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"
                     }`}
             >
-                {busy ? (
-                    <LoaderCircle className="h-5 w-5 animate-spin text-teal-500" />
-                ) : (
-                    <MoreHorizontal className="h-5 w-5" />
-                )}
+                <MoreHorizontal className="h-5 w-5" />
             </button>
 
-            {open &&
+            {mounted &&
                 createPortal(
                     <div
                         ref={menuRef}
@@ -723,8 +912,13 @@ function RowActions({
                             top: position?.top ?? 0,
                             left: position?.left ?? 0,
                             visibility: position ? "visible" : "hidden",
+                            transformOrigin: `${isRtl ? "left" : "right"} ${position?.above ? "bottom" : "top"
+                                }`,
                         }}
-                        className="z-[150] w-60 max-w-[calc(100vw-16px)] rounded-xl border border-slate-200 bg-white p-2 text-sm text-slate-900 shadow-2xl shadow-black/50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
+                        className={`z-[150] w-60 max-w-[calc(100vw-16px)] rounded-xl border border-slate-200 bg-white p-2 text-sm text-slate-900 shadow-2xl shadow-black/50 transition duration-150 ease-out motion-reduce:transition-none dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100 ${visible
+                            ? "scale-100 opacity-100"
+                            : "pointer-events-none scale-95 opacity-0"
+                            }`}
                     >
                         <button
                             type="button"
@@ -806,6 +1000,104 @@ function SkeletonRows({ count }: { count: number }) {
     );
 }
 
+/**
+ * Table row with a fade-in on mount (new rows, page changes, first load) and a
+ * fade-out while it is being removed.
+ */
+function AnimatedRow({
+    leaving,
+    pending,
+    children,
+}: {
+    leaving: boolean;
+    pending: boolean;
+    children: ReactNode;
+}) {
+    const [entered, setEntered] = useState(false);
+
+    useEffect(() => {
+        let inner = 0;
+        const outer = requestAnimationFrame(() => {
+            inner = requestAnimationFrame(() => setEntered(true));
+        });
+
+        return () => {
+            cancelAnimationFrame(outer);
+            cancelAnimationFrame(inner);
+        };
+    }, []);
+
+    return (
+        <tr
+            className={`transition-[opacity,background-color] duration-200 ease-out motion-reduce:transition-none hover:bg-slate-100 dark:hover:bg-slate-800/30 ${leaving
+                ? "pointer-events-none opacity-0"
+                : entered
+                    ? pending
+                        ? "opacity-70"
+                        : "opacity-100"
+                    : "opacity-0"
+                }`}
+        >
+            {children}
+        </tr>
+    );
+}
+
+function ToastView({
+    toast,
+    closeLabel,
+    onDismiss,
+}: {
+    toast: ToastItem;
+    closeLabel: string;
+    onDismiss: (id: number) => void;
+}) {
+    const [entered, setEntered] = useState(false);
+
+    useEffect(() => {
+        let inner = 0;
+        const outer = requestAnimationFrame(() => {
+            inner = requestAnimationFrame(() => setEntered(true));
+        });
+
+        return () => {
+            cancelAnimationFrame(outer);
+            cancelAnimationFrame(inner);
+        };
+    }, []);
+
+    const shown = entered && !toast.leaving;
+
+    return (
+        <div
+            className={`pointer-events-auto flex max-w-md items-start gap-3 rounded-xl border bg-white p-4 text-sm shadow-2xl shadow-black/50 transition duration-200 ease-out motion-reduce:transition-none dark:bg-slate-900 ${toast.kind === "success" ? "border-teal-600/40" : "border-rose-500/40"
+                } ${shown
+                    ? "translate-y-0 scale-100 opacity-100"
+                    : "translate-y-2 scale-95 opacity-0"
+                }`}
+        >
+            {toast.kind === "success" ? (
+                <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-teal-500" />
+            ) : (
+                <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-500 dark:text-rose-400" />
+            )}
+
+            <p className="min-w-0 flex-1 break-words text-slate-900 dark:text-slate-100">
+                {toast.message}
+            </p>
+
+            <button
+                type="button"
+                onClick={() => onDismiss(toast.id)}
+                aria-label={closeLabel}
+                className="rounded-md p-1 text-slate-500 transition-colors duration-150 ease-out motion-reduce:transition-none hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+            >
+                <X className="h-4 w-4" />
+            </button>
+        </div>
+    );
+}
+
 /* -------------------------------------------------------------------------- */
 /* Add / Edit modal                                                           */
 /* -------------------------------------------------------------------------- */
@@ -847,16 +1139,24 @@ function validateForm(
 
 function PayerFormModal({
     payer,
+    draft,
+    initialErrors,
+    initialFormError,
+    visible,
     t,
     isRtl,
     onClose,
     onSubmit,
 }: {
     payer: PayerRow | null;
+    draft?: PayerFormInput;
+    initialErrors?: PayerFieldErrors;
+    initialFormError?: string;
+    visible: boolean;
     t: Messages;
     isRtl: boolean;
     onClose: () => void;
-    onSubmit: (input: PayerFormInput) => Promise<SubmitOutcome>;
+    onSubmit: (input: PayerFormInput) => void;
 }) {
     const isEdit = payer !== null;
     const uid = useId();
@@ -867,18 +1167,23 @@ function PayerFormModal({
         tax: `${uid}-tax`,
     };
 
-    const [nameAr, setNameAr] = useState(payer?.nameAr ?? "");
-    const [nameEn, setNameEn] = useState(payer?.nameEn ?? "");
-    const [nphiesPayerId, setNphiesPayerId] = useState(payer?.nphiesPayerId ?? "");
-    const [taxNumber, setTaxNumber] = useState(payer?.taxNumber ?? "");
-    const [isActive, setIsActive] = useState(payer?.isActive ?? true);
-    const [errors, setErrors] = useState<PayerFieldErrors>({});
-    const [formError, setFormError] = useState("");
-    const [submitting, setSubmitting] = useState(false);
+    const [nameAr, setNameAr] = useState(draft?.nameAr ?? payer?.nameAr ?? "");
+    const [nameEn, setNameEn] = useState(draft?.nameEn ?? payer?.nameEn ?? "");
+    const [nphiesPayerId, setNphiesPayerId] = useState(
+        draft?.nphiesPayerId ?? payer?.nphiesPayerId ?? "",
+    );
+    const [taxNumber, setTaxNumber] = useState(
+        draft?.taxNumber ?? payer?.taxNumber ?? "",
+    );
+    const [isActive, setIsActive] = useState(
+        draft?.isActive ?? payer?.isActive ?? true,
+    );
+    const [errors, setErrors] = useState<PayerFieldErrors>(initialErrors ?? {});
+    const [formError, setFormError] = useState(initialFormError ?? "");
     const firstRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
-        firstRef.current?.focus();
+        firstRef.current?.focus({ preventScroll: true });
 
         const previousOverflow = document.body.style.overflow;
         document.body.style.overflow = "hidden";
@@ -890,13 +1195,13 @@ function PayerFormModal({
 
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !submitting) onClose();
+            if (event.key === "Escape" && visible) onClose();
         };
 
         document.addEventListener("keydown", onKeyDown);
 
         return () => document.removeEventListener("keydown", onKeyDown);
-    }, [onClose, submitting]);
+    }, [onClose, visible]);
 
     function clearError(field: keyof PayerFieldErrors) {
         setErrors((current) => {
@@ -908,10 +1213,12 @@ function PayerFormModal({
         });
     }
 
-    async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    // Validation stays synchronous. Once it passes, the page applies the change
+    // optimistically and this dialog animates out in the same frame.
+    function handleSubmit(event: FormEvent<HTMLFormElement>) {
         event.preventDefault();
 
-        if (submitting) return;
+        if (!visible) return;
 
         setFormError("");
 
@@ -926,36 +1233,27 @@ function PayerFormModal({
         }
 
         setErrors({});
-        setSubmitting(true);
 
-        try {
-            const outcome = await onSubmit({
-                nameAr: nameAr.trim(),
-                nameEn: nameEn.trim(),
-                nphiesPayerId: nphiesPayerId.replace(/\s+/g, "").toUpperCase(),
-                taxNumber: normalizeDigits(taxNumber).replace(/[\s-]/g, ""),
-                isActive,
-            });
-
-            if (outcome) {
-                if (outcome.fieldErrors) setErrors(outcome.fieldErrors);
-
-                setFormError(outcome.error ?? "");
-            }
-        } catch {
-            setFormError(t.failed);
-        } finally {
-            setSubmitting(false);
-        }
+        onSubmit({
+            nameAr: nameAr.trim(),
+            nameEn: nameEn.trim(),
+            nphiesPayerId: nphiesPayerId.replace(/\s+/g, "").toUpperCase(),
+            taxNumber: normalizeDigits(taxNumber).replace(/[\s-]/g, ""),
+            isActive,
+        });
     }
 
     const titleId = `${uid}-title`;
 
     return (
         <div
-            className="fixed inset-0 z-[110] flex items-center justify-center overflow-y-auto bg-slate-900/40 p-4 backdrop-blur-sm dark:bg-slate-950/80"
+            aria-hidden={!visible}
+            className={`fixed inset-0 z-[110] flex items-center justify-center overflow-y-auto p-4 transition duration-200 ease-out motion-reduce:transition-none ${visible
+                ? "bg-slate-900/40 backdrop-blur-sm dark:bg-slate-950/80"
+                : "pointer-events-none bg-slate-900/0 backdrop-blur-none dark:bg-slate-950/0"
+                }`}
             onMouseDown={(event) => {
-                if (event.target === event.currentTarget && !submitting) onClose();
+                if (event.target === event.currentTarget) onClose();
             }}
         >
             <section
@@ -963,14 +1261,16 @@ function PayerFormModal({
                 aria-modal="true"
                 aria-labelledby={titleId}
                 dir={isRtl ? "rtl" : "ltr"}
-                className="relative my-auto w-full max-w-[740px] rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl shadow-black/60 dark:border-slate-700 dark:bg-slate-900 sm:p-8"
+                className={`relative my-auto w-full max-w-[740px] rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl shadow-black/60 transition duration-200 ease-out motion-reduce:transition-none dark:border-slate-700 dark:bg-slate-900 sm:p-8 ${visible
+                    ? "translate-y-0 scale-100 opacity-100"
+                    : "translate-y-3 scale-95 opacity-0"
+                    }`}
             >
                 <button
                     type="button"
                     onClick={onClose}
-                    disabled={submitting}
                     aria-label={t.close}
-                    className="absolute end-5 top-5 rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+                    className="absolute end-5 top-5 rounded-lg p-1.5 text-slate-500 transition duration-150 ease-out motion-reduce:transition-none hover:bg-slate-100 hover:text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-50 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
                 >
                     <X className="h-5 w-5" />
                 </button>
@@ -998,7 +1298,6 @@ function PayerFormModal({
                                 dir="rtl"
                                 value={nameAr}
                                 maxLength={120}
-                                disabled={submitting}
                                 placeholder={t.nameArPlaceholder}
                                 aria-invalid={Boolean(errors.nameAr)}
                                 aria-describedby={errors.nameAr ? `${ids.nameAr}-error` : undefined}
@@ -1022,7 +1321,6 @@ function PayerFormModal({
                                 dir="ltr"
                                 value={nameEn}
                                 maxLength={120}
-                                disabled={submitting}
                                 placeholder={t.nameEnPlaceholder}
                                 aria-invalid={Boolean(errors.nameEn)}
                                 aria-describedby={errors.nameEn ? `${ids.nameEn}-error` : undefined}
@@ -1048,7 +1346,6 @@ function PayerFormModal({
                                 dir="ltr"
                                 value={nphiesPayerId}
                                 maxLength={40}
-                                disabled={submitting}
                                 placeholder={t.nphiesPlaceholder}
                                 autoCapitalize="characters"
                                 autoComplete="off"
@@ -1081,7 +1378,6 @@ function PayerFormModal({
                                 inputMode="numeric"
                                 value={taxNumber}
                                 maxLength={15}
-                                disabled={submitting}
                                 placeholder={t.taxPlaceholder}
                                 autoComplete="off"
                                 aria-invalid={Boolean(errors.taxNumber)}
@@ -1108,7 +1404,6 @@ function PayerFormModal({
                             checked={isActive}
                             onChange={setIsActive}
                             label={isEdit ? t.activeLabel : t.activeImmediately}
-                            disabled={submitting}
                         />
                     </div>
 
@@ -1127,7 +1422,6 @@ function PayerFormModal({
                             <button
                                 type="button"
                                 onClick={onClose}
-                                disabled={submitting}
                                 className={`${outlineButton} h-12 px-8`}
                             >
                                 {t.cancel}
@@ -1135,11 +1429,9 @@ function PayerFormModal({
 
                             <button
                                 type="submit"
-                                disabled={submitting}
                                 className={`${tealButton} h-12 px-8`}
                             >
-                                {submitting && <LoaderCircle className="h-4 w-4 animate-spin" />}
-                                {submitting ? t.saving : isEdit ? t.saveChanges : t.save}
+                                {isEdit ? t.saveChanges : t.save}
                             </button>
                         </div>
                     </div>
@@ -1173,21 +1465,37 @@ export default function InsurancePayersPage({ initialLocale,
 
     const [modal, setModal] = useState<ModalState>(null);
     const [deleteTarget, setDeleteTarget] = useState<PayerRow | null>(null);
-    const [deleting, setDeleting] = useState(false);
-    const [deleteError, setDeleteError] = useState("");
-    const [busyId, setBusyId] = useState<string | null>(null);
-    const [notice, setNotice] = useState<Notice | null>(null);
-
-    const requestCounter = useRef(0);
+    const [removingIds, setRemovingIds] = useState<ReadonlySet<string>>(
+        () => new Set<string>(),
+    );
+    const [toasts, setToasts] = useState<ToastItem[]>([]);
 
     const t = messages[locale];
     const isRtl = locale === "ar";
-    const loadFailedRef = useRef<string>(t.loadFailed);
-    loadFailedRef.current = t.loadFailed;
+
+    // Always-fresh mirrors so background tasks never read stale closures.
+    const tRef = useRef<Messages>(t);
+    const payersRef = useRef<PayerRow[]>([]);
+    const modalRef = useRef<ModalState>(null);
+    const modalSeq = useRef(0);
+    const requestCounter = useRef(0);
+    const toastIdRef = useRef(0);
+    const queueRef = useRef(new Map<string, Promise<void>>());
+    const removalTimers = useRef(new Map<string, number>());
+    // Keeps a row's React key stable when its temporary id becomes the real id,
+    // so a freshly created row does not re-mount (and re-fade) on confirmation.
+    const rowKeysRef = useRef(new Map<string, string>());
+
+    useEffect(() => {
+        tRef.current = t;
+    }, [t]);
 
     // Keeps typing responsive: the input updates immediately while the (cheap)
     // list filtering is allowed to lag a frame behind when needed.
     const deferredQuery = useDeferredValue(query);
+
+    const modalPresence = useHeldValue(modal, MODAL_MS);
+    const deletePresence = useHeldValue(deleteTarget, MODAL_MS);
 
     /* Locale sync (same approach as the dashboard) ------------------------- */
     useEffect(() => {
@@ -1205,16 +1513,72 @@ export default function InsurancePayersPage({ initialLocale,
         return () => observer.disconnect();
     }, []);
 
-    /* Toast auto-dismiss ---------------------------------------------------- */
-    useEffect(() => {
-        if (!notice) return;
+    /* Toasts ---------------------------------------------------------------- */
+    const dismissNotice = useCallback((id: number) => {
+        setToasts((current) =>
+            current.map((item) => (item.id === id ? { ...item, leaving: true } : item)),
+        );
+        window.setTimeout(() => {
+            setToasts((current) => current.filter((item) => item.id !== id));
+        }, TOAST_EXIT_MS);
+    }, []);
 
-        const timer = window.setTimeout(() => setNotice(null), 6000);
+    const pushNotice = useCallback(
+        (notice: Notice): number => {
+            const id = ++toastIdRef.current;
 
-        return () => window.clearTimeout(timer);
-    }, [notice]);
+            setToasts((current) => [
+                ...current.filter((item) => !item.leaving).slice(-(MAX_TOASTS - 1)),
+                { ...notice, id, leaving: false },
+            ]);
+            window.setTimeout(() => dismissNotice(id), TOAST_MS);
 
-    /* One-time (and retry) full fetch -------------------------------------- */
+            return id;
+        },
+        [dismissNotice],
+    );
+
+    /* Local data store ------------------------------------------------------ */
+
+    // Single entry point for every local change: updates the ref synchronously
+    // (so rapid actions always see the latest rows) and schedules the render.
+    const updatePayers = useCallback(
+        (updater: (current: PayerRow[]) => PayerRow[]): PayerRow[] => {
+            const next = updater(payersRef.current);
+
+            payersRef.current = next;
+            setAllPayers(next);
+
+            return next;
+        },
+        [],
+    );
+
+    // Server calls for the same row run strictly in order.
+    const enqueue = useCallback((id: string, task: () => Promise<void>) => {
+        const previous = queueRef.current.get(id) ?? Promise.resolve();
+        const next: Promise<void> = previous
+            .then(task)
+            .catch(() => undefined)
+            .then(() => {
+                if (queueRef.current.get(id) === next) queueRef.current.delete(id);
+            });
+
+        queueRef.current.set(id, next);
+    }, []);
+
+    const setRemoving = useCallback((id: string, on: boolean) => {
+        setRemovingIds((current) => {
+            const next = new Set(current);
+
+            if (on) next.add(id);
+            else next.delete(id);
+
+            return next;
+        });
+    }, []);
+
+    /* Loading --------------------------------------------------------------- */
     const loadAll = useCallback(async () => {
         const requestId = ++requestCounter.current;
 
@@ -1222,59 +1586,52 @@ export default function InsurancePayersPage({ initialLocale,
         setLoadError("");
 
         try {
-            const first = await getPayersAction({
-                page: 1,
-                pageSize: FETCH_PAGE_SIZE,
-            });
+            const result = await fetchAllPayers();
 
             if (requestId !== requestCounter.current) return;
 
-            if (!first.success || !first.data) {
-                setLoadError(first.error ?? loadFailedRef.current);
-                setAllPayers([]);
-                return;
-            }
-
-            const rows = [...first.data.payers];
-            const remaining = Math.max(0, first.data.totalPages - 1);
-
-            if (remaining > 0) {
-                const rest = await Promise.all(
-                    Array.from({ length: remaining }, (_, index) =>
-                        getPayersAction({
-                            page: index + 2,
-                            pageSize: FETCH_PAGE_SIZE,
-                        }),
-                    ),
+            if ("rows" in result) {
+                updatePayers((current) =>
+                    sortPayers([
+                        ...current.filter((item) => isTempId(item.id)),
+                        ...result.rows,
+                    ]),
                 );
-
-                if (requestId !== requestCounter.current) return;
-
-                for (const result of rest) {
-                    if (!result.success || !result.data) {
-                        setLoadError(result.error ?? loadFailedRef.current);
-                        setAllPayers([]);
-                        return;
-                    }
-
-                    rows.push(...result.data.payers);
-                }
+            } else {
+                setLoadError(result.error ?? tRef.current.loadFailed);
+                updatePayers(() => []);
             }
-
-            setAllPayers(sortPayers(rows));
         } catch {
             if (requestId !== requestCounter.current) return;
 
-            setLoadError(loadFailedRef.current);
-            setAllPayers([]);
+            setLoadError(tRef.current.loadFailed);
+            updatePayers(() => []);
         } finally {
             if (requestId === requestCounter.current) setInitialLoading(false);
         }
-    }, []);
+    }, [updatePayers]);
 
     useEffect(() => {
         void loadAll();
     }, [loadAll]);
+
+    // Silent reconciliation with the server, used only after a conflicting rollback.
+    const resyncPayers = useCallback(async () => {
+        try {
+            const result = await fetchAllPayers();
+
+            if ("rows" in result) {
+                updatePayers((current) =>
+                    sortPayers([
+                        ...current.filter((item) => isTempId(item.id)),
+                        ...result.rows,
+                    ]),
+                );
+            }
+        } catch {
+            // Keep the current local state if the background sync fails.
+        }
+    }, [updatePayers]);
 
     /* Client-side search / filter / pagination ----------------------------- */
     const searchIndex = useMemo(
@@ -1340,139 +1697,242 @@ export default function InsurancePayersPage({ initialLocale,
         setPage(1);
     }
 
-    /* Mutations (instant local sync, server confirmed) ---------------------- */
-    async function submitPayer(input: PayerFormInput): Promise<SubmitOutcome> {
-        setNotice(null);
+    /* Modal control --------------------------------------------------------- */
+    const applyModal = useCallback((next: ModalState) => {
+        modalRef.current = next;
+        setModal(next);
+    }, []);
 
-        try {
-            if (modal?.mode === "edit") {
-                const result = await updatePayerAction({
-                    ...input,
-                    payerId: modal.payer.id,
+    const openModal = useCallback(
+        (request: ModalRequest) => {
+            applyModal({ ...request, nonce: ++modalSeq.current } as NonNullable<ModalState>);
+        },
+        [applyModal],
+    );
+
+    const closeModal = useCallback(() => applyModal(null), [applyModal]);
+
+    // After a failed background save the form comes back with the user's input and
+    // the server's field errors, unless the user already opened something else.
+    const reopenModal = useCallback(
+        (request: ModalRequest) => {
+            if (modalRef.current === null) openModal(request);
+        },
+        [openModal],
+    );
+
+    /* Optimistic mutations -------------------------------------------------- */
+    function submitPayer(input: PayerFormInput) {
+        const current = modalRef.current;
+
+        // Dialog animates out immediately; the table is already updated below.
+        closeModal();
+
+        if (current?.mode === "edit") {
+            const base =
+                payersRef.current.find((item) => item.id === current.payer.id) ??
+                current.payer;
+            const optimistic = buildOptimisticPayer(input, base, base.id);
+
+            updatePayers((list) =>
+                list.map((item) => (item.id === base.id ? optimistic : item)),
+            );
+
+            const toastId = pushNotice({ kind: "success", message: t.updated });
+
+            const failEdit = (message: string, fieldErrors?: PayerFieldErrors) => {
+                dismissNotice(toastId);
+
+                const next = updatePayers((list) =>
+                    list.map((item) => (item === optimistic ? base : item)),
+                );
+
+                // A newer local change superseded this one: reconcile with the server.
+                if (!next.includes(base)) void resyncPayers();
+
+                pushNotice({ kind: "error", message });
+                reopenModal({
+                    mode: "edit",
+                    payer: base,
+                    draft: input,
+                    fieldErrors,
+                    formError: message,
                 });
+            };
+
+            enqueue(base.id, async () => {
+                try {
+                    const result = await updatePayerAction({
+                        ...input,
+                        payerId: base.id,
+                    });
+
+                    if (!result.success || !result.data) {
+                        failEdit(result.error ?? tRef.current.failed, result.fieldErrors);
+                        return;
+                    }
+
+                    const confirmed = result.data.payer;
+
+                    // Only replace the row if no newer optimistic change superseded it.
+                    updatePayers((list) =>
+                        list.map((item) => (item === optimistic ? confirmed : item)),
+                    );
+                } catch {
+                    failEdit(tRef.current.failed);
+                }
+            });
+
+            return;
+        }
+
+        const tempId = makeTempId();
+        const optimistic = buildOptimisticPayer(input, null, tempId);
+
+        updatePayers((list) => sortPayers([optimistic, ...list]));
+
+        // Make sure the new row is visible even when filters would hide it.
+        setQuery("");
+        setStatusFilter("ALL");
+        setPage(1);
+
+        const toastId = pushNotice({ kind: "success", message: t.created });
+
+        const failCreate = (message: string, fieldErrors?: PayerFieldErrors) => {
+            dismissNotice(toastId);
+            updatePayers((list) => list.filter((item) => item.id !== tempId));
+            pushNotice({ kind: "error", message });
+            reopenModal({
+                mode: "create",
+                draft: input,
+                fieldErrors,
+                formError: message,
+            });
+        };
+
+        enqueue(tempId, async () => {
+            try {
+                const result = await createPayerAction(input);
 
                 if (!result.success || !result.data) {
-                    return {
-                        error: result.error ?? t.failed,
-                        fieldErrors: result.fieldErrors,
-                    };
+                    failCreate(result.error ?? tRef.current.failed, result.fieldErrors);
+                    return;
                 }
 
-                const updated = result.data.payer;
+                const created = result.data.payer;
 
-                setAllPayers((current) =>
-                    current.map((item) => (item.id === updated.id ? updated : item)),
+                rowKeysRef.current.set(created.id, tempId);
+                updatePayers((list) =>
+                    sortPayers(list.map((item) => (item.id === tempId ? created : item))),
                 );
-                setModal(null);
-                setNotice({ kind: "success", message: t.updated });
-
-                return null;
+            } catch {
+                failCreate(tRef.current.failed);
             }
-
-            const result = await createPayerAction(input);
-
-            if (!result.success || !result.data) {
-                return {
-                    error: result.error ?? t.failed,
-                    fieldErrors: result.fieldErrors,
-                };
-            }
-
-            const created = result.data.payer;
-
-            // The new payer shows up in the table immediately, without a refetch.
-            setAllPayers((current) =>
-                sortPayers([created, ...current.filter((item) => item.id !== created.id)]),
-            );
-
-            // Make sure the new row is visible even when filters would hide it.
-            setQuery("");
-            setStatusFilter("ALL");
-            setPage(1);
-            setModal(null);
-            setNotice({ kind: "success", message: t.created });
-
-            return null;
-        } catch {
-            return { error: t.failed };
-        }
+        });
     }
 
-    async function handleToggleStatus(payer: PayerRow) {
-        if (busyId) return;
+    function handleToggleStatus(payer: PayerRow) {
+        if (isTempId(payer.id)) return;
 
-        const nextActive = !payer.isActive;
+        const current = payersRef.current.find((item) => item.id === payer.id) ?? payer;
+        const nextActive = !current.isActive;
+        const optimistic: PayerRow = { ...current, isActive: nextActive };
 
-        setNotice(null);
-        setBusyId(payer.id);
-
-        // Optimistic: flip the badge right away.
-        setAllPayers((current) =>
-            current.map((item) =>
-                item.id === payer.id ? { ...item, isActive: nextActive } : item,
-            ),
+        // The badge flips right away.
+        updatePayers((list) =>
+            list.map((item) => (item.id === current.id ? optimistic : item)),
         );
 
-        try {
-            const result = await setPayerActiveStatusAction(payer.id, nextActive);
+        const toastId = pushNotice({
+            kind: "success",
+            message: nextActive ? t.activated : t.deactivated,
+        });
 
-            if (!result.success || !result.data) {
-                // Roll back.
-                setAllPayers((current) =>
-                    current.map((item) =>
-                        item.id === payer.id ? { ...item, isActive: payer.isActive } : item,
-                    ),
+        const failToggle = (message: string) => {
+            dismissNotice(toastId);
+
+            const next = updatePayers((list) =>
+                list.map((item) => (item === optimistic ? current : item)),
+            );
+
+            if (!next.includes(current)) void resyncPayers();
+
+            pushNotice({ kind: "error", message });
+        };
+
+        enqueue(current.id, async () => {
+            try {
+                const result = await setPayerActiveStatusAction(current.id, nextActive);
+
+                if (!result.success || !result.data) {
+                    failToggle(result.error ?? tRef.current.failed);
+                    return;
+                }
+
+                const confirmed = result.data.payer;
+
+                updatePayers((list) =>
+                    list.map((item) => (item === optimistic ? confirmed : item)),
                 );
-                setNotice({ kind: "error", message: result.error ?? t.failed });
-                return;
+            } catch {
+                failToggle(tRef.current.failed);
             }
-
-            const updated = result.data.payer;
-
-            setAllPayers((current) =>
-                current.map((item) => (item.id === updated.id ? updated : item)),
-            );
-            setNotice({
-                kind: "success",
-                message: updated.isActive ? t.activated : t.deactivated,
-            });
-        } catch {
-            setAllPayers((current) =>
-                current.map((item) =>
-                    item.id === payer.id ? { ...item, isActive: payer.isActive } : item,
-                ),
-            );
-            setNotice({ kind: "error", message: t.failed });
-        } finally {
-            setBusyId(null);
-        }
+        });
     }
 
-    async function confirmDelete() {
-        if (!deleteTarget || deleting) return;
-
+    function confirmDelete() {
         const target = deleteTarget;
 
-        setDeleting(true);
-        setDeleteError("");
+        if (!target || target.patientCount > 0) return;
 
-        try {
-            const result = await deletePayerAction(target.id);
+        const snapshot =
+            payersRef.current.find((item) => item.id === target.id) ?? target;
 
-            if (!result.success) {
-                // Server-side validation (e.g. payer assigned to patients).
-                setDeleteError(result.error ?? t.failed);
-                return;
+        // Dialog animates out and the row fades out immediately.
+        setDeleteTarget(null);
+        setRemoving(target.id, true);
+
+        const toastId = pushNotice({ kind: "success", message: t.deleted });
+
+        const timer = window.setTimeout(() => {
+            removalTimers.current.delete(target.id);
+            updatePayers((list) => list.filter((item) => item.id !== target.id));
+            setRemoving(target.id, false);
+        }, ROW_EXIT_MS);
+
+        removalTimers.current.set(target.id, timer);
+
+        const restore = (message: string) => {
+            dismissNotice(toastId);
+
+            const pending = removalTimers.current.get(target.id);
+
+            if (pending !== undefined) {
+                window.clearTimeout(pending);
+                removalTimers.current.delete(target.id);
             }
 
-            setAllPayers((current) => current.filter((item) => item.id !== target.id));
-            setDeleteTarget(null);
-            setNotice({ kind: "success", message: t.deleted });
-        } catch {
-            setDeleteError(t.failed);
-        } finally {
-            setDeleting(false);
-        }
+            setRemoving(target.id, false);
+            updatePayers((list) =>
+                list.some((item) => item.id === snapshot.id)
+                    ? list
+                    : sortPayers([...list, snapshot]),
+            );
+            pushNotice({ kind: "error", message });
+        };
+
+        enqueue(target.id, async () => {
+            try {
+                const result = await deletePayerAction(target.id);
+
+                // A record that is already gone on the server is the outcome we wanted.
+                if (!result.success && result.code !== "RECORD_NOT_FOUND") {
+                    restore(result.error ?? tRef.current.failed);
+                }
+            } catch {
+                restore(tRef.current.failed);
+            }
+        });
     }
 
     /* Delete dialog: Escape ------------------------------------------------- */
@@ -1480,22 +1940,22 @@ export default function InsurancePayersPage({ initialLocale,
         if (!deleteTarget) return;
 
         const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !deleting) setDeleteTarget(null);
+            if (event.key === "Escape") setDeleteTarget(null);
         };
 
         document.addEventListener("keydown", onKeyDown);
 
         return () => document.removeEventListener("keydown", onKeyDown);
-    }, [deleteTarget, deleting]);
-
-    const closeModal = useCallback(() => setModal(null), []);
+    }, [deleteTarget]);
 
     /* Derived values -------------------------------------------------------- */
     const showingFrom = total === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
     const showingTo = Math.min(currentPage * PAGE_SIZE, total);
     const PrevIcon = isRtl ? ChevronRight : ChevronLeft;
     const NextIcon = isRtl ? ChevronLeft : ChevronRight;
-    const deleteBlocked = (deleteTarget?.patientCount ?? 0) > 0;
+    const heldModal = modalPresence.held;
+    const heldDelete = deletePresence.held;
+    const deleteBlocked = (heldDelete?.patientCount ?? 0) > 0;
 
     return (
         <div
@@ -1538,10 +1998,7 @@ export default function InsurancePayersPage({ initialLocale,
                             <button
                                 type="button"
                                 disabled={initialLoading}
-                                onClick={() => {
-                                    setNotice(null);
-                                    setModal({ mode: "create" });
-                                }}
+                                onClick={() => openModal({ mode: "create" })}
                                 className={`${tealButton} h-12 shrink-0 px-6 text-base`}
                             >
                                 <Plus className="h-5 w-5" />
@@ -1607,6 +2064,9 @@ export default function InsurancePayersPage({ initialLocale,
                                         aria-busy={initialLoading}
                                     >
                                         <table className="w-full min-w-[900px] border-collapse text-start">
+                                            <caption className="sr-only">
+                                                {initialLoading ? t.loading : t.title}
+                                            </caption>
                                             <thead>
                                                 <tr className="border-b border-slate-200 bg-white text-sm font-bold text-slate-900 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100">
                                                     <th className="px-6 py-5 text-start align-middle">
@@ -1642,11 +2102,15 @@ export default function InsurancePayersPage({ initialLocale,
                                                 ) : (
                                                     visiblePayers.map((payer) => {
                                                         const name = displayName(payer, locale);
+                                                        const pending = isTempId(payer.id);
+                                                        const rowKey =
+                                                            rowKeysRef.current.get(payer.id) ?? payer.id;
 
                                                         return (
-                                                            <tr
-                                                                key={payer.id}
-                                                                className="transition hover:bg-slate-100 dark:hover:bg-slate-800/30"
+                                                            <AnimatedRow
+                                                                key={rowKey}
+                                                                leaving={removingIds.has(payer.id)}
+                                                                pending={pending}
                                                             >
                                                                 <td className="px-6 py-4 align-middle">
                                                                     <div className="flex items-center gap-4">
@@ -1691,19 +2155,13 @@ export default function InsurancePayersPage({ initialLocale,
                                                                         payer={payer}
                                                                         t={t}
                                                                         isRtl={isRtl}
-                                                                        busy={busyId === payer.id}
-                                                                        onEdit={() => {
-                                                                            setNotice(null);
-                                                                            setModal({ mode: "edit", payer });
-                                                                        }}
-                                                                        onToggleStatus={() => void handleToggleStatus(payer)}
-                                                                        onDelete={() => {
-                                                                            setDeleteError("");
-                                                                            setDeleteTarget(payer);
-                                                                        }}
+                                                                        disabled={pending}
+                                                                        onEdit={() => openModal({ mode: "edit", payer })}
+                                                                        onToggleStatus={() => handleToggleStatus(payer)}
+                                                                        onDelete={() => setDeleteTarget(payer)}
                                                                     />
                                                                 </td>
-                                                            </tr>
+                                                            </AnimatedRow>
                                                         );
                                                     })
                                                 )}
@@ -1730,7 +2188,7 @@ export default function InsurancePayersPage({ initialLocale,
                                                 aria-label={t.previous}
                                                 disabled={currentPage <= 1}
                                                 onClick={() => setPage(Math.max(1, currentPage - 1))}
-                                                className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition hover:border-teal-500 hover:text-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
+                                                className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition duration-150 ease-out motion-reduce:transition-none hover:border-teal-500 hover:text-teal-500 active:scale-95 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
                                             >
                                                 <PrevIcon className="h-4 w-4" />
                                             </button>
@@ -1741,7 +2199,7 @@ export default function InsurancePayersPage({ initialLocale,
                                                     key={pageNumber}
                                                     aria-current={pageNumber === currentPage ? "page" : undefined}
                                                     onClick={() => setPage(pageNumber)}
-                                                    className={`h-10 min-w-10 rounded-lg border px-3 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-teal-500 ${pageNumber === currentPage
+                                                    className={`h-10 min-w-10 rounded-lg border px-3 text-sm font-semibold transition duration-150 ease-out motion-reduce:transition-none active:scale-95 focus:outline-none focus:ring-2 focus:ring-teal-500 ${pageNumber === currentPage
                                                         ? "border-teal-600 bg-teal-600 text-white hover:bg-teal-500"
                                                         : "border-slate-200 text-slate-700 hover:border-teal-500 hover:text-teal-500 dark:border-slate-700 dark:text-slate-200"
                                                         }`}
@@ -1755,7 +2213,7 @@ export default function InsurancePayersPage({ initialLocale,
                                                 aria-label={t.next}
                                                 disabled={currentPage >= totalPages}
                                                 onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
-                                                className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition hover:border-teal-500 hover:text-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
+                                                className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition duration-150 ease-out motion-reduce:transition-none hover:border-teal-500 hover:text-teal-500 active:scale-95 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
                                             >
                                                 <NextIcon className="h-4 w-4" />
                                             </button>
@@ -1768,10 +2226,14 @@ export default function InsurancePayersPage({ initialLocale,
                 </main>
             </div>
 
-            {modal && (
+            {heldModal && (
                 <PayerFormModal
-                    key={modal.mode === "edit" ? modal.payer.id : "create"}
-                    payer={modal.mode === "edit" ? modal.payer : null}
+                    key={`${heldModal.mode}-${heldModal.nonce}`}
+                    payer={heldModal.mode === "edit" ? heldModal.payer : null}
+                    draft={heldModal.draft}
+                    initialErrors={heldModal.fieldErrors}
+                    initialFormError={heldModal.formError}
+                    visible={modalPresence.visible}
                     t={t}
                     isRtl={isRtl}
                     onClose={closeModal}
@@ -1779,11 +2241,15 @@ export default function InsurancePayersPage({ initialLocale,
                 />
             )}
 
-            {deleteTarget && (
+            {heldDelete && (
                 <div
-                    className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm dark:bg-slate-950/80"
+                    aria-hidden={!deletePresence.visible}
+                    className={`fixed inset-0 z-[110] flex items-center justify-center p-4 transition duration-200 ease-out motion-reduce:transition-none ${deletePresence.visible
+                        ? "bg-slate-900/40 backdrop-blur-sm dark:bg-slate-950/80"
+                        : "pointer-events-none bg-slate-900/0 backdrop-blur-none dark:bg-slate-950/0"
+                        }`}
                     onMouseDown={(event) => {
-                        if (event.target === event.currentTarget && !deleting) {
+                        if (event.target === event.currentTarget) {
                             setDeleteTarget(null);
                         }
                     }}
@@ -1793,7 +2259,10 @@ export default function InsurancePayersPage({ initialLocale,
                         aria-modal="true"
                         aria-labelledby="delete-payer-title"
                         dir={isRtl ? "rtl" : "ltr"}
-                        className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl shadow-black/60 dark:border-slate-700 dark:bg-slate-900"
+                        className={`w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl shadow-black/60 transition duration-200 ease-out motion-reduce:transition-none dark:border-slate-700 dark:bg-slate-900 ${deletePresence.visible
+                            ? "translate-y-0 scale-100 opacity-100"
+                            : "translate-y-3 scale-95 opacity-0"
+                            }`}
                     >
                         <div className="flex items-start gap-4">
                             <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-rose-500/10 text-rose-500 dark:text-rose-400">
@@ -1808,7 +2277,7 @@ export default function InsurancePayersPage({ initialLocale,
                                     {t.deleteTitle}
                                 </h2>
                                 <p className="mt-1 truncate text-sm font-semibold text-slate-700 dark:text-slate-200">
-                                    {displayName(deleteTarget, locale)}
+                                    {displayName(heldDelete, locale)}
                                 </p>
                                 <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
                                     {t.deleteBody}
@@ -1822,24 +2291,13 @@ export default function InsurancePayersPage({ initialLocale,
                                 className="mt-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-600 dark:text-amber-400"
                             >
                                 <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-                                <p>{t.deleteBlocked(deleteTarget.patientCount)}</p>
-                            </div>
-                        )}
-
-                        {deleteError && (
-                            <div
-                                role="alert"
-                                className="mt-4 flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-sm text-rose-500 dark:text-rose-400"
-                            >
-                                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-                                <p>{deleteError}</p>
+                                <p>{t.deleteBlocked(heldDelete.patientCount)}</p>
                             </div>
                         )}
 
                         <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
                             <button
                                 type="button"
-                                disabled={deleting}
                                 onClick={() => setDeleteTarget(null)}
                                 className={`${outlineButton} h-11 px-6`}
                             >
@@ -1848,51 +2306,32 @@ export default function InsurancePayersPage({ initialLocale,
 
                             <button
                                 type="button"
-                                disabled={deleting || deleteBlocked}
-                                onClick={() => void confirmDelete()}
-                                className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-slate-950"
+                                disabled={deleteBlocked}
+                                onClick={confirmDelete}
+                                className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-rose-600 px-6 text-sm font-semibold text-white transition duration-150 ease-out motion-reduce:transition-none hover:bg-rose-500 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-slate-950"
                             >
-                                {deleting ? (
-                                    <LoaderCircle className="h-4 w-4 animate-spin" />
-                                ) : (
-                                    <Trash2 className="h-4 w-4" />
-                                )}
-                                {deleting ? t.deleting : t.deleteConfirm}
+                                <Trash2 className="h-4 w-4" />
+                                {t.deleteConfirm}
                             </button>
                         </div>
                     </section>
                 </div>
             )}
 
-            {notice && (
-                <div
-                    role="status"
-                    aria-live="polite"
-                    className={`fixed bottom-6 end-6 z-[200] flex max-w-md items-start gap-3 rounded-xl border bg-white p-4 text-sm shadow-2xl shadow-black/50 dark:bg-slate-900 ${notice.kind === "success"
-                        ? "border-teal-600/40"
-                        : "border-rose-500/40"
-                        }`}
-                >
-                    {notice.kind === "success" ? (
-                        <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-teal-500" />
-                    ) : (
-                        <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-500 dark:text-rose-400" />
-                    )}
-
-                    <p className="min-w-0 flex-1 break-words text-slate-900 dark:text-slate-100">
-                        {notice.message}
-                    </p>
-
-                    <button
-                        type="button"
-                        onClick={() => setNotice(null)}
-                        aria-label={t.close}
-                        className="rounded-md p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
-                    >
-                        <X className="h-4 w-4" />
-                    </button>
-                </div>
-            )}
+            <div
+                role="status"
+                aria-live="polite"
+                className="pointer-events-none fixed bottom-6 end-6 z-[200] flex flex-col items-end gap-3"
+            >
+                {toasts.map((toast) => (
+                    <ToastView
+                        key={toast.id}
+                        toast={toast}
+                        closeLabel={t.close}
+                        onDismiss={dismissNotice}
+                    />
+                ))}
+            </div>
         </div>
     );
 }
