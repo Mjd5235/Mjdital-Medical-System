@@ -26,6 +26,7 @@ import { requirePortalSession } from "@/lib/auth/guard";
 const BRANDING_BUCKET = "center-branding";
 const MAX_LOGO_BYTES = 900 * 1024;
 const MAX_FAVICON_BYTES = 256 * 1024;
+const SIGNED_URL_TTL_SECONDS = 60 * 60 * 12;
 
 export type CenterSettingsFieldKey =
     | "logoUrl"
@@ -70,6 +71,8 @@ export interface CenterSettingsData extends CenterSettingsFields {
     /** 0 means the center has no saved settings yet. */
     version: number;
     updatedAt: string | null;
+    /** Maps a stored asset URL to a short-lived signed URL used only for display. */
+    assetPreviews: Record<string, string>;
 }
 
 export interface SaveCenterSettingsInput extends CenterSettingsFields {
@@ -339,6 +342,7 @@ function mapRow(row: CenterSettings): CenterSettingsData {
         phone: row.phone ?? "",
         email: row.email ?? "",
         websiteUrl: row.websiteUrl ?? "",
+        assetPreviews: {},
     };
 }
 
@@ -363,6 +367,7 @@ function emptyData(): CenterSettingsData {
         phone: "",
         email: "",
         websiteUrl: "",
+        assetPreviews: {},
     };
 }
 
@@ -531,6 +536,42 @@ async function removeReplacedAssets(
 
 /* ------------------------------- actions ------------------------------- */
 
+/** Signed URLs let the page display branding images even if the bucket is not public. */
+async function buildAssetPreviews(
+    organizationId: string,
+    urls: Array<string | null | undefined>,
+): Promise<Record<string, string>> {
+    const previews: Record<string, string> = {};
+
+    try {
+        const prefix = assetPrefix(organizationId);
+        const owned = urls.filter(
+            (value): value is string => Boolean(value) && value!.startsWith(prefix),
+        );
+
+        if (owned.length === 0) return previews;
+
+        const paths = owned.map((value) => `${organizationId}/${value.slice(prefix.length)}`);
+
+        const { data, error } = await getStorageClient()
+            .storage.from(BRANDING_BUCKET)
+            .createSignedUrls(paths, SIGNED_URL_TTL_SECONDS);
+
+        if (error || !data) {
+            console.error("[buildAssetPreviews]", error);
+            return previews;
+        }
+
+        data.forEach((item, index) => {
+            if (item.signedUrl) previews[owned[index]] = item.signedUrl;
+        });
+    } catch (error) {
+        console.error("[buildAssetPreviews]", error);
+    }
+
+    return previews;
+}
+
 export async function getCenterSettingsAction(): Promise<
     CenterSettingsActionResult<CenterSettingsData>
 > {
@@ -541,7 +582,16 @@ export async function getCenterSettingsAction(): Promise<
             where: { organizationId: session.organizationId },
         });
 
-        return { success: true, data: row ? mapRow(row) : emptyData() };
+        if (!row) return { success: true, data: emptyData() };
+
+        const data = mapRow(row);
+
+        data.assetPreviews = await buildAssetPreviews(session.organizationId, [
+            row.logoUrl,
+            row.faviconUrl,
+        ]);
+
+        return { success: true, data };
     } catch (error) {
         return databaseError("getCenterSettingsAction", error);
     }

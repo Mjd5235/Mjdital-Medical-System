@@ -644,6 +644,11 @@ function ImageUploader({
     const inputRef = useRef<HTMLInputElement>(null);
     const [dragging, setDragging] = useState(false);
     const isLogo = kind === "logo";
+    const [failed, setFailed] = useState(false);
+
+    useEffect(() => {
+        setFailed(false);
+    }, [src]);
 
     const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0];
@@ -678,13 +683,13 @@ function ImageUploader({
                     : "border-slate-300 bg-slate-50 dark:border-slate-600 dark:bg-slate-950/50"
                     } ${isLogo ? "min-h-[150px]" : "mx-auto h-[120px] w-[120px] sm:mx-0"}`}
             >
-                {src ? (
+                {src && !failed ? (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
                         src={src}
                         alt={label}
-                        className={`object-contain transition-opacity duration-200 ${isLogo ? "max-h-20 max-w-full" : "h-12 w-12"
-                            }`}
+                        onError={() => setFailed(true)}
+                        className={`object-contain transition-opacity duration-200 ${isLogo ? "max-h-20 max-w-full" : "h-12 w-12"}`}
                     />
                 ) : (
                     <div className="flex flex-col items-center gap-1 text-slate-400">
@@ -965,6 +970,7 @@ export default function CenterSettingsPage({ initialLocale,
     const [syncing, setSyncing] = useState(0);
     const [justSaved, setJustSaved] = useState(false);
     const [stale, setStale] = useState(false);
+    const [assetPreviews, setAssetPreviews] = useState<Record<string, string>>({});
 
     const t = messages[locale];
     const isRtl = locale === "ar";
@@ -1053,6 +1059,8 @@ export default function CenterSettingsPage({ initialLocale,
             }
 
             const values = toFormValues(result.data);
+
+            setAssetPreviews(result.data.assetPreviews ?? {});
 
             versionRef.current = result.data.version;
             confirmedRef.current = values;
@@ -1350,6 +1358,7 @@ export default function CenterSettingsPage({ initialLocale,
     );
 
     const SaveIcon = justSaved && !dirty ? Check : Save;
+    const resolveAsset = (url: string) => (url ? (assetPreviews[url] ?? url) : "");
 
     return (
         <div
@@ -1446,7 +1455,7 @@ export default function CenterSettingsPage({ initialLocale,
                                     <div className="grid grid-cols-1 gap-6 sm:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
                                         <ImageUploader
                                             kind="logo"
-                                            src={draft.logoUrl}
+                                            src={resolveAsset(draft.logoUrl)}
                                             label={t.logo}
                                             hint={t.logoHint}
                                             changeLabel={t.changeLogo}
@@ -1458,7 +1467,7 @@ export default function CenterSettingsPage({ initialLocale,
                                         />
                                         <ImageUploader
                                             kind="favicon"
-                                            src={draft.faviconUrl}
+                                            src={resolveAsset(draft.faviconUrl)}
                                             label={t.favicon}
                                             hint={t.faviconHint}
                                             changeLabel={t.change}
