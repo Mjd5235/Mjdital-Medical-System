@@ -1,75 +1,3 @@
-// ============================================================================
-// prisma/schema.prisma  (UPDATED — adds the Center Settings module)
-//
-// What changed vs. the previous schema:
-//   1. NEW enum   `CenterFacilityType` (MOH / NPHIES facility classification).
-//   2. NEW model  `CenterSettings`     (ONE row per Organization — branding, legal info,
-//                                       Saudi National Address, MOH/NPHIES identifiers, contact).
-//                                       Used by app/admin/settings/page.tsx + actions.ts
-//                                       (getCenterSettingsAction / saveCenterSettingsAction /
-//                                       uploadCenterAssetAction).
-//   3. `Organization` gets the back-relation `centerSettings CenterSettings?`.
-//   4. Everything else (Pricing & Taxes, Policies, Doctors, Shifts, ...) is UNCHANGED.
-//
-// Design notes:
-//   - `organizationId` is UNIQUE: exactly one settings row per tenant (upsert-safe).
-//   - `version` is an optimistic-concurrency counter. The action updates with
-//     `WHERE organization_id = ? AND version = ?` so two admins cannot silently overwrite
-//     each other. version = 0 on the client means "no row yet" (create path).
-//   - `taxRegistrationNumber`, `mohLicenseNumber`, `nphiesFacilityId` are globally UNIQUE
-//     (nullable): one ZATCA VAT number / MOH license / NPHIES facility ID cannot be claimed by
-//     two tenants. Postgres allows many NULLs, so new organizations are not blocked.
-//   - `Organization.nameAr / nameEn / vatNumber / city` are kept untouched for backwards
-//     compatibility. CenterSettings is the source of truth for the Center Settings page; if you
-//     want them mirrored, do it inside saveCenterSettingsAction in one transaction.
-//   - logoUrl / faviconUrl hold PUBLIC Supabase Storage URLs of the `center-branding` bucket.
-//     The action only accepts URLs inside `<bucket>/<organizationId>/` (tenant isolation).
-//
-// After pasting: run `npx prisma migrate dev --name add_center_settings`
-// (or `prisma db push`), then `npx prisma generate`.
-//
-// Supabase setup required by actions.ts:
-//   - Create a PUBLIC Storage bucket named `center-branding`.
-//   - Env vars: NEXT_PUBLIC_SUPABASE_URL (or SUPABASE_URL) and SUPABASE_SERVICE_ROLE_KEY.
-//
-// Recommended raw-SQL guards in the generated migration (Prisma cannot express CHECKs):
-//   ALTER TABLE "center_settings" ADD CONSTRAINT "center_settings_version_chk"
-//     CHECK ("version" >= 1);
-//   ALTER TABLE "center_settings" ADD CONSTRAINT "center_settings_tax_number_chk"
-//     CHECK ("tax_registration_number" IS NULL OR "tax_registration_number" ~ '^3[0-9]{13}3$');
-//   ALTER TABLE "center_settings" ADD CONSTRAINT "center_settings_national_address_chk"
-//     CHECK (("postal_code" IS NULL OR "postal_code" ~ '^[0-9]{5}$')
-//        AND ("additional_number" IS NULL OR "additional_number" ~ '^[0-9]{4}$')
-//        AND ("building_number" IS NULL OR "building_number" ~ '^[0-9]{4}$'));
-//   ALTER TABLE "center_settings" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
-//
-// Earlier recommended guards for the Pricing & Taxes module (kept for reference):
-//   -- Back-fill first: UPDATE "services" SET "vat_category" = 'CITIZEN_MEDICAL_EXEMPT' WHERE "vat_rate" = 0;
-//   ALTER TABLE "service_prices" ADD CONSTRAINT "service_prices_price_chk"
-//     CHECK ("price_ex_vat" > 0 AND "price_incl_vat" >= "price_ex_vat");
-//   ALTER TABLE "service_prices" ADD CONSTRAINT "service_prices_vat_chk"
-//     CHECK (("vat_category" = 'STANDARD' AND "vat_rate" = 15)
-//         OR ("vat_category" = 'CITIZEN_MEDICAL_EXEMPT' AND "vat_rate" = 0));
-//   ALTER TABLE "services" ADD CONSTRAINT "services_vat_chk"
-//     CHECK (("vat_category" = 'STANDARD' AND "vat_rate" = 15)
-//         OR ("vat_category" = 'CITIZEN_MEDICAL_EXEMPT' AND "vat_rate" = 0));
-//   ALTER TABLE "service_prices" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
-//
-// Earlier recommended guards for `insurance_policies` (kept for reference):
-//   ALTER TABLE "insurance_policies" ADD CONSTRAINT "insurance_policies_copay_chk"
-//     CHECK ("copay_value" >= 0 AND ("copay_type" <> 'PERCENTAGE' OR "copay_value" <= 100));
-//   ALTER TABLE "insurance_policies" ADD CONSTRAINT "insurance_policies_max_share_chk"
-//     CHECK ("max_patient_share" IS NULL OR "max_patient_share" >= 0);
-//   ALTER TABLE "insurance_policies" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
-//
-// Earlier recommended guards for `shifts` (kept for reference):
-//   ALTER TABLE "shifts" ADD CONSTRAINT "shifts_time_range_chk"
-//     CHECK ("start_minute" >= 0 AND "end_minute" <= 1440 AND "end_minute" > "start_minute");
-//   ALTER TABLE "shifts" ADD CONSTRAINT "shifts_slot_chk"
-//     CHECK ("slot_duration_minutes" BETWEEN 5 AND 240);
-//   ALTER TABLE "shifts" ENABLE ROW LEVEL SECURITY;  -- if you use Supabase RLS
-// ============================================================================
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -181,6 +109,42 @@ enum CenterFacilityType {
   @@map("center_facility_type")
 }
 
+/// بيئة الربط مع هيئة الزكاة (ZATCA Fatoora).
+/// - SIMULATION: بيئة المحاكاة (Simulation Sandbox) للاختبار قبل الإنتاج.
+/// - PRODUCTION: بيئة الإنتاج الفعلية (فواتير ذات أثر نظامي).
+enum ZatcaEnvironment {
+  SIMULATION
+  PRODUCTION
+
+  @@map("zatca_environment")
+}
+
+/// نوع الفاتورة الإلكترونية (المرحلة الثانية).
+/// - SIMPLIFIED_B2C: فاتورة مبسطة (إبلاغ Reporting).
+/// - TAX_B2B: فاتورة ضريبية للمنشآت (اعتماد Clearance) — وتشمل فواتير التأمين عبر isInsurance.
+enum ZatcaInvoiceType {
+  SIMPLIFIED_B2C
+  TAX_B2B
+  CREDIT_NOTE
+  DEBIT_NOTE
+
+  @@map("zatca_invoice_type")
+}
+
+/// حالة استجابة هيئة الزكاة لإرسال فاتورة.
+/// - PENDING: أُرسلت ولم يصل الرد بعد.
+/// - REPORTED: تم الإبلاغ بنجاح (فواتير مبسطة).
+/// - CLEARED: تم الاعتماد بنجاح (فواتير ضريبية).
+/// - REJECTED: رُفضت من الهيئة (انظر messages).
+enum ZatcaResponseStatus {
+  PENDING
+  REPORTED
+  CLEARED
+  REJECTED
+
+  @@map("zatca_response_status")
+}
+
 /// المؤسسة الرئيسية والمستأجر (Tenant) في النظام.
 
 model Organization {
@@ -197,6 +161,9 @@ model Organization {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   centerSettings     CenterSettings?
+  zatcaConfig        ZatcaConfig?
+  zatcaCredentials   ZatcaCredential[]
+  zatcaTransmissions ZatcaTransmission[]
   users              User[]
   clinics            Clinic[]
   doctors            Doctor[]
@@ -261,6 +228,85 @@ model CenterSettings {
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
 
   @@map("center_settings")
+}
+
+/// إعدادات الربط مع هيئة الزكاة (سجل واحد لكل مؤسسة): البيئة المختارة حالياً.
+/// الملف الضريبي (الرقم الضريبي والعنوان) يُقرأ من CenterSettings ولا يُكرَّر هنا.
+model ZatcaConfig {
+  id                String           @id @default(uuid()) @db.Uuid
+  organizationId    String           @unique @map("organization_id") @db.Uuid
+  activeEnvironment ZatcaEnvironment @default(SIMULATION) @map("active_environment")
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@map("zatca_configs")
+}
+
+/// شهادة CSID (معرّف ختم التشفير) لجهاز EGS — سجل واحد لكل مؤسسة وبيئة.
+/// - egsSerial: الرقم التسلسلي الظاهر في الواجهة (مثال: EGS-KSA-01-00482).
+/// - egsUuid: المعرّف الفريد للجهاز داخل حقل SN في طلب الشهادة (CSR).
+/// - binarySecurityToken: الشهادة العامة (ليست سرية).
+/// - secretEncrypted / privateKeyEncrypted: مشفّران AES-256-GCM ولا يُرسلان للمتصفح أبداً.
+/// - complianceRequestId / productionRequestId: معرّفات الطلبات لدى هيئة الزكاة.
+model ZatcaCredential {
+  id                  String           @id @default(uuid()) @db.Uuid
+  organizationId      String           @map("organization_id") @db.Uuid
+  environment         ZatcaEnvironment
+  egsSerial           String           @map("egs_serial") @db.VarChar(40)
+  egsUuid             String           @map("egs_uuid") @db.Uuid
+  complianceRequestId String?          @map("compliance_request_id") @db.VarChar(64)
+  productionRequestId String?          @map("production_request_id") @db.VarChar(64)
+  binarySecurityToken String           @map("binary_security_token") @db.Text
+  secretEncrypted     String           @map("secret_encrypted") @db.Text
+  privateKeyEncrypted String           @map("private_key_encrypted") @db.Text
+  issuedAt            DateTime         @map("issued_at")
+  expiresAt           DateTime         @map("expires_at")
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@unique([organizationId, environment])
+  @@unique([organizationId, egsSerial])
+  @@index([organizationId, expiresAt])
+  @@map("zatca_credentials")
+}
+
+/// سجل إرسال الفواتير إلى هيئة الزكاة (Transmission Log).
+/// - invoiceRef: رقم الفاتورة المعروض (مثال: INV-2026-10482).
+/// - invoiceUuid: UUID الفاتورة المرسل للهيئة.
+/// - isInsurance: فاتورة ضريبية B2B موجهة لشركة تأمين (تُعرض "Tax Invoice B2B · Insurance").
+/// - messages: رسائل التحقق من الهيئة (أخطاء/تحذيرات) بصيغة JSON.
+/// تُكتب السجلات من خط الفوترة، وتُقرأ فقط من صفحة ZATCA Integration.
+model ZatcaTransmission {
+  id              String              @id @default(uuid()) @db.Uuid
+  organizationId  String              @map("organization_id") @db.Uuid
+  invoiceId       String?             @map("invoice_id") @db.Uuid
+  invoiceRef      String              @map("invoice_ref") @db.VarChar(40)
+  invoiceUuid     String              @map("invoice_uuid") @db.Uuid
+  invoiceType     ZatcaInvoiceType    @map("invoice_type")
+  isInsurance     Boolean             @default(false) @map("is_insurance")
+  payerName       String?             @map("payer_name") @db.VarChar(160)
+  environment     ZatcaEnvironment
+  status          ZatcaResponseStatus @default(PENDING)
+  invoiceHash     String?             @map("invoice_hash") @db.VarChar(128)
+  zatcaRequestId  String?             @map("zatca_request_id") @db.VarChar(64)
+  httpStatus      Int?                @map("http_status")
+  messages        Json?
+  submittedAt     DateTime            @default(now()) @map("submitted_at")
+  respondedAt     DateTime?           @map("responded_at")
+  createdAt       DateTime            @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  invoice      Invoice?     @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, environment, submittedAt])
+  @@index([organizationId, status, submittedAt])
+  @@index([organizationId, invoiceUuid])
+  @@index([invoiceId])
+  @@map("zatca_transmissions")
 }
 
 
@@ -367,20 +413,25 @@ model ServicePrice {
 
 
 /// حساب المستخدم داخل المؤسسة، وليس داخل عيادة محددة.
-
+/// - mobileNumber: رقم الجوال السعودي بصيغة موحّدة (+9665XXXXXXXX)، فريد داخل المؤسسة.
+/// - isActive / activatedAt / mustChangePassword: دورة حياة الحساب.
+///   الحسابات الجديدة من شاشة "Users & Roles" تُنشأ دائماً بـ isActive=false و mustChangePassword=true
+///   إلى أن يسجّل المستخدم الدخول لأول مرة ويغيّر كلمة المرور (عندها يُضبط activatedAt و isActive=true).
 model User {
-  id             String    @id @default(uuid()) @db.Uuid
-  organizationId String    @map("organization_id") @db.Uuid
-  email          String    @unique
-  passwordHash   String    @map("password_hash")
-  fullNameAr     String    @map("full_name_ar")
-  fullNameEn     String    @map("full_name_en")
-  role           UserRole
-  isActive       Boolean   @default(true) @map("is_active")
-  mustChangePassword Boolean @default(false) @map("must_change_password")
-  lastLoginAt    DateTime? @map("last_login_at")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  id                 String    @id @default(uuid()) @db.Uuid
+  organizationId     String    @map("organization_id") @db.Uuid
+  email              String    @unique
+  passwordHash       String    @map("password_hash")
+  fullNameAr         String    @map("full_name_ar")
+  fullNameEn         String    @map("full_name_en")
+  mobileNumber       String?   @map("mobile_number") @db.VarChar(20)
+  role               UserRole
+  isActive           Boolean   @default(true) @map("is_active")
+  mustChangePassword Boolean   @default(false) @map("must_change_password")
+  activatedAt        DateTime? @map("activated_at")
+  lastLoginAt        DateTime? @map("last_login_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
 
@@ -390,8 +441,11 @@ model User {
   onboardingTokens DoctorOnboardingToken[]
 
   @@unique([organizationId, email])
+  @@unique([organizationId, mobileNumber])
   @@index([organizationId])
   @@index([organizationId, role])
+  @@index([organizationId, isActive])
+  @@index([organizationId, createdAt])
   @@map("users")
 }
 
@@ -662,6 +716,8 @@ model Invoice {
   patient      Patient      @relation(fields: [patientId], references: [id], onDelete: Restrict)
 
   appointment Appointment? @relation(fields: [appointmentId], references: [id], onDelete: Restrict)
+
+  zatcaTransmissions ZatcaTransmission[]
 
   @@unique([organizationId, invoiceCounter])
   @@index([organizationId])

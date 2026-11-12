@@ -1283,7 +1283,7 @@ function PolicyModal({
 
     return (
         <div
-            className={`fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 p-3 backdrop-blur-sm transition-opacity duration-200 ease-out motion-reduce:transition-none dark:bg-slate-950/80 sm:p-6 ${entered ? "opacity-100" : "opacity-0"
+            className={`fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 p-3 -sm transition-opacity duration-200 ease-out motion-reduce:transition-none dark:bg-slate-950/80 sm:p-6 ${entered ? "opacity-100" : "opacity-0"
                 }`}
             onMouseDown={(event) => {
                 if (event.target === event.currentTarget) requestClose();
@@ -1584,7 +1584,7 @@ function DeleteDialog({
 
     return (
         <div
-            className={`fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 p-3 backdrop-blur-sm transition-opacity duration-200 ease-out motion-reduce:transition-none dark:bg-slate-950/80 sm:p-6 ${entered ? "opacity-100" : "opacity-0"
+            className={`fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 p-3 -sm transition-opacity duration-200 ease-out motion-reduce:transition-none dark:bg-slate-950/80 sm:p-6 ${entered ? "opacity-100" : "opacity-0"
                 }`}
             onMouseDown={(event) => {
                 if (event.target === event.currentTarget) requestClose();

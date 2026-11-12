@@ -1771,7 +1771,7 @@ function ShiftFormModal({
 
     return (
         <div
-            className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-900/50 p-0 backdrop-blur-sm dark:bg-slate-950/80 sm:items-center sm:p-4"
+            className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-900/50 p-0 -sm dark:bg-slate-950/80 sm:items-center sm:p-4"
             onMouseDown={(event) => {
                 if (event.target === event.currentTarget) onClose();
             }}
@@ -2872,7 +2872,7 @@ export default function SchedulesShiftsPage({ initialLocale,
 
             {deleteTarget && (
                 <div
-                    className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm dark:bg-slate-950/80"
+                    className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/50 p-4 -sm dark:bg-slate-950/80"
                     onMouseDown={(event) => {
                         if (event.target === event.currentTarget) setDeleteTarget(null);
                     }}

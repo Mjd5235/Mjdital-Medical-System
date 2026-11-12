@@ -1555,7 +1555,7 @@ function DoctorFormModal({
 
     return (
         <div
-            className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 dark:bg-slate-950/80 p-3 backdrop-blur-sm sm:p-6"
+            className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 dark:bg-slate-950/80 p-3 -sm sm:p-6"
             onMouseDown={(event) => {
                 if (event.target === event.currentTarget) onClose();
             }}
@@ -2798,7 +2798,7 @@ export default function DoctorsManagementPage({ initialLocale,
 
             {deleteTarget && (
                 <div
-                    className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/40 dark:bg-slate-950/80 p-4 backdrop-blur-sm"
+                    className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/40 dark:bg-slate-950/80 p-4 -sm"
                     onMouseDown={(event) => {
                         if (event.target === event.currentTarget) setDeleteTarget(null);
                     }}

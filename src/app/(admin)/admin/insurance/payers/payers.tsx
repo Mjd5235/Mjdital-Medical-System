@@ -1249,8 +1249,8 @@ function PayerFormModal({
         <div
             aria-hidden={!visible}
             className={`fixed inset-0 z-[110] flex items-center justify-center overflow-y-auto p-4 transition duration-200 ease-out motion-reduce:transition-none ${visible
-                ? "bg-slate-900/40 backdrop-blur-sm dark:bg-slate-950/80"
-                : "pointer-events-none bg-slate-900/0 backdrop-blur-none dark:bg-slate-950/0"
+                ? "bg-slate-900/40 -sm dark:bg-slate-950/80"
+                : "pointer-events-none bg-slate-900/0 -none dark:bg-slate-950/0"
                 }`}
             onMouseDown={(event) => {
                 if (event.target === event.currentTarget) onClose();
@@ -2245,8 +2245,8 @@ export default function InsurancePayersPage({ initialLocale,
                 <div
                     aria-hidden={!deletePresence.visible}
                     className={`fixed inset-0 z-[110] flex items-center justify-center p-4 transition duration-200 ease-out motion-reduce:transition-none ${deletePresence.visible
-                        ? "bg-slate-900/40 backdrop-blur-sm dark:bg-slate-950/80"
-                        : "pointer-events-none bg-slate-900/0 backdrop-blur-none dark:bg-slate-950/0"
+                        ? "bg-slate-900/40 -sm dark:bg-slate-950/80"
+                        : "pointer-events-none bg-slate-900/0 -none dark:bg-slate-950/0"
                         }`}
                     onMouseDown={(event) => {
                         if (event.target === event.currentTarget) {

@@ -700,7 +700,7 @@ function ModalShell({
             <div
                 aria-hidden="true"
                 onClick={requestClose}
-                className={`absolute inset-0 bg-slate-950/70 backdrop-blur-sm transition-opacity duration-200 ease-out ${visible ? "opacity-100" : "opacity-0"
+                className={`absolute inset-0 bg-slate-950/70 -sm transition-opacity duration-200 ease-out ${visible ? "opacity-100" : "opacity-0"
                     }`}
             />
 

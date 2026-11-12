@@ -53,6 +53,7 @@ import {
     type UpdateServiceInput,
 } from "./actions";
 import AdminHeader from "@/components/AdminPortalHeader/Header";
+import { AnimatePresence, motion } from 'framer-motion';
 
 type ClinicsServicesProps = {
     initialLocale: Locale;
@@ -2014,453 +2015,559 @@ export default function ClinicsServicesPage({ initialLocale,
                     </main>
                 </div>
             </div >
-
-            {modal && (
-                <div
-                    className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-3 backdrop-blur-[3px] sm:p-6"
-                    onMouseDown={(event) => {
-                        if (event.target === event.currentTarget) closeModal();
-                    }}
-                >
-                    <section
-                        role="dialog"
-                        aria-modal="true"
-                        aria-labelledby="management-modal-title"
-                        className="my-auto max-h-[95vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-950"
+            <AnimatePresence>
+                {modal && (
+                    <motion.div
+                        key="management-modal-backdrop"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={{ duration: 0.2, ease: "easeOut" }}
+                        className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-3 sm:p-6"
+                        onMouseDown={(event) => {
+                            if (event.target === event.currentTarget) closeModal();
+                        }}
                     >
-                        <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-5 py-5 sm:px-6 dark:border-slate-800">
-                            <div className="flex items-start gap-3">
-                                <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-teal-50 text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
-                                    {modal === "clinic" ? <Hospital size={22} /> : <Coins size={22} />}
-                                </div>
-
-                                <div>
-                                    <h2
-                                        id="management-modal-title"
-                                        className="text-lg font-extrabold text-slate-900 dark:text-white"
-                                    >
-                                        {modal === "clinic"
-                                            ? editingClinic ? t.editClinic : t.newClinic
-                                            : editingService ? t.editService : t.newService}
-                                    </h2>
-                                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                        {modal === "clinic" ? t.clinicDescription : t.serviceDescription}
-                                    </p>
-                                </div>
-                            </div>
-
-                            <button
-                                type="button"
-                                onClick={closeModal}
-                                aria-label={t.close}
-                                className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
-                            >
-                                <X size={19} />
-                            </button>
-                        </div>
-
-                        {error && (
-                            <div
-                                role="alert"
-                                className="mx-5 mt-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300 sm:mx-6"
-                            >
-                                {error}
-                            </div>
-                        )}
-
-                        {modal === "clinic" ? (
-                            <form onSubmit={handleClinicSubmit} className="space-y-5 p-5 sm:p-6">
-                                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                                    <Field label={t.clinicEn}>
-                                        <input
-                                            required
-                                            maxLength={150}
-                                            autoFocus
-                                            value={clinicForm.nameEn}
-                                            onChange={(event) =>
-                                                setClinicForm((current) => ({
-                                                    ...current,
-                                                    nameEn: event.target.value,
-                                                }))
-                                            }
-                                            placeholder="e.g. Dental Clinic"
-                                            className={cn(inputClass, "text-left")}
-                                            dir="ltr"
-                                        />
-                                    </Field>
-
-                                    <Field label={t.clinicAr}>
-                                        <input
-                                            required
-                                            maxLength={150}
-                                            value={clinicForm.nameAr}
-                                            onChange={(event) =>
-                                                setClinicForm((current) => ({
-                                                    ...current,
-                                                    nameAr: event.target.value,
-                                                }))
-                                            }
-                                            placeholder="مثال: عيادة الأسنان"
-                                            className={cn(inputClass, "text-right")}
-                                            dir="rtl"
-                                        />
-                                    </Field>
-                                </div>
-
-                                <Field label={t.specialty}>
-                                    <div className="relative">
-                                        <select
-                                            required
-                                            value={clinicForm.specialty}
-                                            onChange={(event) => {
-                                                const selected = specialties.find(
-                                                    (item) => item.code === event.target.value,
-                                                );
-
-                                                if (!selected) return;
-
-                                                setClinicForm((current) => ({
-                                                    ...current,
-                                                    specialty: selected.code,
-                                                    nphiesCode: selected.nphies,
-                                                }));
-                                            }}
-                                            className={cn(inputClass, "appearance-none pe-10")}
-                                        >
-                                            {specialties.map((specialty) => (
-                                                <option key={specialty.code} value={specialty.code}>
-                                                    {locale === "ar" ? specialty.ar : specialty.en}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <ChevronDown
-                                            size={16}
-                                            className={cn(
-                                                "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                isRtl ? "left-3" : "right-3",
-                                            )}
-                                        />
-                                    </div>
-                                </Field>
-
-                                <Field label={t.clinicCode} hint={t.nphiesNote}>
-                                    <input
-                                        required
-                                        minLength={2}
-                                        maxLength={30}
-                                        pattern="[A-Za-z0-9-]{2,30}"
-                                        value={clinicForm.nphiesCode}
-                                        onChange={(event) =>
-                                            setClinicForm((current) => ({
-                                                ...current,
-                                                nphiesCode: event.target.value.toUpperCase(),
-                                            }))
-                                        }
-                                        placeholder="DENT-01"
-                                        className={cn(inputClass, "font-mono text-left")}
-                                        dir="ltr"
-                                    />
-                                </Field>
-
-                                {!editingClinic && (
-                                    <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50/70 p-4 dark:border-slate-700 dark:bg-slate-900/60">
-                                        <div>
-                                            <p className="text-sm font-bold text-slate-800 dark:text-white">
-                                                {t.status}
-                                            </p>
-                                            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                                {t.statusNote}
-                                            </p>
-                                        </div>
-
-                                        <button
-                                            type="button"
-                                            role="switch"
-                                            aria-checked={clinicForm.isActive}
-                                            aria-label={t.status}
-                                            onClick={() =>
-                                                setClinicForm((current) => ({
-                                                    ...current,
-                                                    isActive: !current.isActive,
-                                                }))
-                                            }
-                                            className={cn(
-                                                "relative h-7 w-12 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500",
-                                                clinicForm.isActive
-                                                    ? "bg-teal-600"
-                                                    : "bg-slate-300 dark:bg-slate-700",
-                                            )}
-                                        >
-                                            <span
-                                                className={cn(
-                                                    "absolute top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-all",
-                                                    clinicForm.isActive
-                                                        ? isRtl ? "right-1" : "left-[1.625rem]"
-                                                        : isRtl ? "right-[1.625rem]" : "left-1",
-                                                )}
-                                            />
-                                        </button>
-                                    </div>
-                                )}
-
-                                <div className="flex flex-col-reverse gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end dark:border-slate-800">
-                                    <button
-                                        type="button"
-                                        onClick={closeModal}
-                                        className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
-                                    >
-                                        {t.cancel}
-                                    </button>
-
-                                    <button
-                                        type="submit"
-                                        className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700"
-                                    >
-                                        {editingClinic ? t.saveChanges : t.saveClinic}
-                                    </button>
-                                </div>
-                            </form>
-                        ) : (
-                            <form onSubmit={handleServiceSubmit} className="space-y-5 p-5 sm:p-6">
-                                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                                    <Field label={t.serviceEn}>
-                                        <input
-                                            required
-                                            maxLength={200}
-                                            autoFocus
-                                            value={serviceForm.nameEn}
-                                            onChange={(event) =>
-                                                setServiceForm((current) => ({
-                                                    ...current,
-                                                    nameEn: event.target.value,
-                                                }))
-                                            }
-                                            placeholder="e.g. Dental Cleaning"
-                                            className={cn(inputClass, "text-left")}
-                                            dir="ltr"
-                                        />
-                                    </Field>
-
-                                    <Field label={t.serviceAr}>
-                                        <input
-                                            required
-                                            maxLength={200}
-                                            value={serviceForm.nameAr}
-                                            onChange={(event) =>
-                                                setServiceForm((current) => ({
-                                                    ...current,
-                                                    nameAr: event.target.value,
-                                                }))
-                                            }
-                                            placeholder="مثال: تنظيف الأسنان"
-                                            className={cn(inputClass, "text-right")}
-                                            dir="rtl"
-                                        />
-                                    </Field>
-                                </div>
-
-                                <Field label={t.serviceCode}>
-                                    <input
-                                        required
-                                        minLength={2}
-                                        maxLength={40}
-                                        pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,39}"
-                                        value={serviceForm.code}
-                                        readOnly
-                                        aria-readonly="true"
-                                        placeholder="e.g. PED-101"
-                                        className={cn(
-                                            inputClass,
-                                            "font-mono text-left cursor-not-allowed",
+                        <motion.section
+                            key="management-modal-content"
+                            initial={{
+                                opacity: 0,
+                                scale: 0.96,
+                                y: 16,
+                            }}
+                            animate={{
+                                opacity: 1,
+                                scale: 1,
+                                y: 0,
+                            }}
+                            exit={{
+                                opacity: 0,
+                                scale: 0.97,
+                                y: 10,
+                            }}
+                            transition={{
+                                duration: 0.22,
+                                ease: [0.22, 1, 0.36, 1],
+                            }}
+                            role="dialog"
+                            aria-modal="true"
+                            aria-labelledby="management-modal-title"
+                            className="my-auto max-h-[95vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-950"
+                        >
+                            <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-5 py-5 sm:px-6 dark:border-slate-800">
+                                <div className="flex items-start gap-3">
+                                    <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-teal-50 text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
+                                        {modal === "clinic" ? (
+                                            <Hospital size={22} />
+                                        ) : (
+                                            <Coins size={22} />
                                         )}
-                                        dir="ltr"
-                                    />
-                                </Field>
-
-                                <Field label={t.associatedClinic}>
-                                    <div className="relative">
-                                        <select
-                                            required
-                                            value={serviceForm.clinicId}
-                                            onChange={(event) => {
-                                                const clinicId = event.target.value;
-                                                const selectedClinic = clinics.find(
-                                                    (clinic) => clinic.id === clinicId,
-                                                );
-
-                                                setServiceForm((current) => ({
-                                                    ...current,
-                                                    clinicId,
-                                                    code: generateServiceCode(clinicId),
-                                                }));
-
-                                                if (selectedClinic && !selectedClinic.isActive) {
-                                                    setError(t.serviceClinicDisabledSelect);
-                                                } else {
-                                                    setError("");
-                                                }
-                                            }}
-                                            className={cn(inputClass, "appearance-none pe-10")}
-                                        >
-                                            <option value="" disabled>
-                                                {t.chooseClinic}
-                                            </option>
-                                            {clinics.map((clinic) => (
-                                                <option
-                                                    key={clinic.id}
-                                                    value={clinic.id}
-                                                    disabled={!clinic.isActive || isTempId(clinic.id)}
-                                                >
-                                                    {clinicName(clinic)}{!clinic.isActive ? ` (${t.inactive})` : ""}
-                                                </option>
-                                            ))}
-                                        </select>
-                                        <ChevronDown
-                                            size={16}
-                                            className={cn(
-                                                "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                isRtl ? "left-3" : "right-3",
-                                            )}
-                                        />
                                     </div>
-                                </Field>
 
-                                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                                    <Field label={t.basePrice}>
-                                        <input
-                                            required
-                                            type="number"
-                                            min="0"
-                                            max="9999999999.99"
-                                            step="0.01"
-                                            inputMode="decimal"
-                                            value={serviceForm.basePrice}
-                                            onChange={(event) =>
-                                                setServiceForm((current) => ({
-                                                    ...current,
-                                                    basePrice: event.target.value,
-                                                }))
-                                            }
-                                            placeholder="0.00"
-                                            className={cn(inputClass, "font-mono text-left")}
-                                            dir="ltr"
-                                        />
-                                    </Field>
+                                    <div>
+                                        <h2
+                                            id="management-modal-title"
+                                            className="text-lg font-extrabold text-slate-900 dark:text-white"
+                                        >
+                                            {modal === "clinic"
+                                                ? editingClinic
+                                                    ? t.editClinic
+                                                    : t.newClinic
+                                                : editingService
+                                                    ? t.editService
+                                                    : t.newService}
+                                        </h2>
 
-                                    <Field label={t.vat}>
-                                        <div className="relative">
-                                            <select
-                                                value={serviceForm.vatRate}
+                                        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                            {modal === "clinic"
+                                                ? t.clinicDescription
+                                                : t.serviceDescription}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <button
+                                    type="button"
+                                    onClick={closeModal}
+                                    aria-label={t.close}
+                                    className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+                                >
+                                    <X size={19} />
+                                </button>
+                            </div>
+
+                            {error && (
+                                <div
+                                    role="alert"
+                                    className="mx-5 mt-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300 sm:mx-6"
+                                >
+                                    {error}
+                                </div>
+                            )}
+
+                            {modal === "clinic" ? (
+                                <form
+                                    onSubmit={handleClinicSubmit}
+                                    className="space-y-5 p-5 sm:p-6"
+                                >
+                                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                                        <Field label={t.clinicEn}>
+                                            <input
+                                                required
+                                                maxLength={150}
+                                                autoFocus
+                                                value={clinicForm.nameEn}
                                                 onChange={(event) =>
-                                                    setServiceForm((current) => ({
+                                                    setClinicForm((current) => ({
                                                         ...current,
-                                                        vatRate: Number(event.target.value) as 0 | 15,
+                                                        nameEn: event.target.value,
                                                     }))
                                                 }
-                                                className={cn(inputClass, "appearance-none pe-10")}
+                                                placeholder="e.g. Dental Clinic"
+                                                className={cn(inputClass, "text-left")}
+                                                dir="ltr"
+                                            />
+                                        </Field>
+
+                                        <Field label={t.clinicAr}>
+                                            <input
+                                                required
+                                                maxLength={150}
+                                                value={clinicForm.nameAr}
+                                                onChange={(event) =>
+                                                    setClinicForm((current) => ({
+                                                        ...current,
+                                                        nameAr: event.target.value,
+                                                    }))
+                                                }
+                                                placeholder="مثال: عيادة الأسنان"
+                                                className={cn(inputClass, "text-right")}
+                                                dir="rtl"
+                                            />
+                                        </Field>
+                                    </div>
+
+                                    <Field label={t.specialty}>
+                                        <div className="relative">
+                                            <select
+                                                required
+                                                value={clinicForm.specialty}
+                                                onChange={(event) => {
+                                                    const selected = specialties.find(
+                                                        (item) =>
+                                                            item.code === event.target.value
+                                                    );
+
+                                                    if (!selected) return;
+
+                                                    setClinicForm((current) => ({
+                                                        ...current,
+                                                        specialty: selected.code,
+                                                        nphiesCode: selected.nphies,
+                                                    }));
+                                                }}
+                                                className={cn(
+                                                    inputClass,
+                                                    "appearance-none pe-10"
+                                                )}
                                             >
-                                                <option value={15}>{t.standardVat}</option>
-                                                <option value={0}>{t.exemptVat}</option>
+                                                {specialties.map((specialty) => (
+                                                    <option
+                                                        key={specialty.code}
+                                                        value={specialty.code}
+                                                    >
+                                                        {locale === "ar"
+                                                            ? specialty.ar
+                                                            : specialty.en}
+                                                    </option>
+                                                ))}
                                             </select>
+
                                             <ChevronDown
                                                 size={16}
                                                 className={cn(
                                                     "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                    isRtl ? "left-3" : "right-3",
+                                                    isRtl ? "left-3" : "right-3"
                                                 )}
                                             />
                                         </div>
                                     </Field>
-                                </div>
 
-                                <div className="rounded-2xl border border-teal-100 bg-gradient-to-br from-teal-50/80 to-cyan-50/50 p-4 dark:border-teal-900 dark:from-teal-950/30 dark:to-cyan-950/20">
-                                    <div className="mb-4 flex items-center gap-2">
-                                        <div className="grid h-9 w-9 place-items-center rounded-xl bg-white text-teal-700 shadow-sm dark:bg-slate-900 dark:text-teal-400">
-                                            <CircleDollarSign size={19} />
-                                        </div>
-                                        <div>
-                                            <p className="text-sm font-bold text-slate-800 dark:text-white">
-                                                {t.billing}
-                                            </p>
-                                            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                                                {t.vatNote}
-                                            </p>
-                                        </div>
-                                    </div>
+                                    <Field label={t.clinicCode} hint={t.nphiesNote}>
+                                        <input
+                                            required
+                                            minLength={2}
+                                            maxLength={30}
+                                            pattern="[A-Za-z0-9-]{2,30}"
+                                            value={clinicForm.nphiesCode}
+                                            onChange={(event) =>
+                                                setClinicForm((current) => ({
+                                                    ...current,
+                                                    nphiesCode:
+                                                        event.target.value.toUpperCase(),
+                                                }))
+                                            }
+                                            placeholder="DENT-01"
+                                            className={cn(
+                                                inputClass,
+                                                "font-mono text-left"
+                                            )}
+                                            dir="ltr"
+                                        />
+                                    </Field>
 
-                                    <div className="space-y-3">
-                                        <div className="flex items-center justify-between gap-3 text-sm">
-                                            <span className="text-slate-600 dark:text-slate-300">
-                                                {t.basePrice}
-                                            </span>
-                                            <span className="font-semibold tabular-nums text-slate-800 dark:text-white">
-                                                {validBaseAmount ? money(baseAmount, locale) : "—"} {t.sar}
-                                            </span>
-                                        </div>
+                                    {!editingClinic && (
+                                        <div className="flex items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50/70 p-4 dark:border-slate-700 dark:bg-slate-900/60">
+                                            <div>
+                                                <p className="text-sm font-bold text-slate-800 dark:text-white">
+                                                    {t.status}
+                                                </p>
+                                                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                                    {t.statusNote}
+                                                </p>
+                                            </div>
 
-                                        <div className="flex items-center justify-between gap-3 text-sm">
-                                            <span className="text-slate-600 dark:text-slate-300">
-                                                {t.taxAmount} ({serviceForm.vatRate}%)
-                                            </span>
-                                            <span className="font-semibold tabular-nums text-slate-800 dark:text-white">
-                                                {validBaseAmount ? money(vatAmount, locale) : "—"} {t.sar}
-                                            </span>
-                                        </div>
-
-                                        <div className="border-t border-teal-200 pt-3 dark:border-teal-900">
-                                            <Field label={t.totalPrice}>
-                                                <input
-                                                    type="text"
-                                                    readOnly
-                                                    disabled
-                                                    aria-label={t.totalPrice}
-                                                    value={
-                                                        validBaseAmount
-                                                            ? `${money(totalAmount, locale)} ${t.sar}`
-                                                            : ""
-                                                    }
-                                                    placeholder="0.00"
+                                            <button
+                                                type="button"
+                                                role="switch"
+                                                aria-checked={clinicForm.isActive}
+                                                aria-label={t.status}
+                                                onClick={() =>
+                                                    setClinicForm((current) => ({
+                                                        ...current,
+                                                        isActive: !current.isActive,
+                                                    }))
+                                                }
+                                                className={cn(
+                                                    "relative h-7 w-12 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500",
+                                                    clinicForm.isActive
+                                                        ? "bg-teal-600"
+                                                        : "bg-slate-300 dark:bg-slate-700"
+                                                )}
+                                            >
+                                                <span
                                                     className={cn(
-                                                        inputClass,
-                                                        "border-teal-200 bg-white font-bold text-teal-700 dark:border-teal-900 dark:bg-slate-900 dark:text-teal-400",
+                                                        "absolute top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-all",
+                                                        clinicForm.isActive
+                                                            ? isRtl
+                                                                ? "right-1"
+                                                                : "left-[1.625rem]"
+                                                            : isRtl
+                                                                ? "right-[1.625rem]"
+                                                                : "left-1"
                                                     )}
                                                 />
-                                            </Field>
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    <div className="flex flex-col-reverse gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end dark:border-slate-800">
+                                        <button
+                                            type="button"
+                                            onClick={closeModal}
+                                            className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                        >
+                                            {t.cancel}
+                                        </button>
+
+                                        <button
+                                            type="submit"
+                                            className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700"
+                                        >
+                                            {editingClinic
+                                                ? t.saveChanges
+                                                : t.saveClinic}
+                                        </button>
+                                    </div>
+                                </form>
+                            ) : (
+                                <form
+                                    onSubmit={handleServiceSubmit}
+                                    className="space-y-5 p-5 sm:p-6"
+                                >
+                                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                                        <Field label={t.serviceEn}>
+                                            <input
+                                                required
+                                                maxLength={200}
+                                                autoFocus
+                                                value={serviceForm.nameEn}
+                                                onChange={(event) =>
+                                                    setServiceForm((current) => ({
+                                                        ...current,
+                                                        nameEn: event.target.value,
+                                                    }))
+                                                }
+                                                placeholder="e.g. Dental Cleaning"
+                                                className={cn(inputClass, "text-left")}
+                                                dir="ltr"
+                                            />
+                                        </Field>
+
+                                        <Field label={t.serviceAr}>
+                                            <input
+                                                required
+                                                maxLength={200}
+                                                value={serviceForm.nameAr}
+                                                onChange={(event) =>
+                                                    setServiceForm((current) => ({
+                                                        ...current,
+                                                        nameAr: event.target.value,
+                                                    }))
+                                                }
+                                                placeholder="مثال: تنظيف الأسنان"
+                                                className={cn(inputClass, "text-right")}
+                                                dir="rtl"
+                                            />
+                                        </Field>
+                                    </div>
+
+                                    <Field label={t.serviceCode}>
+                                        <input
+                                            required
+                                            minLength={2}
+                                            maxLength={40}
+                                            pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,39}"
+                                            value={serviceForm.code}
+                                            readOnly
+                                            aria-readonly="true"
+                                            placeholder="e.g. PED-101"
+                                            className={cn(
+                                                inputClass,
+                                                "font-mono text-left cursor-not-allowed"
+                                            )}
+                                            dir="ltr"
+                                        />
+                                    </Field>
+
+                                    <Field label={t.associatedClinic}>
+                                        <div className="relative">
+                                            <select
+                                                required
+                                                value={serviceForm.clinicId}
+                                                onChange={(event) => {
+                                                    const clinicId = event.target.value;
+
+                                                    const selectedClinic = clinics.find(
+                                                        (clinic) =>
+                                                            clinic.id === clinicId
+                                                    );
+
+                                                    setServiceForm((current) => ({
+                                                        ...current,
+                                                        clinicId,
+                                                        code: generateServiceCode(clinicId),
+                                                    }));
+
+                                                    if (
+                                                        selectedClinic &&
+                                                        !selectedClinic.isActive
+                                                    ) {
+                                                        setError(
+                                                            t.serviceClinicDisabledSelect
+                                                        );
+                                                    } else {
+                                                        setError("");
+                                                    }
+                                                }}
+                                                className={cn(
+                                                    inputClass,
+                                                    "appearance-none pe-10"
+                                                )}
+                                            >
+                                                <option value="" disabled>
+                                                    {t.chooseClinic}
+                                                </option>
+
+                                                {clinics.map((clinic) => (
+                                                    <option
+                                                        key={clinic.id}
+                                                        value={clinic.id}
+                                                        disabled={
+                                                            !clinic.isActive ||
+                                                            isTempId(clinic.id)
+                                                        }
+                                                    >
+                                                        {clinicName(clinic)}
+                                                        {!clinic.isActive
+                                                            ? ` (${t.inactive})`
+                                                            : ""}
+                                                    </option>
+                                                ))}
+                                            </select>
+
+                                            <ChevronDown
+                                                size={16}
+                                                className={cn(
+                                                    "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
+                                                    isRtl ? "left-3" : "right-3"
+                                                )}
+                                            />
+                                        </div>
+                                    </Field>
+
+                                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                                        <Field label={t.basePrice}>
+                                            <input
+                                                required
+                                                type="number"
+                                                min="0"
+                                                max="9999999999.99"
+                                                step="0.01"
+                                                inputMode="decimal"
+                                                value={serviceForm.basePrice}
+                                                onChange={(event) =>
+                                                    setServiceForm((current) => ({
+                                                        ...current,
+                                                        basePrice: event.target.value,
+                                                    }))
+                                                }
+                                                placeholder="0.00"
+                                                className={cn(
+                                                    inputClass,
+                                                    "font-mono text-left"
+                                                )}
+                                                dir="ltr"
+                                            />
+                                        </Field>
+
+                                        <Field label={t.vat}>
+                                            <div className="relative">
+                                                <select
+                                                    value={serviceForm.vatRate}
+                                                    onChange={(event) =>
+                                                        setServiceForm((current) => ({
+                                                            ...current,
+                                                            vatRate: Number(
+                                                                event.target.value
+                                                            ) as 0 | 15,
+                                                        }))
+                                                    }
+                                                    className={cn(
+                                                        inputClass,
+                                                        "appearance-none pe-10"
+                                                    )}
+                                                >
+                                                    <option value={15}>
+                                                        {t.standardVat}
+                                                    </option>
+                                                    <option value={0}>
+                                                        {t.exemptVat}
+                                                    </option>
+                                                </select>
+
+                                                <ChevronDown
+                                                    size={16}
+                                                    className={cn(
+                                                        "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
+                                                        isRtl ? "left-3" : "right-3"
+                                                    )}
+                                                />
+                                            </div>
+                                        </Field>
+                                    </div>
+
+                                    <div className="rounded-2xl border border-teal-100 bg-gradient-to-br from-teal-50/80 to-cyan-50/50 p-4 dark:border-teal-900 dark:from-teal-950/30 dark:to-cyan-950/20">
+                                        <div className="mb-4 flex items-center gap-2">
+                                            <div className="grid h-9 w-9 place-items-center rounded-xl bg-white text-teal-700 shadow-sm dark:bg-slate-900 dark:text-teal-400">
+                                                <CircleDollarSign size={19} />
+                                            </div>
+
+                                            <div>
+                                                <p className="text-sm font-bold text-slate-800 dark:text-white">
+                                                    {t.billing}
+                                                </p>
+
+                                                <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                    {t.vatNote}
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        <div className="space-y-3">
+                                            <div className="flex items-center justify-between gap-3 text-sm">
+                                                <span className="text-slate-600 dark:text-slate-300">
+                                                    {t.basePrice}
+                                                </span>
+
+                                                <span className="font-semibold tabular-nums text-slate-800 dark:text-white">
+                                                    {validBaseAmount
+                                                        ? money(baseAmount, locale)
+                                                        : "—"}{" "}
+                                                    {t.sar}
+                                                </span>
+                                            </div>
+
+                                            <div className="flex items-center justify-between gap-3 text-sm">
+                                                <span className="text-slate-600 dark:text-slate-300">
+                                                    {t.taxAmount} ({serviceForm.vatRate}%)
+                                                </span>
+
+                                                <span className="font-semibold tabular-nums text-slate-800 dark:text-white">
+                                                    {validBaseAmount
+                                                        ? money(vatAmount, locale)
+                                                        : "—"}{" "}
+                                                    {t.sar}
+                                                </span>
+                                            </div>
+
+                                            <div className="border-t border-teal-200 pt-3 dark:border-teal-900">
+                                                <Field label={t.totalPrice}>
+                                                    <input
+                                                        type="text"
+                                                        readOnly
+                                                        disabled
+                                                        aria-label={t.totalPrice}
+                                                        value={
+                                                            validBaseAmount
+                                                                ? `${money(totalAmount, locale)} ${t.sar}`
+                                                                : ""
+                                                        }
+                                                        placeholder="0.00"
+                                                        className={cn(
+                                                            inputClass,
+                                                            "border-teal-200 bg-white font-bold text-teal-700 dark:border-teal-900 dark:bg-slate-900 dark:text-teal-400"
+                                                        )}
+                                                    />
+                                                </Field>
+                                            </div>
                                         </div>
                                     </div>
-                                </div>
 
-                                <div className="flex flex-col-reverse gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end dark:border-slate-800">
-                                    <button
-                                        type="button"
-                                        onClick={closeModal}
-                                        className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
-                                    >
-                                        {t.cancel}
-                                    </button>
+                                    <div className="flex flex-col-reverse gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end dark:border-slate-800">
+                                        <button
+                                            type="button"
+                                            onClick={closeModal}
+                                            className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                        >
+                                            {t.cancel}
+                                        </button>
 
-                                    <button
-                                        type="submit"
-                                        disabled={
-                                            !validBaseAmount ||
-                                            (!editingService && activeClinics.length === 0)
-                                        }
-                                        className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
-                                    >
-                                        {editingService ? t.saveChanges : t.saveService}
-                                    </button>
-                                </div>
-                            </form>
-                        )}
-                    </section>
-                </div>
-            )
-            }
+                                        <button
+                                            type="submit"
+                                            disabled={
+                                                !validBaseAmount ||
+                                                (!editingService &&
+                                                    activeClinics.length === 0)
+                                            }
+                                            className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            {editingService
+                                                ? t.saveChanges
+                                                : t.saveService}
+                                        </button>
+                                    </div>
+                                </form>
+                            )}
+                        </motion.section>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {
                 statusTarget && (
                     <div
-                        className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4 backdrop-blur-[3px]"
+                        className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
                         onMouseDown={(event) => {
                             if (event.target === event.currentTarget) {
                                 closeStatusModal();
@@ -2561,7 +2668,7 @@ export default function ClinicsServicesPage({ initialLocale,
 
             {deleteTarget && (
                 <div
-                    className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4 backdrop-blur-[3px]"
+                    className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
                     onMouseDown={(event) => {
                         if (event.target === event.currentTarget) closeDeleteModal();
                     }}
