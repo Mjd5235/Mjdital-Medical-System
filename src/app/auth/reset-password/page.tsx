@@ -1,4 +1,4 @@
-
+// app/auth/reset-password/page.tsx
 "use client";
 
 import {
@@ -7,6 +7,7 @@ import {
     useTransition,
     type FormEvent,
 } from "react";
+import { useRouter } from "next/navigation";
 import {
     Check,
     Circle,
@@ -22,7 +23,7 @@ import { LanguageToggle } from "@/components/portal/language-toggle";
 import { ThemeToggle } from "@/components/portal/theme-toggle";
 import type { Locale } from "@/lib/i18n/types";
 import {
-    resetDoctorPasswordAction,
+    resetPasswordAction,
     type ResetPasswordInput,
 } from "./actions";
 
@@ -30,7 +31,7 @@ const translations = {
     en: {
         title: "Set a New Password",
         subtitle:
-            "Secure your account before accessing your medical portal.",
+            "Secure your account before accessing your portal.",
         securityTitle: "First-time Login Security Requirement:",
         securityDescription:
             "Please establish your permanent account password.",
@@ -41,8 +42,15 @@ const translations = {
         case: "Uppercase and lowercase letters",
         number: "Includes a number",
         special: "Includes a special character",
+        requirements: "Password requirements",
+        strength: "Password strength",
+        strengthWeak: "Weak",
+        strengthFair: "Fair",
+        strengthGood: "Good",
+        strengthStrong: "Strong",
         update: "Update Password & Access Portal",
         updating: "Updating Password...",
+        redirecting: "Redirecting to your portal...",
         encrypted: "Your password is encrypted and securely stored.",
         required: "Please complete all password fields.",
         invalidCurrent: "Enter your current temporary password.",
@@ -58,7 +66,7 @@ const translations = {
     },
     ar: {
         title: "تعيين كلمة مرور جديدة",
-        subtitle: "قم بتأمين حسابك قبل الوصول إلى بوابة الطبيب.",
+        subtitle: "قم بتأمين حسابك قبل الوصول إلى بوابتك.",
         securityTitle: "متطلب أمني لتسجيل الدخول لأول مرة:",
         securityDescription: "يرجى تعيين كلمة مرور دائمة لحسابك.",
         currentPassword: "كلمة المرور المؤقتة الحالية",
@@ -68,8 +76,15 @@ const translations = {
         case: "أحرف إنجليزية كبيرة وصغيرة",
         number: "تحتوي على رقم",
         special: "تحتوي على رمز خاص",
+        requirements: "متطلبات كلمة المرور",
+        strength: "قوة كلمة المرور",
+        strengthWeak: "ضعيفة",
+        strengthFair: "مقبولة",
+        strengthGood: "جيدة",
+        strengthStrong: "قوية",
         update: "تحديث كلمة المرور والدخول للبوابة",
         updating: "جارٍ تحديث كلمة المرور...",
+        redirecting: "جارٍ التحويل إلى بوابتك...",
         encrypted: "يتم تشفير كلمة المرور وتخزينها بشكل آمن.",
         required: "يرجى تعبئة جميع حقول كلمات المرور.",
         invalidCurrent: "يرجى إدخال كلمة المرور المؤقتة الحالية.",
@@ -120,6 +135,49 @@ function isValidPassword(password: string): boolean {
         Object.values(checks).every(Boolean) &&
         password.length <= 128 &&
         new TextEncoder().encode(password).length <= 256
+    );
+}
+
+/** 0 = empty, 1 = weak, 2 = fair, 3 = good, 4 = strong */
+function getStrengthLevel(password: string): 0 | 1 | 2 | 3 | 4 {
+    if (password.length === 0) return 0;
+
+    const checks = getPasswordChecks(password);
+
+    const points =
+        Number(checks.minimum) +
+        Number(checks.case) +
+        Number(checks.number) +
+        Number(checks.special) +
+        (password.length >= 16 ? 1 : 0);
+
+    if (points <= 1) return 1;
+    if (points === 2) return 2;
+    if (points === 3) return 3;
+
+    return 4;
+}
+
+const STRENGTH_SEGMENT_STYLES: Record<1 | 2 | 3 | 4, string> = {
+    1: "bg-rose-500",
+    2: "bg-amber-500",
+    3: "bg-teal-400",
+    4: "bg-teal-500 shadow-[0_0_10px_rgba(20,184,166,0.55)]",
+};
+
+const STRENGTH_TEXT_STYLES: Record<1 | 2 | 3 | 4, string> = {
+    1: "text-rose-500",
+    2: "text-amber-500",
+    3: "text-teal-500 dark:text-teal-300",
+    4: "text-teal-600 dark:text-teal-300",
+};
+
+function isSafeInternalPath(path: string | undefined): path is string {
+    return (
+        typeof path === "string" &&
+        path.startsWith("/") &&
+        !path.startsWith("//") &&
+        !path.includes("\\")
     );
 }
 
@@ -192,13 +250,16 @@ function PasswordInput({
     );
 }
 
-export default function DoctorResetPasswordPage() {
+export default function ResetPasswordPage() {
+    const router = useRouter();
+
     const [locale, setLocale] = useState<Locale>("ar");
     const [values, setValues] =
         useState<ResetPasswordInput>(initialValues);
     const [visibility, setVisibility] =
         useState<PasswordVisibility>(initialVisibility);
     const [error, setError] = useState<string | null>(null);
+    const [isRedirecting, setIsRedirecting] = useState(false);
     const [isPending, startTransition] = useTransition();
 
     useEffect(() => {
@@ -222,8 +283,17 @@ export default function DoctorResetPasswordPage() {
 
     const t = translations[locale];
     const isRtl = locale === "ar";
+    const isBusy = isPending || isRedirecting;
 
     const checks = getPasswordChecks(values.newPassword);
+    const strengthLevel = getStrengthLevel(values.newPassword);
+
+    const strengthLabels = {
+        1: t.strengthWeak,
+        2: t.strengthFair,
+        3: t.strengthGood,
+        4: t.strengthStrong,
+    } as const;
 
     const requirements = [
         { key: "minimum", label: t.minimum, valid: checks.minimum },
@@ -252,11 +322,8 @@ export default function DoctorResetPasswordPage() {
     }
 
     function validateForm(): string | null {
-        const {
-            currentPassword,
-            newPassword,
-            confirmPassword,
-        } = values;
+        const { currentPassword, newPassword, confirmPassword } =
+            values;
 
         if (!currentPassword || !newPassword || !confirmPassword) {
             return t.required;
@@ -286,12 +353,16 @@ export default function DoctorResetPasswordPage() {
         return null;
     }
 
-    function handleSubmit(
-        event: FormEvent<HTMLFormElement>,
-    ): void {
+    function navigateTo(path: string): void {
+        setIsRedirecting(true);
+        router.replace(path);
+        router.refresh();
+    }
+
+    function handleSubmit(event: FormEvent<HTMLFormElement>): void {
         event.preventDefault();
 
-        if (isPending) return;
+        if (isBusy) return;
 
         const validationError = validateForm();
 
@@ -310,11 +381,28 @@ export default function DoctorResetPasswordPage() {
 
         startTransition(async () => {
             try {
-                const result = await resetDoctorPasswordAction(payload);
+                const result = await resetPasswordAction(payload);
 
-                if (!result.success) {
-                    setError(result.error ?? t.unexpected);
+                if (result.success && isSafeInternalPath(result.redirectTo)) {
+                    navigateTo(result.redirectTo);
+                    return;
                 }
+
+                if (
+                    result.code === "ALREADY_COMPLETED" &&
+                    isSafeInternalPath(result.redirectTo)
+                ) {
+                    navigateTo(result.redirectTo);
+                    return;
+                }
+
+                if (result.code === "UNAUTHORIZED") {
+                    setError(result.error ?? t.unexpected);
+                    router.replace("/");
+                    return;
+                }
+
+                setError(result.error ?? t.unexpected);
             } catch (caught) {
                 if (
                     caught instanceof Error &&
@@ -401,7 +489,7 @@ export default function DoctorResetPasswordPage() {
                         showLabel={t.show}
                         hideLabel={t.hide}
                         autoComplete="current-password"
-                        disabled={isPending}
+                        disabled={isBusy}
                     />
 
                     <div className="space-y-3">
@@ -419,16 +507,52 @@ export default function DoctorResetPasswordPage() {
                             showLabel={t.show}
                             hideLabel={t.hide}
                             autoComplete="new-password"
-                            disabled={isPending}
+                            disabled={isBusy}
                         />
 
                         <div
+                            className="space-y-2"
+                            role="status"
+                            aria-live="polite"
+                            aria-label={t.strength}
+                        >
+                            <div className="flex items-center gap-2">
+                                <div className="grid flex-1 grid-cols-4 gap-1.5">
+                                    {([1, 2, 3, 4] as const).map(
+                                        (segment) => (
+                                            <span
+                                                key={segment}
+                                                className={`h-1.5 rounded-full transition-all duration-300 ${strengthLevel >= segment
+                                                    ? STRENGTH_SEGMENT_STYLES[
+                                                    strengthLevel as 1 | 2 | 3 | 4
+                                                    ]
+                                                    : "bg-slate-200 dark:bg-slate-700/70"
+                                                    }`}
+                                            />
+                                        ),
+                                    )}
+                                </div>
+
+                                <span
+                                    className={`min-w-[3.5rem] text-end text-xs font-semibold ${strengthLevel === 0
+                                        ? "text-transparent"
+                                        : STRENGTH_TEXT_STYLES[
+                                        strengthLevel as 1 | 2 | 3 | 4
+                                        ]
+                                        }`}
+                                >
+                                    {strengthLevel === 0
+                                        ? "\u00A0"
+                                        : strengthLabels[
+                                        strengthLevel as 1 | 2 | 3 | 4
+                                        ]}
+                                </span>
+                            </div>
+                        </div>
+
+                        <div
                             className="space-y-2 py-0.5"
-                            aria-label={
-                                isRtl
-                                    ? "متطلبات كلمة المرور"
-                                    : "Password requirements"
-                            }
+                            aria-label={t.requirements}
                         >
                             {requirements.map((requirement) => (
                                 <div
@@ -474,7 +598,7 @@ export default function DoctorResetPasswordPage() {
                         showLabel={t.show}
                         hideLabel={t.hide}
                         autoComplete="new-password"
-                        disabled={isPending}
+                        disabled={isBusy}
                     />
 
                     {values.confirmPassword.length > 0 &&
@@ -504,16 +628,16 @@ export default function DoctorResetPasswordPage() {
 
                     <button
                         type="submit"
-                        disabled={isPending}
+                        disabled={isBusy}
                         className="mt-1 flex h-[53px] w-full items-center justify-center gap-2 rounded-xl bg-teal-600 px-4 text-base font-bold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-65 sm:text-[18px] dark:bg-[#079e98] dark:hover:bg-teal-600"
                     >
-                        {isPending ? (
+                        {isBusy ? (
                             <>
                                 <LoaderCircle
                                     size={20}
                                     className="animate-spin"
                                 />
-                                {t.updating}
+                                {isRedirecting ? t.redirecting : t.updating}
                             </>
                         ) : (
                             t.update

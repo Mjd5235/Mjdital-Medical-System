@@ -1,3 +1,12 @@
+// proxy.ts
+// Next.js 16: keep this file name and export (`proxy`).
+// Next.js 15: rename the file to middleware.ts. The default export below is picked up
+// as the middleware, and Prisma requires the Node.js runtime for it.
+//
+// Pages in use (and the only ones handled here):
+//   /auth/reset-password     -> forced password change (all roles)
+//   /auth/inactive-account   -> explicitly disabled accounts (?portal=admin|reception|doctor)
+
 import { NextResponse, type NextRequest } from "next/server";
 import { UserRole } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
@@ -20,15 +29,85 @@ import {
 } from "@/lib/i18n/get-locale";
 import { isLocale, LOCALE_COOKIE } from "@/lib/i18n/types";
 
-const RESET_PATH = "/doctor/reset-password";
-const DOCTOR_HOME = "/doctor/dashboard";
-const INACTIVE_PATH = "/doctor/inactive-account";
+const RESET_PATH = "/auth/reset-password";
+const INACTIVE_PATH = "/auth/inactive-account";
+
+/**
+ * Query parameter carrying the origin portal (admin | reception | doctor)
+ * to the inactive-account page.
+ */
+const ORIGIN_PORTAL_PARAM = "portal";
+
+/**
+ * Remembers the portal whose login page the user last opened. It is what lets
+ * pages that live outside any portal (/auth/...) know where the user came from.
+ * It is only a UI hint: it is validated against the user's role before use.
+ */
+const ORIGIN_PORTAL_COOKIE = "mjdital-origin-portal";
+
+/**
+ * Used only when no portal can be derived at all.
+ */
+const FALLBACK_LOGIN_PORTAL: Portal = "doctor";
+
+const ALL_PORTALS = ["admin", "reception", "doctor"] as Portal[];
 
 type AccountStatus = {
   isActive: boolean;
   mustChangePassword: boolean;
   doctor: { isActive: boolean } | null;
 };
+
+type AccountLookup =
+  | { ok: true; account: AccountStatus | null }
+  | { ok: false };
+
+function hasSession(
+  session: SessionUser | null,
+): session is SessionUser {
+  return Boolean(session && session.organizationId);
+}
+
+/**
+ * Validates an untrusted value against the portal allow-list.
+ */
+function parsePortal(value: string | null | undefined): Portal | null {
+  if (!value) return null;
+
+  const normalized = value.trim().toLowerCase();
+
+  return (ALL_PORTALS as string[]).includes(normalized)
+    ? (normalized as Portal)
+    : null;
+}
+
+/**
+ * Resolves the portal the user belongs to / signed in from.
+ * Priority:
+ *   1. the portal of the current URL (if the role may use it)
+ *   2. the portal whose login page the user opened (cookie, if the role may use it)
+ *   3. the first portal the role is allowed to use
+ *   4. the fallback portal
+ */
+function resolveOriginPortal(
+  request: NextRequest,
+  role: SessionUser["role"],
+  requestPortal: Portal | null,
+): Portal {
+  const candidates: Array<Portal | null> = [
+    requestPortal,
+    parsePortal(request.cookies.get(ORIGIN_PORTAL_COOKIE)?.value),
+    ...ALL_PORTALS,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate && portalAllowsRole(candidate, role)) {
+      return candidate;
+    }
+  }
+
+  return FALLBACK_LOGIN_PORTAL;
+}
 
 async function readSession(
   request: NextRequest,
@@ -52,15 +131,23 @@ function applyLocaleCookie(
 
   if (isLocale(stored)) return;
 
-  response.cookies.set(
-    LOCALE_COOKIE,
-    defaultLocaleForPortal(portal),
-    {
-      path: "/",
-      sameSite: "lax",
-      maxAge: 60 * 60 * 24 * 365,
-    },
-  );
+  response.cookies.set(LOCALE_COOKIE, defaultLocaleForPortal(portal), {
+    path: "/",
+    sameSite: "lax",
+    maxAge: 60 * 60 * 24 * 365,
+  });
+}
+
+function applyOriginPortalCookie(
+  response: NextResponse,
+  portal: Portal,
+): void {
+  response.cookies.set(ORIGIN_PORTAL_COOKIE, portal, {
+    path: "/",
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 60 * 60 * 24 * 30,
+  });
 }
 
 function withRequestContext(
@@ -71,6 +158,7 @@ function withRequestContext(
 
   headers.set("x-pathname", request.nextUrl.pathname);
 
+  // Never trust identity headers coming from the client.
   headers.delete("x-organization-id");
   headers.delete("x-user-role");
   headers.delete("x-user-id");
@@ -84,19 +172,26 @@ function withRequestContext(
   return headers;
 }
 
+function noStore(response: NextResponse): NextResponse {
+  response.headers.set("Cache-Control", "no-store");
+  return response;
+}
+
 function redirectTo(
   request: NextRequest,
   pathname: string,
   portal: Portal | null,
-  next?: string,
+  params?: Record<string, string>,
 ): NextResponse {
   const url = request.nextUrl.clone();
 
   url.pathname = pathname;
   url.search = "";
 
-  if (next) {
-    url.searchParams.set("next", next);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
   }
 
   const response = NextResponse.redirect(url);
@@ -106,27 +201,45 @@ function redirectTo(
   return response;
 }
 
-/**
- * Sends a deactivated account to /doctor/inactive-account.
- *
- * The session cookie is intentionally kept: the inactive page itself verifies
- * (against the database) that the signed-in account really is inactive, which
- * is what restricts that page to redirected users only.
- */
-function redirectToInactive(
+/** Priority 1: every account with a temporary password goes to the reset page. */
+function redirectToReset(
   request: NextRequest,
   portal: Portal | null,
 ): NextResponse {
-  const response = redirectTo(request, INACTIVE_PATH, portal);
-
-  response.headers.set("Cache-Control", "no-store");
-
-  return response;
+  return noStore(redirectTo(request, RESET_PATH, portal));
 }
 
 /**
- * Sends an authenticated session whose account no longer exists back to the
- * login page with the stale cookie cleared (prevents redirect loops).
+ * Priority 2: accounts explicitly disabled by an administrator.
+ * Always appends the origin portal (?portal=admin|reception|doctor) so the
+ * inactive page knows which login page to send the user back to.
+ */
+function redirectToInactive(
+  request: NextRequest,
+  role: SessionUser["role"],
+  requestPortal: Portal | null,
+): NextResponse {
+  const origin = resolveOriginPortal(request, role, requestPortal);
+
+  return noStore(
+    redirectTo(request, INACTIVE_PATH, origin, {
+      [ORIGIN_PORTAL_PARAM]: origin,
+    }),
+  );
+}
+
+/** Priority 3: active account with a permanent password goes to its own dashboard. */
+function redirectToRoleHome(
+  request: NextRequest,
+  role: SessionUser["role"],
+  portal: Portal | null,
+): NextResponse {
+  return noStore(redirectTo(request, homePathForRole(role), portal));
+}
+
+/**
+ * Session points to an account that no longer exists: back to login with the
+ * stale cookie cleared (prevents redirect loops).
  */
 function redirectToLoginClearingSession(
   request: NextRequest,
@@ -135,9 +248,8 @@ function redirectToLoginClearingSession(
   const response = redirectTo(request, portalLoginPath(portal), portal);
 
   response.cookies.delete(SESSION_COOKIE);
-  response.headers.set("Cache-Control", "no-store");
 
-  return response;
+  return noStore(response);
 }
 
 function verificationUnavailable(): NextResponse {
@@ -154,22 +266,29 @@ function verificationUnavailable(): NextResponse {
 
 async function lookupAccount(
   session: SessionUser,
-): Promise<AccountStatus | null> {
-  return prisma.user.findFirst({
-    where: {
-      id: session.userId,
-      organizationId: session.organizationId,
-    },
-    select: {
-      isActive: true,
-      mustChangePassword: true,
-      doctor: {
-        select: {
-          isActive: true,
+): Promise<AccountLookup> {
+  try {
+    const account = await prisma.user.findFirst({
+      where: {
+        id: session.userId,
+        organizationId: session.organizationId,
+      },
+      select: {
+        isActive: true,
+        mustChangePassword: true,
+        doctor: {
+          select: {
+            isActive: true,
+          },
         },
       },
-    },
-  });
+    });
+
+    return { ok: true, account };
+  } catch (error) {
+    console.error("[proxy] Account status lookup failed", error);
+    return { ok: false };
+  }
 }
 
 function isAccountInactive(
@@ -189,67 +308,150 @@ export async function proxy(
   const portal = portalFromPathname(pathname);
   const session = await readSession(request);
 
-  const passThrough = (): NextResponse => {
+  const passThrough = (
+    localePortal: Portal | null = portal,
+  ): NextResponse => {
     const response = NextResponse.next({
       request: {
         headers: withRequestContext(request, session),
       },
     });
 
-    applyLocaleCookie(request, response, portal);
+    applyLocaleCookie(request, response, localePortal);
+
+    // Remember which portal's login page the user opened, so that pages
+    // outside the portals (/auth/inactive-account) can send them back to it.
+    if (portal && pathname === portalLoginPath(portal)) {
+      applyOriginPortalCookie(response, portal);
+    }
 
     return response;
   };
 
   // ---------------------------------------------------------------------
-  // /doctor/inactive-account is only reachable by an authenticated account
-  // that is genuinely inactive (i.e. someone who was redirected here).
-  // Everyone else is sent to /doctor/login.
+  // /auth/inactive-account
+  // Only reachable by an authenticated account that was explicitly disabled
+  // (isActive/doctor.isActive false AND mustChangePassword false).
+  //   - no session                   -> login of the portal named in ?portal
+  //   - deleted account              -> login (stale cookie cleared)
+  //   - temporary password pending   -> reset page (activation flow)
+  //   - active account               -> own dashboard
+  // The ?portal parameter is always normalised to the user's origin portal,
+  // so it cannot be spoofed or left missing.
   // ---------------------------------------------------------------------
   if (pathname === INACTIVE_PATH) {
-    const toLogin = (): NextResponse =>
-      redirectTo(request, portalLoginPath("doctor"), "doctor");
+    const requested = parsePortal(
+      request.nextUrl.searchParams.get(ORIGIN_PORTAL_PARAM),
+    );
 
-    if (!session || !session.organizationId) {
-      return toLogin();
+    if (!hasSession(session)) {
+      const loginPortal =
+        requested ??
+        parsePortal(request.cookies.get(ORIGIN_PORTAL_COOKIE)?.value) ??
+        FALLBACK_LOGIN_PORTAL;
+
+      return redirectTo(
+        request,
+        portalLoginPath(loginPortal),
+        loginPortal,
+      );
     }
 
-    let account: AccountStatus | null;
+    const origin = resolveOriginPortal(request, session.role, null);
+    const lookup = await lookupAccount(session);
 
-    try {
-      account = await lookupAccount(session);
-    } catch (error) {
-      console.error("[proxy] Account status lookup failed", error);
+    if (!lookup.ok) return verificationUnavailable();
 
-      return verificationUnavailable();
+    const { account } = lookup;
+
+    if (!account) {
+      return redirectToLoginClearingSession(request, origin);
     }
 
-    if (!account || !isAccountInactive(session.role, account)) {
-      return toLogin();
+    if (account.mustChangePassword) {
+      return redirectToReset(request, origin);
     }
 
-    const response = passThrough();
+    if (!isAccountInactive(session.role, account)) {
+      return redirectToRoleHome(request, session.role, origin);
+    }
 
-    response.headers.set("Cache-Control", "no-store");
+    if (requested !== origin) {
+      // Missing / wrong parameter: rewrite the URL once with the right value.
+      return redirectToInactive(request, session.role, null);
+    }
 
-    return response;
+    return noStore(passThrough(origin));
   }
 
+  // ---------------------------------------------------------------------
+  // /auth/reset-password (all roles).
+  // Reachable only while the database record has mustChangePassword === true.
+  // This also covers disabled-but-pending accounts: changing the password for
+  // the first time is what activates them.
+  //   - no session / deleted account       -> login
+  //   - password already permanent
+  //       - explicitly disabled            -> inactive page (?portal=...)
+  //       - active                         -> own dashboard
+  // ---------------------------------------------------------------------
+  if (pathname === RESET_PATH) {
+    if (!hasSession(session)) {
+      const loginPortal =
+        parsePortal(request.cookies.get(ORIGIN_PORTAL_COOKIE)?.value) ??
+        FALLBACK_LOGIN_PORTAL;
+
+      return redirectTo(
+        request,
+        portalLoginPath(loginPortal),
+        loginPortal,
+      );
+    }
+
+    const origin = resolveOriginPortal(request, session.role, null);
+    const lookup = await lookupAccount(session);
+
+    if (!lookup.ok) return verificationUnavailable();
+
+    const { account } = lookup;
+
+    if (!account) {
+      return redirectToLoginClearingSession(request, origin);
+    }
+
+    if (!account.mustChangePassword) {
+      if (isAccountInactive(session.role, account)) {
+        return redirectToInactive(request, session.role, null);
+      }
+
+      return redirectToRoleHome(request, session.role, origin);
+    }
+
+    return noStore(passThrough(origin));
+  }
+
+  // Anything outside the three portals (and the pages above) is not guarded here.
   if (!portal) {
     return passThrough();
   }
 
   const isLogin = pathname === portalLoginPath(portal);
-  const isReset = pathname === RESET_PATH;
 
-  if (!session || !session.organizationId) {
-    if (isLogin || isPublicPath(pathname)) {
+  // Public, non-login routes (sign-out, locale endpoints, ...) are always
+  // reachable so that nobody is ever trapped.
+  if (isPublicPath(pathname) && !isLogin) {
+    return passThrough();
+  }
+
+  // ---------------------------------------------------------------------
+  // No session: only the login page is reachable.
+  // ---------------------------------------------------------------------
+  if (!hasSession(session)) {
+    if (isLogin) {
       return passThrough();
     }
 
     const next =
-      pathname.startsWith(`/${portal}/`) &&
-        !pathname.includes("//")
+      pathname.startsWith(`/${portal}/`) && !pathname.includes("//")
         ? pathname
         : undefined;
 
@@ -257,87 +459,68 @@ export async function proxy(
       request,
       portalLoginPath(portal),
       portal,
-      next,
+      next ? { next } : undefined,
     );
   }
 
-  if (!portalAllowsRole(portal, session.role)) {
-    if (isLogin || isPublicPath(pathname)) {
-      return passThrough();
-    }
+  // The database is the source of truth so that every change (deactivation,
+  // temporary password issued, ...) takes effect immediately, even for
+  // sessions issued earlier.
+  const lookup = await lookupAccount(session);
 
-    return redirectTo(
-      request,
-      homePathForRole(session.role),
-      portal,
-    );
-  }
+  if (!lookup.ok) return verificationUnavailable();
 
-  // ---------------------------------------------------------------------
-  // Account activity enforcement (all authenticated roles).
-  // The database is the source of truth so that deactivation takes effect
-  // immediately, even for sessions that were issued before the suspension.
-  // ---------------------------------------------------------------------
-  let account: AccountStatus | null;
-
-  try {
-    account = await lookupAccount(session);
-  } catch (error) {
-    console.error("[proxy] Account status lookup failed", error);
-
-    return verificationUnavailable();
-  }
+  const { account } = lookup;
 
   if (!account) {
-    // The session points to an account that no longer exists.
-    if (isLogin || isPublicPath(pathname)) {
+    if (isLogin) {
       return passThrough();
     }
 
     return redirectToLoginClearingSession(request, portal);
   }
 
+  // ---------------------------------------------------------------------
+  // Priority 1: temporary password -> reset page, whatever portal was
+  // requested and whatever the isActive flag says (pending accounts activate
+  // themselves by changing the password).
+  // ---------------------------------------------------------------------
+  if (account.mustChangePassword) {
+    return redirectToReset(request, portal);
+  }
+
+  // ---------------------------------------------------------------------
+  // Priority 2: mustChangePassword === false and the account is disabled
+  // -> explicitly disabled by an admin -> static inactive page, carrying the
+  // origin portal (?portal=admin|reception|doctor).
+  // The login page stays reachable (no redirect loop).
+  // ---------------------------------------------------------------------
   if (isAccountInactive(session.role, account)) {
-    // Public/login routes stay reachable (no redirect loop); every
-    // protected route is intercepted and sent to /doctor/inactive-account.
-    if (isLogin || isPublicPath(pathname)) {
+    if (isLogin) {
       return passThrough();
     }
 
-    return redirectToInactive(request, portal);
+    return redirectToInactive(request, session.role, portal);
   }
 
   // ---------------------------------------------------------------------
-  // Active account: normal flow.
+  // Priority 3: active account with a permanent password.
+  // Block cross-portal access (e.g. a receptionist opening /admin) by sending
+  // the user to the home of their own role.
   // ---------------------------------------------------------------------
-  if (session.role === UserRole.DOCTOR) {
-    if (account.mustChangePassword) {
-      if (isReset) {
-        return passThrough();
-      }
-
-      return redirectTo(request, RESET_PATH, portal);
-    }
-
-    if (isReset) {
-      return redirectTo(request, DOCTOR_HOME, portal);
-    }
+  if (!portalAllowsRole(portal, session.role)) {
+    return redirectToRoleHome(request, session.role, portal);
   }
 
+  // Already signed in: the login page just forwards to the portal home.
   if (isLogin) {
-    return redirectTo(
-      request,
-      portalHomePath(portal),
-      portal,
-    );
-  }
-
-  if (isPublicPath(pathname)) {
-    return passThrough();
+    return redirectTo(request, portalHomePath(portal), portal);
   }
 
   return passThrough();
 }
+
+export default proxy;
 
 export const config = {
   matcher: [

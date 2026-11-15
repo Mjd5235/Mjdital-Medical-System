@@ -1,14 +1,71 @@
+// app/auth/inactive-account/page.tsx
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, Headset, UserRound } from "lucide-react";
 import { BrandLogo } from "@/components/brand/logo";
 import { LanguageToggle } from "@/components/portal/language-toggle";
 import { ThemeToggle } from "@/components/portal/theme-toggle";
 import type { Locale } from "@/lib/i18n/types";
 
-const LOGIN_PATH = "/doctor/login";
+/**
+ * Allow-list of origin portals -> login routes.
+ * Anything not in this map is ignored, so neither the `portal` query
+ * parameter nor the cookie can ever be used as an open redirect.
+ */
+const LOGIN_PATHS = {
+    admin: "/admin/login",
+    reception: "/reception/login",
+    doctor: "/doctor/login",
+} as const;
+
+type PortalKey = keyof typeof LOGIN_PATHS;
+
+const DEFAULT_LOGIN_PATH: string = LOGIN_PATHS.doctor;
+
+/** Set by proxy.ts when the user opens a portal's login page. */
+const ORIGIN_PORTAL_COOKIE = "mjdital-origin-portal";
+
+function isPortalKey(value: string): value is PortalKey {
+    return Object.prototype.hasOwnProperty.call(LOGIN_PATHS, value);
+}
+
+function readOriginPortalCookie(): string | null {
+    if (typeof document === "undefined") return null;
+
+    const entry = document.cookie
+        .split(";")
+        .map((part) => part.trim())
+        .find((part) => part.startsWith(`${ORIGIN_PORTAL_COOKIE}=`));
+
+    if (!entry) return null;
+
+    try {
+        return decodeURIComponent(entry.slice(ORIGIN_PORTAL_COOKIE.length + 1));
+    } catch {
+        return null;
+    }
+}
+
+function toPortalKey(raw: string | null): PortalKey | null {
+    const key = raw?.trim().toLowerCase();
+
+    return key && isPortalKey(key) ? key : null;
+}
+
+/**
+ * Priority: ?portal= query (set by the proxy) -> origin-portal cookie -> default.
+ */
+function resolveLoginPath(
+    queryPortal: string | null,
+    cookiePortal: string | null,
+): string {
+    const key = toPortalKey(queryPortal) ?? toPortalKey(cookiePortal);
+
+    return key ? LOGIN_PATHS[key] : DEFAULT_LOGIN_PATH;
+}
+
 const SUPPORT_EMAIL =
     process.env.NEXT_PUBLIC_SUPPORT_EMAIL ?? "support@mjdital.com";
 
@@ -74,8 +131,9 @@ function StatusIcon({ label }: { label: string }) {
     );
 }
 
-export default function AccountInactivePage() {
+function AccountInactiveContent() {
     const router = useRouter();
+    const searchParams = useSearchParams();
     const [locale, setLocale] = useState<Locale>("ar");
     const [navigating, setNavigating] = useState(false);
 
@@ -112,8 +170,15 @@ export default function AccountInactivePage() {
     function handleBack(): void {
         if (navigating) return;
 
+        // Origin portal: ?portal= (set by the proxy), then the cookie of the
+        // login page the user opened, then the default login route.
+        const loginPath = resolveLoginPath(
+            searchParams.get("portal"),
+            readOriginPortalCookie(),
+        );
+
         setNavigating(true);
-        router.push(LOGIN_PATH);
+        router.push(loginPath);
     }
 
     return (
@@ -208,5 +273,17 @@ export default function AccountInactivePage() {
                 </div>
             </section>
         </main>
+    );
+}
+
+export default function AccountInactivePage() {
+    return (
+        <Suspense
+            fallback={
+                <main className="min-h-screen bg-slate-50 dark:bg-slate-950" />
+            }
+        >
+            <AccountInactiveContent />
+        </Suspense>
     );
 }
