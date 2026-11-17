@@ -417,6 +417,12 @@ model ServicePrice {
 /// - isActive / activatedAt / mustChangePassword: دورة حياة الحساب.
 ///   الحسابات الجديدة من شاشة "Users & Roles" تُنشأ دائماً بـ isActive=false و mustChangePassword=true
 ///   إلى أن يسجّل المستخدم الدخول لأول مرة ويغيّر كلمة المرور (عندها يُضبط activatedAt و isActive=true).
+/// - isSuperAdmin: المدير العام (Super Admin) — أعلى مستوى في التسلسل الهرمي للصلاحيات.
+///   * فقط حسابات ADMIN يمكن أن تكون Super Admin.
+///   * لا يوجد أي مسار في الواجهة أو Server Actions لمنح/سحب هذه الصلاحية (منعاً لتصعيد الصلاحيات)؛
+///     تُضبط من قاعدة البيانات / سكربت التهيئة فقط، مثال:
+///       UPDATE users SET is_super_admin = true WHERE email = 'owner@clinic.sa';
+///   * المدير العادي (isSuperAdmin = false) لا يستطيع إنشاء/تعديل/تعطيل/حذف حسابات ADMIN أو Super Admin.
 model User {
   id                 String    @id @default(uuid()) @db.Uuid
   organizationId     String    @map("organization_id") @db.Uuid
@@ -426,6 +432,7 @@ model User {
   fullNameEn         String    @map("full_name_en")
   mobileNumber       String?   @map("mobile_number") @db.VarChar(20)
   role               UserRole
+  isSuperAdmin       Boolean   @default(false) @map("is_super_admin")
   isActive           Boolean   @default(true) @map("is_active")
   mustChangePassword Boolean   @default(false) @map("must_change_password")
   activatedAt        DateTime? @map("activated_at")
@@ -446,6 +453,7 @@ model User {
   @@index([organizationId, role])
   @@index([organizationId, isActive])
   @@index([organizationId, createdAt])
+  @@index([organizationId, isSuperAdmin])
   @@map("users")
 }
 

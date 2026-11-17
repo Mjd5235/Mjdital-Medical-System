@@ -1,51 +1,5 @@
 "use server";
 
-/**
- * Users & Roles — server actions
- * ------------------------------
- * schema.prisma: NO changes are required. `User` already has `isActive`, `mustChangePassword`,
- * `activatedAt`, `lastLoginAt`, the `@@unique([organizationId, email])` /
- * `@@unique([organizationId, mobileNumber])` constraints and the tenant indexes this module uses.
- *
- * Architecture (mirrors the Doctors module)
- * - Every query and mutation is scoped by `session.organizationId` (strict tenant isolation).
- * - This module only manages ADMIN and RECEPTIONIST accounts. Doctors are managed from the Doctors
- *   module; any other role is invisible and immutable here.
- *
- * Account lifecycle (single source of truth: `deriveStatus`)
- *     PENDING  -> isActive = false AND mustChangePassword = true AND activatedAt IS NULL
- *                 (invited, never completed the first login)
- *     ACTIVE   -> isActive = true
- *     DISABLED -> isActive = false in every other case (manually disabled by an admin)
- *
- *   The old bug ("Disabled" flipping back to "Pending" after the sync) came from deriving the status
- *   ONLY from `activatedAt`. Accounts whose first-login flow never stamped `activatedAt` were shown
- *   as Pending as soon as `isActive` became false. Now:
- *     - Disabling ALWAYS stamps `activatedAt` (if it is still null), so a disabled account can never
- *       be mistaken for a pending one again.
- *     - Pending additionally requires `mustChangePassword = true`.
- *     - Re-activating only flips `isActive = true`.
- *
- * - createUserAction ALWAYS stores `mustChangePassword = true`, `isActive = false`, `activatedAt = null`.
- *   The client can never relax this rule.
- * - FIRST-LOGIN HOOK (lives in your login / change-password flow, never in a client-callable action):
- *
- *     await prisma.user.update({
- *         where: { id: user.id, organizationId: user.organizationId },
- *         data: {
- *             passwordHash,                 // the password the user just chose
- *             mustChangePassword: false,
- *             isActive: true,               // Pending -> Active
- *             activatedAt: user.activatedAt ?? new Date(),
- *             lastLoginAt: new Date(),
- *         },
- *     });
- *
- *   Login must also reject users whose `isActive` is false (Pending users may only reach the
- *   forced password-change screen).
- * - No revalidatePath(): the client component owns its data and applies optimistic updates.
- */
-
 import { Prisma, UserRole } from "@prisma/client";
 import { randomInt } from "node:crypto";
 import { prisma, prismaBase } from "@/lib/db/prisma";
@@ -74,6 +28,8 @@ export interface UserRow {
     email: string;
     mobileNumber: string | null;
     role: ManagedRole;
+    /** Highest tier of the hierarchy. Read-only everywhere in the app. */
+    isSuperAdmin: boolean;
     status: UserAccountStatus;
     isActive: boolean;
     mustChangePassword: boolean;
@@ -97,6 +53,8 @@ export interface GetUsersData {
     page: number;
     pageSize: number;
     totalPages: number;
+    /** Privileges of the signed-in user, re-read from the database on every request. */
+    viewer: { isSuperAdmin: boolean };
 }
 
 export interface CreateUserInput {
@@ -144,6 +102,7 @@ const userSelect = {
     email: true,
     mobileNumber: true,
     role: true,
+    isSuperAdmin: true,
     isActive: true,
     mustChangePassword: true,
     activatedAt: true,
@@ -152,6 +111,36 @@ const userSelect = {
 } satisfies Prisma.UserSelect;
 
 type UserRecord = Prisma.UserGetPayload<{ select: typeof userSelect }>;
+
+/** Minimal shape needed by the hierarchy rules. */
+interface HierarchyTarget {
+    role: UserRole;
+    isSuperAdmin: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Hierarchy rules (single source of truth — the client mirrors them)        */
+/* -------------------------------------------------------------------------- */
+
+/** Admin and Super Admin accounts are "protected": only a Super Admin may act on them. */
+function isProtectedTarget(target: HierarchyTarget): boolean {
+    return target.role === UserRole.ADMIN || target.isSuperAdmin;
+}
+
+/** Only a Super Admin may create Admin accounts or promote a user to Admin. */
+function canAssignRole(actorIsSuperAdmin: boolean, role: ManagedRole): boolean {
+    return actorIsSuperAdmin || role !== UserRole.ADMIN;
+}
+
+/** Whether the actor may edit / disable / re-activate / delete / reset the password of the target. */
+function canManageTarget(actorIsSuperAdmin: boolean, target: HierarchyTarget): boolean {
+    return actorIsSuperAdmin || !isProtectedTarget(target);
+}
+
+const FORBIDDEN_TARGET_MESSAGE =
+    "You do not have permission to manage Admin or Super Admin accounts. Only a Super Admin can.";
+const FORBIDDEN_ROLE_MESSAGE =
+    "Only a Super Admin can create Admin accounts or promote users to the Admin role.";
 
 /* -------------------------------------------------------------------------- */
 /*  Helpers                                                                   */
@@ -222,6 +211,7 @@ function mapUser(user: UserRecord, actorId: string | null): UserRow {
         email: user.email,
         mobileNumber: user.mobileNumber,
         role: user.role as ManagedRole,
+        isSuperAdmin: user.isSuperAdmin,
         status: deriveStatus(user),
         isActive: user.isActive,
         mustChangePassword: user.mustChangePassword,
@@ -307,28 +297,124 @@ function mappedTransactionError<T>(error: unknown): UserActionResult<T> | null {
                 "You cannot delete the account you are currently signed in with.",
                 "CANNOT_DELETE_SELF",
             );
+        case "FORBIDDEN_TARGET":
+            return invalid(FORBIDDEN_TARGET_MESSAGE, "FORBIDDEN_TARGET");
+        case "FORBIDDEN_ROLE_ASSIGNMENT":
+            return invalid(FORBIDDEN_ROLE_MESSAGE, "FORBIDDEN_ROLE_ASSIGNMENT");
+        case "SUPER_ADMIN_ROLE_LOCKED":
+            return invalid(
+                "A Super Admin account always keeps the Admin role.",
+                "SUPER_ADMIN_ROLE_LOCKED",
+            );
         default:
             return null;
     }
 }
 
-async function authorize<T>(
-    action: string,
-): Promise<
-    | { ok: true; organizationId: string; actorId: string | null }
-    | { ok: false; result: UserActionResult<T> }
-> {
-    try {
-        const session = await requirePortalSession("admin");
-        const actorId = (session as unknown as { userId?: string }).userId ?? null;
+/** Security trail for every rejected hierarchy violation (never throws). */
+function reportDenied(action: string, actorId: string, detail: string): void {
+    console.warn(`[${action}] DENIED actor=${actorId} reason=${detail}`);
+}
 
-        return { ok: true, organizationId: session.organizationId, actorId };
+function reportIfDenied(action: string, actorId: string, error: unknown): void {
+    if (error instanceof Error && error.message.startsWith("FORBIDDEN_")) {
+        reportDenied(action, actorId, error.message);
+    }
+}
+
+function forbidden<T>(
+    action: string,
+    actorId: string,
+    code: "FORBIDDEN_TARGET" | "FORBIDDEN_ROLE_ASSIGNMENT",
+): UserActionResult<T> {
+    reportDenied(action, actorId, code);
+
+    return invalid(
+        code === "FORBIDDEN_TARGET" ? FORBIDDEN_TARGET_MESSAGE : FORBIDDEN_ROLE_MESSAGE,
+        code,
+    );
+}
+
+type AuthorizeResult<T> =
+    | { ok: true; organizationId: string; actorId: string; actorIsSuperAdmin: boolean }
+    | { ok: false; result: UserActionResult<T> };
+
+function resolveActorId(session: unknown): string | null {
+    const candidate =
+        (session as { userId?: unknown } | null)?.userId ??
+        (session as { user?: { id?: unknown } | null } | null)?.user?.id;
+
+    return typeof candidate === "string" && validUuid(candidate) ? candidate : null;
+}
+
+/**
+ * Portal guard + hierarchy context. Fails CLOSED: if the acting user cannot be resolved to an
+ * active Admin of the same organisation in the database, nothing is executed.
+ * `isSuperAdmin` is always read from the database, never from the session or the client.
+ */
+async function authorize<T>(action: string): Promise<AuthorizeResult<T>> {
+    let session: Awaited<ReturnType<typeof requirePortalSession>>;
+
+    try {
+        session = await requirePortalSession("admin");
     } catch (error) {
         console.error(`[${action}] Authorization failed`, error);
 
         return {
             ok: false,
             result: invalid("Your session has expired. Sign in and try again.", "UNAUTHORIZED"),
+        };
+    }
+
+    const actorId = resolveActorId(session);
+
+    if (!actorId) {
+        console.error(`[${action}] Authorization failed: the session has no resolvable user id.`);
+
+        return {
+            ok: false,
+            result: invalid("Your session has expired. Sign in and try again.", "UNAUTHORIZED"),
+        };
+    }
+
+    try {
+        const actor = await prisma.user.findFirst({
+            where: {
+                id: actorId,
+                organizationId: session.organizationId,
+                role: UserRole.ADMIN,
+                isActive: true,
+            },
+            select: { id: true, isSuperAdmin: true },
+        });
+
+        if (!actor) {
+            reportDenied(action, actorId, "ACTOR_NOT_AN_ACTIVE_ADMIN");
+
+            return {
+                ok: false,
+                result: invalid(
+                    "Your account is not allowed to manage users.",
+                    "FORBIDDEN",
+                ),
+            };
+        }
+
+        return {
+            ok: true,
+            organizationId: session.organizationId,
+            actorId: actor.id,
+            actorIsSuperAdmin: actor.isSuperAdmin,
+        };
+    } catch (error) {
+        console.error(`[${action}] Actor lookup failed`, error);
+
+        return {
+            ok: false,
+            result: invalid(
+                "The operation could not be completed. Please try again.",
+                "DATABASE_ERROR",
+            ),
         };
     }
 }
@@ -485,6 +571,7 @@ export async function getUsersAction(
         const records = await prisma.user.findMany({
             where,
             select: userSelect,
+            // Super Admins first, then newest accounts.
             orderBy: [{ createdAt: "desc" }, { id: "desc" }],
             skip: (page - 1) * pageSize,
             take: pageSize,
@@ -498,6 +585,7 @@ export async function getUsersAction(
                 page,
                 pageSize,
                 totalPages,
+                viewer: { isSuperAdmin: auth.actorIsSuperAdmin },
             },
         };
     } catch (error) {
@@ -527,6 +615,12 @@ export async function createUserAction(
     if (!parsed.ok) return invalid(parsed.error, parsed.code);
 
     const { fullName, email, mobileNumber, role } = parsed.value;
+
+    // Hierarchy: a regular Admin can never create an Admin account.
+    if (!canAssignRole(auth.actorIsSuperAdmin, role)) {
+        return forbidden("createUserAction", auth.actorId, "FORBIDDEN_ROLE_ASSIGNMENT");
+    }
+
     const temporaryPassword =
         typeof input?.temporaryPassword === "string" ? input.temporaryPassword : "";
 
@@ -569,6 +663,8 @@ export async function createUserAction(
                     fullNameAr: fullName,
                     mobileNumber,
                     role,
+                    // Never grantable from this module (set in the database only).
+                    isSuperAdmin: false,
                     // Critical lifecycle defaults — never driven by client input (=> PENDING):
                     isActive: false,
                     mustChangePassword: true,
@@ -580,6 +676,8 @@ export async function createUserAction(
 
         return { success: true, data: { user: mapUser(created, auth.actorId) } };
     } catch (error) {
+        reportIfDenied("createUserAction", auth.actorId, error);
+
         return (
             mappedTransactionError<{ user: UserRow }>(error) ??
             databaseError("createUserAction", error)
@@ -610,6 +708,11 @@ export async function updateUserAction(
 
     const { fullName, email, mobileNumber, role } = parsed.value;
 
+    // Hierarchy: a regular Admin can never promote anybody (or keep anybody) at the Admin role.
+    if (!canAssignRole(auth.actorIsSuperAdmin, role)) {
+        return forbidden("updateUserAction", auth.actorId, "FORBIDDEN_ROLE_ASSIGNMENT");
+    }
+
     try {
         const updated = await prisma.$transaction(async (tx) => {
             const target = await tx.user.findFirst({
@@ -623,6 +726,16 @@ export async function updateUserAction(
 
             if (!target) {
                 throw new Error("USER_NOT_FOUND");
+            }
+
+            // Hierarchy: regular Admins can never touch Admin / Super Admin accounts.
+            if (!canManageTarget(auth.actorIsSuperAdmin, target)) {
+                throw new Error("FORBIDDEN_TARGET");
+            }
+
+            // A Super Admin account is always an ADMIN.
+            if (target.isSuperAdmin && role !== UserRole.ADMIN) {
+                throw new Error("SUPER_ADMIN_ROLE_LOCKED");
             }
 
             if (email !== target.email) {
@@ -652,7 +765,7 @@ export async function updateUserAction(
             }
 
             if (role !== target.role) {
-                if (auth.actorId && target.id === auth.actorId) {
+                if (target.id === auth.actorId) {
                     throw new Error("CANNOT_CHANGE_OWN_ROLE");
                 }
 
@@ -673,8 +786,9 @@ export async function updateUserAction(
                 }
             }
 
-            // Lifecycle flags (isActive / mustChangePassword / activatedAt) are intentionally NOT
-            // part of this update, so editing a profile can never change the account status.
+            // Lifecycle flags (isActive / mustChangePassword / activatedAt) and `isSuperAdmin` are
+            // intentionally NOT part of this update, so editing a profile can never change the
+            // account status or escalate privileges.
             return tx.user.update({
                 where: { id: target.id, organizationId: auth.organizationId },
                 data: {
@@ -690,6 +804,8 @@ export async function updateUserAction(
 
         return { success: true, data: { user: mapUser(updated, auth.actorId) } };
     } catch (error) {
+        reportIfDenied("updateUserAction", auth.actorId, error);
+
         return (
             mappedTransactionError<{ user: UserRow }>(error) ??
             databaseError("updateUserAction", error)
@@ -735,6 +851,11 @@ export async function toggleUserStatusAction(
                 throw new Error("USER_NOT_FOUND");
             }
 
+            // Hierarchy: regular Admins can never touch Admin / Super Admin accounts.
+            if (!canManageTarget(auth.actorIsSuperAdmin, target)) {
+                throw new Error("FORBIDDEN_TARGET");
+            }
+
             // A pending account becomes active only through the first-login flow.
             if (deriveStatus(target) === "PENDING") {
                 throw new Error("PENDING_USER");
@@ -746,7 +867,7 @@ export async function toggleUserStatusAction(
             }
 
             if (!enabled) {
-                if (auth.actorId && target.id === auth.actorId) {
+                if (target.id === auth.actorId) {
                     throw new Error("CANNOT_DISABLE_SELF");
                 }
 
@@ -781,6 +902,8 @@ export async function toggleUserStatusAction(
 
         return { success: true, data: { user: mapUser(updated, auth.actorId) } };
     } catch (error) {
+        reportIfDenied("toggleUserStatusAction", auth.actorId, error);
+
         return (
             mappedTransactionError<{ user: UserRow }>(error) ??
             databaseError("toggleUserStatusAction", error)
@@ -813,14 +936,19 @@ export async function deleteUserAction(
                     organizationId: auth.organizationId,
                     role: { in: [...MANAGED_ROLES] },
                 },
-                select: { id: true, role: true, isActive: true },
+                select: { id: true, role: true, isActive: true, isSuperAdmin: true },
             });
 
             if (!target) {
                 throw new Error("USER_NOT_FOUND");
             }
 
-            if (auth.actorId && target.id === auth.actorId) {
+            // Hierarchy: regular Admins can never delete Admin / Super Admin accounts.
+            if (!canManageTarget(auth.actorIsSuperAdmin, target)) {
+                throw new Error("FORBIDDEN_TARGET");
+            }
+
+            if (target.id === auth.actorId) {
                 throw new Error("CANNOT_DELETE_SELF");
             }
 
@@ -855,6 +983,8 @@ export async function deleteUserAction(
 
         return { success: true, data: { id: deletedId } };
     } catch (error) {
+        reportIfDenied("deleteUserAction", auth.actorId, error);
+
         return (
             mappedTransactionError<{ id: string }>(error) ??
             databaseError("deleteUserAction", error)
@@ -894,6 +1024,11 @@ export async function regenerateTempPasswordAction(
                 "The requested user could not be found. Refresh and try again.",
                 "RECORD_NOT_FOUND",
             );
+        }
+
+        // Hierarchy: resetting credentials of an Admin / Super Admin is a Super Admin privilege.
+        if (!canManageTarget(auth.actorIsSuperAdmin, target)) {
+            return forbidden("regenerateTempPasswordAction", auth.actorId, "FORBIDDEN_TARGET");
         }
 
         if (deriveStatus(target) !== "PENDING") {

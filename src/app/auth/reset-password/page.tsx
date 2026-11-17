@@ -228,7 +228,7 @@ function PasswordInput({
                     required
                     maxLength={128}
                     dir="ltr"
-                    className="h-12 w-full rounded-lg border border-slate-300 bg-white/70 px-5 pe-12 text-left text-[15px] tracking-[0.12em] text-slate-900 outline-none transition-colors focus:border-teal-500 focus:ring-2 focus:ring-teal-500/15 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-950/30 dark:text-slate-100 dark:focus:border-teal-500"
+                    className="h-12 w-full rounded-lg border border-slate-300 bg-white/70 px-5 pe-14 ps-5 text-left text-[15px] tracking-[0.12em] text-slate-900 outline-none transition-colors focus:border-teal-500 focus:ring-2 focus:ring-teal-500/15 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-950/30 dark:text-slate-100 dark:focus:border-teal-500"
                 />
 
                 <button
@@ -237,7 +237,7 @@ function PasswordInput({
                     disabled={disabled}
                     aria-label={visible ? hideLabel : showLabel}
                     aria-pressed={visible}
-                    className="absolute end-3 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-md text-slate-500 transition-colors hover:text-teal-600 focus-visible:outline-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:text-blue-200 dark:hover:text-teal-400"
+                    className="absolute end-2 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-md text-slate-500 transition-colors hover:text-teal-600 focus-visible:outline-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:text-blue-200 dark:hover:text-teal-400"
                 >
                     {visible ? (
                         <EyeOff size={21} strokeWidth={1.8} />

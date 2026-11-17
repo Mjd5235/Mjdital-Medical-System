@@ -21,6 +21,14 @@
  *     Disabled = !isActive in every other case (manually disabled; stamped with activatedAt)
  * - Mobile input: "+966" is a fixed affix; the user types 05XXXXXXXX only (hard limit of 10 digits,
  *   forced "05" prefix, digits only, paste is sanitised).
+ *
+ * Hierarchical RBAC (UI mirror of the server rules in actions.ts — the server is the authority):
+ * - `viewerIsSuperAdmin` comes from the server (re-read from the database on every fetch).
+ * - Super Admin rows get a glowing teal/indigo "Super Admin" pill.
+ * - A regular Admin sees Admin / Super Admin rows with a locked, disabled action button (tooltip),
+ *   no Edit / Disable / Re-activate / Delete / Regenerate controls, and the "Admin" option of the
+ *   role dropdown is locked in the create / edit dialog.
+ * - Optimistic mutations are guarded too, so a forbidden action never even flickers in the table.
  */
 
 import {
@@ -46,6 +54,7 @@ import {
     ChevronRight,
     CircleAlert,
     Copy,
+    Crown,
     Eye,
     EyeOff,
     Filter,
@@ -145,6 +154,12 @@ const messages = {
         colActions: "Actions",
         roleAdmin: "Admin",
         roleReceptionist: "Receptionist",
+        superAdmin: "Super Admin",
+        superAdminHint: "Super Admin — full, unrestricted system privileges",
+        restrictedTitle: "Only a Super Admin can manage Admin accounts.",
+        restrictedAria: "Actions unavailable — Super Admin only",
+        restrictedNotice:
+            "You are signed in as an Admin. You can manage Receptionist accounts only — Admin and Super Admin accounts can be managed by a Super Admin.",
         statusActive: "Active",
         statusPending: "Pending",
         statusDisabled: "Disabled",
@@ -184,7 +199,13 @@ const messages = {
         mobileHelp: "Start with 05 — exactly 10 digits. The +966 code is added for you.",
         role: "Role",
         roleHelp: "Available roles: Admin or Receptionist",
+        roleHelpRestricted:
+            "Available role: Receptionist. Only a Super Admin can assign the Admin role.",
         roleLocked: "You cannot change your own role.",
+        roleLockedSuper: "A Super Admin account always keeps the Admin role.",
+        roleAdminLocked: "Only a Super Admin can assign the Admin role.",
+        errRoleForbidden: "Only a Super Admin can assign the Admin role.",
+        forbidden: "You do not have permission to perform this action.",
         tempPassword: "Temporary Password",
         generate: "Generate",
         copy: "Copy",
@@ -235,6 +256,12 @@ const messages = {
         colActions: "الإجراءات",
         roleAdmin: "مدير",
         roleReceptionist: "موظف استقبال",
+        superAdmin: "مدير عام",
+        superAdminHint: "مدير عام — صلاحيات كاملة وغير مقيّدة على النظام",
+        restrictedTitle: "حسابات المديرين يديرها المدير العام فقط.",
+        restrictedAria: "الإجراءات غير متاحة — للمدير العام فقط",
+        restrictedNotice:
+            "أنت مسجّل الدخول بصفة مدير. يمكنك إدارة حسابات موظفي الاستقبال فقط — أما حسابات المديرين والمدير العام فيديرها المدير العام.",
         statusActive: "نشط",
         statusPending: "قيد الانتظار",
         statusDisabled: "معطّل",
@@ -274,7 +301,13 @@ const messages = {
         mobileHelp: "ابدأ بـ 05 — 10 أرقام بالضبط. يتم إضافة رمز الدولة +966 تلقائياً.",
         role: "الدور",
         roleHelp: "الأدوار المتاحة: مدير أو موظف استقبال",
+        roleHelpRestricted:
+            "الدور المتاح: موظف استقبال. تعيين دور المدير متاح للمدير العام فقط.",
         roleLocked: "لا يمكنك تغيير دورك الخاص.",
+        roleLockedSuper: "حساب المدير العام يحتفظ دائماً بدور المدير.",
+        roleAdminLocked: "تعيين دور المدير متاح للمدير العام فقط.",
+        errRoleForbidden: "تعيين دور المدير متاح للمدير العام فقط.",
+        forbidden: "ليست لديك صلاحية لتنفيذ هذا الإجراء.",
         tempPassword: "كلمة المرور المؤقتة",
         generate: "توليد",
         copy: "نسخ",
@@ -359,6 +392,20 @@ function makeTempId(): string {
 
 function isTempId(id: string): boolean {
     return id.startsWith(TEMP_ID_PREFIX);
+}
+
+/* ---------------------------- hierarchy helpers ---------------------------- */
+
+/**
+ * Mirrors `canManageTarget` in actions.ts — keep both in sync.
+ * A Super Admin manages everyone; a regular Admin manages only non-Admin, non-Super-Admin users.
+ * (The server remains the single authority; this only drives what the UI shows.)
+ */
+function canManageUser(
+    user: Pick<UserRow, "role" | "isSuperAdmin">,
+    viewerIsSuperAdmin: boolean,
+): boolean {
+    return viewerIsSuperAdmin || (user.role !== "ADMIN" && !user.isSuperAdmin);
 }
 
 /* ------------------------------ mobile helpers ----------------------------- */
@@ -528,7 +575,7 @@ interface FormValues {
     temporaryPassword: string;
 }
 
-type FormField = "fullName" | "email" | "mobileNumber" | "temporaryPassword";
+type FormField = "fullName" | "email" | "mobileNumber" | "temporaryPassword" | "role";
 type FormErrors = Partial<Record<FormField, string>>;
 
 interface SubmitOutcome {
@@ -547,6 +594,8 @@ function buildCreatedRow(values: FormValues, id: string): UserRow {
         email: values.email,
         mobileNumber: values.mobileNumber,
         role: values.role,
+        // Never grantable from the UI.
+        isSuperAdmin: false,
         status: "PENDING",
         isActive: false,
         mustChangePassword: true,
@@ -604,7 +653,9 @@ function mergeServerRows(
     return [...temps, ...merged];
 }
 
-async function fetchAllUsers(): Promise<{ rows: UserRow[] } | { error: string | null }> {
+async function fetchAllUsers(): Promise<
+    { rows: UserRow[]; viewerIsSuperAdmin: boolean } | { error: string | null }
+> {
     const first = await getUsersAction({ page: 1, pageSize: FETCH_PAGE_SIZE });
 
     if (!first.success || !first.data) {
@@ -613,6 +664,7 @@ async function fetchAllUsers(): Promise<{ rows: UserRow[] } | { error: string | 
 
     const rows: UserRow[] = [...first.data.users];
     const totalPages = first.data.totalPages ?? 1;
+    const viewerIsSuperAdmin = Boolean(first.data.viewer?.isSuperAdmin);
 
     if (totalPages > 1) {
         const rest = await Promise.all(
@@ -630,7 +682,7 @@ async function fetchAllUsers(): Promise<{ rows: UserRow[] } | { error: string | 
         }
     }
 
-    return { rows };
+    return { rows, viewerIsSuperAdmin };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -650,7 +702,28 @@ function Avatar({ name, id }: { name: string; id: string }) {
     );
 }
 
-function RoleBadge({ role, t }: { role: ManagedRole; t: Messages }) {
+function RoleBadge({
+    role,
+    isSuperAdmin = false,
+    t,
+}: {
+    role: ManagedRole;
+    isSuperAdmin?: boolean;
+    t: Messages;
+}) {
+    // Super Admin: replaces the plain "Admin" label with the glowing teal/indigo pill.
+    if (isSuperAdmin) {
+        return (
+            <span
+                title={t.superAdminHint}
+                className="inline-flex items-center gap-2 rounded-lg border border-teal-400/40 bg-gradient-to-r from-teal-500/15 via-teal-500/10 to-indigo-500/20 px-3 py-1.5 text-sm font-bold text-teal-700 shadow-[0_0_14px_rgba(45,212,191,0.35)] ring-1 ring-indigo-400/25 dark:text-teal-200"
+            >
+                <Crown className="h-4 w-4" />
+                {t.superAdmin}
+            </span>
+        );
+    }
+
     const isAdmin = role === "ADMIN";
 
     return (
@@ -662,6 +735,19 @@ function RoleBadge({ role, t }: { role: ManagedRole; t: Messages }) {
         >
             {isAdmin ? <ShieldCheck className="h-4 w-4" /> : <UserRound className="h-4 w-4" />}
             {isAdmin ? t.roleAdmin : t.roleReceptionist}
+        </span>
+    );
+}
+
+/** Glowing teal → indigo pill shown next to every account where `isSuperAdmin === true`. */
+function SuperAdminBadge({ t }: { t: Messages }) {
+    return (
+        <span
+            title={t.superAdminHint}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-teal-400/40 bg-gradient-to-r from-teal-500/15 via-teal-500/10 to-indigo-500/20 px-2.5 py-0.5 text-xs font-bold tracking-wide text-teal-700 shadow-[0_0_14px_rgba(45,212,191,0.35)] ring-1 ring-indigo-400/25 dark:text-teal-200"
+        >
+            <Crown className="h-3.5 w-3.5" />
+            {t.superAdmin}
         </span>
     );
 }
@@ -738,6 +824,10 @@ function SkeletonRows() {
 interface DropdownOption<V extends string> {
     value: V;
     label: string;
+    /** Locked option: rendered with a lock icon, not selectable. */
+    disabled?: boolean;
+    /** Tooltip shown on a locked option. */
+    hint?: string;
 }
 
 function Dropdown<V extends string>({
@@ -819,22 +909,38 @@ function Dropdown<V extends string>({
                     >
                         {options.map((option) => {
                             const selected = option.value === value;
+                            const locked = Boolean(option.disabled);
 
                             return (
-                                <li key={option.value} role="option" aria-selected={selected}>
+                                <li
+                                    key={option.value}
+                                    role="option"
+                                    aria-selected={selected}
+                                    aria-disabled={locked}
+                                >
                                     <button
                                         type="button"
+                                        disabled={locked}
+                                        title={locked ? option.hint : undefined}
                                         onClick={() => {
+                                            if (locked) return;
+
                                             setOpen(false);
                                             onChange(option.value);
                                         }}
-                                        className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-start text-sm transition-colors duration-150 ${selected
-                                            ? "bg-teal-600/10 text-teal-700 dark:text-teal-300"
-                                            : "text-slate-800 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+                                        className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-start text-sm transition-colors duration-150 ${locked
+                                            ? "cursor-not-allowed text-slate-400 opacity-60 dark:text-slate-500"
+                                            : selected
+                                                ? "bg-teal-600/10 text-teal-700 dark:text-teal-300"
+                                                : "text-slate-800 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
                                             }`}
                                     >
                                         <span className="truncate">{option.label}</span>
-                                        {selected && <Check className="h-4 w-4 shrink-0" />}
+                                        {locked ? (
+                                            <Lock className="h-4 w-4 shrink-0" />
+                                        ) : (
+                                            selected && <Check className="h-4 w-4 shrink-0" />
+                                        )}
                                     </button>
                                 </li>
                             );
@@ -856,6 +962,7 @@ function RowActions({
     isRtl,
     busy,
     syncing,
+    canManage,
     onEdit,
     onToggleStatus,
     onRegenerate,
@@ -866,6 +973,8 @@ function RowActions({
     isRtl: boolean;
     busy: boolean;
     syncing: boolean;
+    /** false => the viewer's rank is not high enough to act on this row. */
+    canManage: boolean;
     onEdit: (user: UserRow) => void;
     onToggleStatus: (user: UserRow, enabled: boolean) => void;
     onRegenerate: (user: UserRow) => void;
@@ -932,6 +1041,22 @@ function RowActions({
             window.removeEventListener("resize", close);
         };
     }, [open]);
+
+    // Hierarchy lock: no menu, no handlers — just a disabled button explaining why.
+    if (!canManage) {
+        return (
+            <button
+                type="button"
+                disabled
+                aria-disabled="true"
+                aria-label={t.restrictedAria}
+                title={t.restrictedTitle}
+                className="inline-flex h-10 w-10 cursor-not-allowed items-center justify-center rounded-lg border border-dashed border-slate-300 text-slate-400 opacity-80 dark:border-slate-700 dark:text-slate-500"
+            >
+                <Lock className="h-5 w-5" />
+            </button>
+        );
+    }
 
     const itemClass =
         "flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-start text-sm font-medium text-slate-800 transition-colors duration-150 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800";
@@ -1094,12 +1219,14 @@ function UserFormDialog({
     user,
     t,
     isRtl,
+    viewerIsSuperAdmin,
     onClose,
     onSubmit,
 }: {
     user: UserRow | null;
     t: Messages;
     isRtl: boolean;
+    viewerIsSuperAdmin: boolean;
     onClose: () => void;
     onSubmit: (target: UserRow | null, values: FormValues) => SubmitOutcome;
 }) {
@@ -1197,6 +1324,10 @@ function UserFormDialog({
         if (!isEdit && !isAcceptablePassword(form.temporaryPassword)) {
             next.temporaryPassword = t.errPassword;
         }
+        // Hierarchy: only a Super Admin may assign the Admin role (the server re-checks this).
+        if (!viewerIsSuperAdmin && form.role === "ADMIN") {
+            next.role = t.errRoleForbidden;
+        }
 
         if (Object.keys(next).length > 0) {
             setErrors(next);
@@ -1214,14 +1345,29 @@ function UserFormDialog({
         if (!outcome.ok) setErrors(outcome.errors ?? {});
     };
 
+    // Regular Admins cannot pick "Admin": the option stays visible but locked.
     const roleOptions: DropdownOption<ManagedRole>[] = [
-        { value: "ADMIN", label: t.roleAdmin },
+        {
+            value: "ADMIN",
+            label: t.roleAdmin,
+            disabled: !viewerIsSuperAdmin,
+            hint: t.roleAdminLocked,
+        },
         { value: "RECEPTIONIST", label: t.roleReceptionist },
     ];
 
     const iconPosition = isRtl ? "end-3" : "start-3";
     const ltrPadding = isRtl ? "ps-3 pe-10 text-end" : "ps-10 pe-3";
-    const roleLocked = isEdit && Boolean(user?.isCurrentUser);
+    const editingSelf = isEdit && Boolean(user?.isCurrentUser);
+    const editingSuperAdmin = isEdit && Boolean(user?.isSuperAdmin);
+    const roleLocked = editingSelf || editingSuperAdmin;
+    const roleHelp = editingSelf
+        ? t.roleLocked
+        : editingSuperAdmin
+            ? t.roleLockedSuper
+            : viewerIsSuperAdmin
+                ? t.roleHelp
+                : t.roleHelpRestricted;
     const mobileInvalid = Boolean(errors.mobileNumber);
 
     return (
@@ -1359,7 +1505,8 @@ function UserFormDialog({
                         <Field
                             label={t.role}
                             htmlFor={ids.role}
-                            help={roleLocked ? t.roleLocked : t.roleHelp}
+                            error={errors.role}
+                            help={roleHelp}
                         >
                             <Dropdown
                                 value={form.role}
@@ -1566,6 +1713,8 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
     const [users, setUsers] = useState<UserRow[]>([]);
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState("");
+    // Privileges of the signed-in user — always provided by the server with the user list.
+    const [viewerIsSuperAdmin, setViewerIsSuperAdmin] = useState(false);
 
     const [query, setQuery] = useState("");
     const [roleFilter, setRoleFilter] = useState<RoleFilter>("ALL");
@@ -1671,6 +1820,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
             if ("rows" in result) {
                 const busy = new Set(queueRef.current.keys());
 
+                setViewerIsSuperAdmin(result.viewerIsSuperAdmin);
                 updateUsers((current) => mergeServerRows(current, result.rows, busy));
             } else {
                 setLoadError(result.error ?? tRef.current.loadFailed);
@@ -1691,6 +1841,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
             if ("rows" in result) {
                 const busy = new Set(queueRef.current.keys());
 
+                setViewerIsSuperAdmin(result.viewerIsSuperAdmin);
                 updateUsers((current) => mergeServerRows(current, result.rows, busy));
             }
         } catch {
@@ -1825,6 +1976,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
     const NextIcon = isRtl ? ChevronLeft : ChevronRight;
     const showSkeleton = loading && users.length === 0 && !loadError;
     const showEmpty = !showSkeleton && !loadError && pageUsers.length === 0;
+    const showRestrictedNotice = !loading && !loadError && !viewerIsSuperAdmin;
 
     const closeModal = useCallback(() => setModal(null), []);
     const cancelDelete = useCallback(() => setDeleteTarget(null), []);
@@ -1834,6 +1986,11 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
     // Returns synchronously: { ok: true } closes the dialog in the same frame as the row change.
     const submitUser = useCallback(
         (target: UserRow | null, values: FormValues): SubmitOutcome => {
+            // Hierarchy guard (the server enforces it again): only a Super Admin assigns Admin.
+            if (!viewerIsSuperAdmin && values.role === "ADMIN") {
+                return { ok: false, errors: { role: tRef.current.errRoleForbidden } };
+            }
+
             // Instant duplicate pre-check against the local list (the server stays the authority).
             const duplicate: FormErrors = {};
 
@@ -1859,6 +2016,11 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                 const base = usersRef.current.find((item) => item.id === target.id) ?? target;
 
                 if (isTempId(base.id)) return { ok: true };
+
+                if (!canManageUser(base, viewerIsSuperAdmin)) {
+                    pushToast("error", tRef.current.forbidden);
+                    return { ok: true };
+                }
 
                 const optimistic = buildEditedRow(base, values);
 
@@ -1925,7 +2087,16 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
 
             return { ok: true };
         },
-        [enqueue, pushToast, removeTempRow, resetFilters, rollbackRow, settleRow, updateUsers],
+        [
+            enqueue,
+            pushToast,
+            removeTempRow,
+            resetFilters,
+            rollbackRow,
+            settleRow,
+            updateUsers,
+            viewerIsSuperAdmin,
+        ],
     );
 
     const handleToggleStatus = useCallback(
@@ -1933,6 +2104,11 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
             if (isTempId(user.id)) return;
 
             const current = usersRef.current.find((item) => item.id === user.id) ?? user;
+
+            if (!canManageUser(current, viewerIsSuperAdmin)) {
+                pushToast("error", tRef.current.forbidden);
+                return;
+            }
 
             if (current.status === "PENDING") return;
             if (!enabled && current.isCurrentUser) return;
@@ -1963,13 +2139,34 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                 }
             });
         },
-        [enqueue, pushToast, rollbackRow, settleRow, updateUsers],
+        [enqueue, pushToast, rollbackRow, settleRow, updateUsers, viewerIsSuperAdmin],
+    );
+
+    const requestDelete = useCallback(
+        (row: UserRow) => {
+            const current = usersRef.current.find((item) => item.id === row.id) ?? row;
+
+            if (!canManageUser(current, viewerIsSuperAdmin)) {
+                pushToast("error", tRef.current.forbidden);
+                return;
+            }
+
+            setDeleteTarget(current);
+        },
+        [pushToast, viewerIsSuperAdmin],
     );
 
     const confirmDelete = useCallback(() => {
         if (!deleteTarget) return;
 
         const target = deleteTarget;
+
+        if (!canManageUser(target, viewerIsSuperAdmin)) {
+            setDeleteTarget(null);
+            pushToast("error", tRef.current.forbidden);
+            return;
+        }
+
         const index = usersRef.current.findIndex((item) => item.id === target.id);
         const snapshot = index >= 0 ? (usersRef.current[index] as UserRow) : target;
 
@@ -1991,12 +2188,17 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                 restoreDeletedRow(snapshot, index, toastId, tRef.current.failed);
             }
         });
-    }, [deleteTarget, enqueue, pushToast, restoreDeletedRow, updateUsers]);
+    }, [deleteTarget, enqueue, pushToast, restoreDeletedRow, updateUsers, viewerIsSuperAdmin]);
 
     // The only action that must wait for the server: the password is generated there.
     const handleRegenerate = useCallback(
         (user: UserRow) => {
             if (isTempId(user.id) || user.status !== "PENDING") return;
+
+            if (!canManageUser(user, viewerIsSuperAdmin)) {
+                pushToast("error", tRef.current.forbidden);
+                return;
+            }
 
             setBusyId(user.id);
 
@@ -2027,14 +2229,24 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                 }
             });
         },
-        [enqueue, pushToast, updateUsers],
+        [enqueue, pushToast, updateUsers, viewerIsSuperAdmin],
     );
 
-    const openEdit = useCallback((row: UserRow) => {
-        if (isTempId(row.id)) return;
+    const openEdit = useCallback(
+        (row: UserRow) => {
+            if (isTempId(row.id)) return;
 
-        setModal({ mode: "edit", user: usersRef.current.find((item) => item.id === row.id) ?? row });
-    }, []);
+            const current = usersRef.current.find((item) => item.id === row.id) ?? row;
+
+            if (!canManageUser(current, viewerIsSuperAdmin)) {
+                pushToast("error", tRef.current.forbidden);
+                return;
+            }
+
+            setModal({ mode: "edit", user: current });
+        },
+        [pushToast, viewerIsSuperAdmin],
+    );
 
     /* ---------------------------- render ---------------------------- */
 
@@ -2069,6 +2281,12 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                 </h1>
 
                                 <p className="mt-3 text-base text-slate-600 dark:text-slate-300">{t.subtitle}</p>
+
+                                {!loading && viewerIsSuperAdmin && (
+                                    <div className="mt-3">
+                                        <SuperAdminBadge t={t} />
+                                    </div>
+                                )}
                             </div>
 
                             <button
@@ -2080,6 +2298,17 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                 {t.add}
                             </button>
                         </header>
+
+                        {/* Hierarchy notice for regular Admins */}
+                        {showRestrictedNotice && (
+                            <div
+                                role="note"
+                                className="flex items-start gap-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-4 py-3 text-sm text-indigo-900 dark:border-indigo-400/30 dark:bg-indigo-500/10 dark:text-indigo-200"
+                            >
+                                <Lock className="mt-0.5 h-4 w-4 shrink-0" />
+                                <p>{t.restrictedNotice}</p>
+                            </div>
+                        )}
 
                         {/* Search & filter bar */}
                         <section className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(220px,2fr)_minmax(170px,1fr)_minmax(170px,1fr)_auto]">
@@ -2204,6 +2433,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                                     const login = formatLastLogin(user.lastLoginAt, locale);
                                                     const syncing = isTempId(user.id);
                                                     const rowKey = keyMapRef.current.get(user.id) ?? user.id;
+                                                    const canManage = canManageUser(user, viewerIsSuperAdmin);
                                                     const canDisable =
                                                         user.status === "ACTIVE" && !user.isCurrentUser;
 
@@ -2214,13 +2444,16 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                                             animate={{ opacity: 1, y: 0 }}
                                                             exit={{ opacity: 0 }}
                                                             transition={{ duration: 0.16, ease: "easeOut" }}
-                                                            className="border-t border-slate-200 transition-colors duration-150 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/30"
+                                                            className={`border-t border-slate-200 transition-colors duration-150 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/30 ${user.isSuperAdmin
+                                                                ? "bg-gradient-to-r from-teal-500/[0.04] to-indigo-500/[0.04]"
+                                                                : ""
+                                                                }`}
                                                         >
                                                             <td className="px-6 py-4 align-middle">
                                                                 <div className="flex items-center gap-4">
                                                                     <Avatar name={user.fullName} id={rowKey} />
                                                                     <div className="min-w-0">
-                                                                        <p className="flex items-center gap-2 truncate text-base font-semibold text-slate-900 dark:text-white">
+                                                                        <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-base font-semibold text-slate-900 dark:text-white">
                                                                             <span className="truncate">{user.fullName}</span>
                                                                             {user.isCurrentUser && (
                                                                                 <span className="shrink-0 rounded-md bg-teal-600/10 px-2 py-0.5 text-xs font-semibold text-teal-700 dark:text-teal-300">
@@ -2247,7 +2480,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                                             </td>
 
                                                             <td className="px-4 py-4 align-middle">
-                                                                <RoleBadge role={user.role} t={t} />
+                                                                <RoleBadge role={user.role} isSuperAdmin={user.isSuperAdmin} t={t} />
                                                             </td>
 
                                                             <td className="whitespace-nowrap px-4 py-4 align-middle text-sm text-slate-800 dark:text-slate-200">
@@ -2275,7 +2508,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
 
                                                             <td className="px-4 py-4 align-middle">
                                                                 <div className="flex items-center justify-center gap-2">
-                                                                    {user.status === "DISABLED" && (
+                                                                    {canManage && user.status === "DISABLED" && (
                                                                         <button
                                                                             type="button"
                                                                             onClick={() => handleToggleStatus(user, true)}
@@ -2286,7 +2519,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                                                         </button>
                                                                     )}
 
-                                                                    {canDisable && !syncing && (
+                                                                    {canManage && canDisable && !syncing && (
                                                                         <button
                                                                             type="button"
                                                                             onClick={() => handleToggleStatus(user, false)}
@@ -2303,10 +2536,11 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                                                         isRtl={isRtl}
                                                                         busy={busyId === user.id}
                                                                         syncing={syncing}
+                                                                        canManage={canManage}
                                                                         onEdit={openEdit}
                                                                         onToggleStatus={handleToggleStatus}
                                                                         onRegenerate={handleRegenerate}
-                                                                        onDelete={(row) => setDeleteTarget(row)}
+                                                                        onDelete={requestDelete}
                                                                     />
                                                                 </div>
                                                             </td>
@@ -2376,6 +2610,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                         user={modal.mode === "edit" ? modal.user : null}
                         t={t}
                         isRtl={isRtl}
+                        viewerIsSuperAdmin={viewerIsSuperAdmin}
                         onClose={closeModal}
                         onSubmit={submitUser}
                     />
