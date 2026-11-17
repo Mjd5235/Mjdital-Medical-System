@@ -1,8 +1,3 @@
-// ============================================================================
-// FILE: app/admin/clinical/providers/actions.ts
-// All mutations live here. Reads for the first paint live in ./queries.ts.
-// ============================================================================
-
 "use server";
 
 import {
@@ -16,40 +11,123 @@ import { revalidatePath } from "next/cache";
 import { prisma, prismaBase } from "@/lib/db/prisma";
 import { requirePortalSession } from "@/lib/auth/guard";
 import { hashPassword } from "@/lib/auth/password";
-import {
-    doctorInclude,
-    fetchDoctorFormOptions,
-    getDoctorsSnapshot,
-    getOrganizationClinicIds,
-    mapDoctor,
-} from "./queries";
-import type {
-    CreateDoctorInput,
-    CreateDoctorResultData,
-    DoctorActionResult,
-    DoctorFormOptions,
-    DoctorsSnapshot,
-    RegeneratePasswordResultData,
-    SetDoctorActiveStatusResultData,
-    UpdateDoctorInput,
-    UpdateDoctorResultData,
-} from "./types";
-
-export type {
-    CreateDoctorInput,
-    CreateDoctorResultData,
-    DoctorActionResult,
-    DoctorClinicOption,
-    DoctorRow,
-    DoctorServiceOption,
-    DoctorsSnapshot,
-    RegeneratePasswordResultData,
-    SetDoctorActiveStatusResultData,
-    UpdateDoctorInput,
-    UpdateDoctorResultData,
-} from "./types";
 
 const MANAGEMENT_PATH = "/admin/clinical/providers";
+const TOKEN_EXPIRY_HOURS = 24;
+const PAGE_SIZE = 10;
+
+export interface DoctorActionResult<T> {
+    success: boolean;
+    data?: T;
+    error?: string;
+    code?: string;
+}
+
+export interface DoctorClinicOption {
+    id: string;
+    nameEn: string;
+    nameAr: string;
+    isActive: boolean;
+}
+
+export interface DoctorServiceOption {
+    id: string;
+    clinicId: string;
+    nameEn: string;
+    nameAr: string;
+    code: string;
+    isActive: boolean;
+}
+
+export interface DoctorRow {
+    id: string;
+    userId: string | null;
+    email: string | null;
+    firstName: string;
+    lastName: string;
+    fullName: string;
+    specialty: string;
+    specialtyAr: string;
+    nationalId: string;
+    identityType: IdentityType;
+    scfhsLicenseNumber: string;
+    professionalRank: DoctorProfessionalRank;
+    clinicId: string;
+    clinicName: string;
+    clinicNameAr: string;
+    commissionRate: string;
+    isActive: boolean;
+    mustChangePassword: boolean;
+    accountStatus: "ACTIVE" | "INVITED" | "INACTIVE" | "NO_ACCOUNT";
+    createdAt: string;
+    services: Array<{
+        id: string;
+        nameEn: string;
+        nameAr: string;
+        code: string;
+    }>;
+}
+
+export interface GetDoctorsInput {
+    clinicId?: string;
+    search?: string;
+    status?: "ALL" | "ACTIVE" | "INACTIVE" | "INVITED";
+    page?: number;
+    pageSize?: number;
+}
+
+export interface GetDoctorsData {
+    doctors: DoctorRow[];
+    clinics: DoctorClinicOption[];
+    services: DoctorServiceOption[];
+    total: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+}
+
+export interface CreateDoctorInput {
+    email: string;
+    firstName: string;
+    lastName: string;
+    nationalId: string;
+    scfhsLicenseNumber: string;
+    professionalRank: DoctorProfessionalRank;
+    specialty: string;
+    specialtyAr?: string;
+    clinicId: string;
+    serviceIds: string[];
+    commissionRate: string | number;
+    /** Optional. When empty the server generates a secure temporary password. */
+    temporaryPassword?: string;
+}
+
+export interface UpdateDoctorInput extends CreateDoctorInput {
+    doctorId: string;
+}
+
+export interface CreateDoctorResultData {
+    doctor: DoctorRow;
+    emailSent: boolean;
+    /** Plain-text password, only returned when the server had to generate one. */
+    generatedPassword: string | null;
+}
+
+export interface UpdateDoctorResultData {
+    doctor: DoctorRow;
+    /** Plain-text password, only returned when the server had to generate one. */
+    generatedPassword: string | null;
+}
+
+export interface RegeneratePasswordResultData {
+    email: string;
+    /** Plain-text (NOT hashed) temporary password for the admin to copy. */
+    temporaryPassword: string;
+}
+
+export interface SetDoctorActiveStatusResultData {
+    doctor: DoctorRow;
+}
 
 const VALID_RANKS = new Set<string>(Object.values(DoctorProfessionalRank));
 
@@ -65,9 +143,27 @@ const PASSWORD_LOWER = "abcdefghijkmnopqrstuvwxyz";
 const PASSWORD_DIGITS = "23456789";
 const PASSWORD_SYMBOLS = "!@#$%&*?";
 
-/* -------------------------------------------------------------------------- */
-/* Helpers                                                                    */
-/* -------------------------------------------------------------------------- */
+const doctorInclude = {
+    clinic: {
+        select: { nameEn: true, nameAr: true },
+    },
+    user: {
+        select: { email: true, isActive: true, mustChangePassword: true },
+    },
+    services: {
+        select: {
+            id: true,
+            nameEn: true,
+            nameAr: true,
+            code: true,
+        },
+        orderBy: { nameEn: "asc" },
+    },
+} satisfies Prisma.DoctorInclude;
+
+type DoctorWithRelations = Prisma.DoctorGetPayload<{
+    include: typeof doctorInclude;
+}>;
 
 function cleanText(value: unknown): string {
     return typeof value === "string" ? value.trim() : "";
@@ -196,6 +292,57 @@ function mappedTransactionError<T>(error: unknown): DoctorActionResult<T> | null
     }
 }
 
+function getBaseUrl(): string {
+    const configured = process.env.APP_URL ?? process.env.NEXT_PUBLIC_APP_URL;
+
+    if (!configured) {
+        throw new Error("APP_URL is not configured.");
+    }
+
+    const url = new URL(configured);
+
+    if (process.env.NODE_ENV === "production" && url.protocol !== "https:") {
+        throw new Error("APP_URL must use HTTPS in production.");
+    }
+
+    return url.origin;
+}
+
+function mapDoctor(doctor: DoctorWithRelations): DoctorRow {
+    const nameParts = doctor.fullNameEn.split(/\s+/);
+    const mustChangePassword = Boolean(doctor.user?.mustChangePassword);
+
+    return {
+        id: doctor.id,
+        userId: doctor.userId,
+        email: doctor.user?.email ?? null,
+        firstName: nameParts[0] ?? doctor.fullNameEn,
+        lastName: nameParts.slice(1).join(" "),
+        fullName: doctor.fullNameEn,
+        specialty: doctor.specialtyEn,
+        specialtyAr: doctor.specialtyAr,
+        nationalId: doctor.nationalId,
+        identityType: doctor.identityType,
+        scfhsLicenseNumber: doctor.scfhsLicenseNumber,
+        professionalRank: doctor.professionalRank,
+        clinicId: doctor.clinicId,
+        clinicName: doctor.clinic.nameEn,
+        clinicNameAr: doctor.clinic.nameAr,
+        commissionRate: doctor.commissionRate.toString(),
+        isActive: doctor.isActive,
+        mustChangePassword,
+        accountStatus: !doctor.isActive
+            ? "INACTIVE"
+            : !doctor.user
+                ? "NO_ACCOUNT"
+                : mustChangePassword || !doctor.user.isActive
+                    ? "INVITED"
+                    : "ACTIVE",
+        createdAt: doctor.createdAt.toISOString(),
+        services: doctor.services,
+    };
+}
+
 type ParsedDoctorInput = {
     email: string;
     firstName: string;
@@ -311,23 +458,154 @@ function parseDoctorInput(
     };
 }
 
-/* -------------------------------------------------------------------------- */
-/* Reads used by the client for background re-sync                            */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Silent reconciliation after a conflicting optimistic rollback.
- * The first page load never calls this: the Server Component fetches directly.
- */
-export async function getDoctorsSnapshotAction(): Promise<
-    DoctorActionResult<DoctorsSnapshot>
-> {
+export async function getDoctorsAction(
+    input: GetDoctorsInput = {},
+): Promise<DoctorActionResult<GetDoctorsData>> {
     try {
-        const data = await getDoctorsSnapshot();
+        const session = await requirePortalSession("admin");
 
-        return { success: true, data };
+        const requestedPage =
+            Number.isInteger(input.page) && Number(input.page) > 0
+                ? Number(input.page)
+                : 1;
+
+        const pageSize =
+            Number.isInteger(input.pageSize) &&
+                Number(input.pageSize) >= 1 &&
+                Number(input.pageSize) <= 100
+                ? Number(input.pageSize)
+                : PAGE_SIZE;
+
+        const search = cleanText(input.search).slice(0, 120);
+        const status = input.status ?? "ALL";
+        const clinicFilter = cleanText(input.clinicId);
+
+        if (clinicFilter && !validUuid(clinicFilter)) {
+            return invalid("Select a valid clinic.", "INVALID_CLINIC");
+        }
+
+        const clinics = await prisma.clinic.findMany({
+            where: {
+                organizationId: session.organizationId,
+            },
+            select: {
+                id: true,
+                nameEn: true,
+                nameAr: true,
+                isActive: true,
+            },
+            orderBy: [{ isActive: "desc" }, { nameEn: "asc" }],
+        });
+
+        const clinicsInScope = clinicFilter
+            ? clinics.filter((clinic) => clinic.id === clinicFilter)
+            : clinics;
+
+        if (clinicFilter && clinicsInScope.length === 0) {
+            return invalid(
+                "The selected clinic was not found in your organization.",
+                "CLINIC_NOT_FOUND",
+            );
+        }
+
+        const services = await prisma.service.findMany({
+            where: {
+                organizationId: session.organizationId,
+                clinic: {
+                    is: {
+                        organizationId: session.organizationId,
+                    },
+                },
+                ...(clinicFilter ? { clinicId: clinicFilter } : {}),
+            },
+            select: {
+                id: true,
+                clinicId: true,
+                nameEn: true,
+                nameAr: true,
+                code: true,
+                isActive: true,
+            },
+            orderBy: { nameEn: "asc" },
+        });
+
+        const clinicIds = clinicsInScope.map((clinic) => clinic.id);
+
+        if (clinicIds.length === 0) {
+            return {
+                success: true,
+                data: {
+                    doctors: [],
+                    clinics,
+                    services,
+                    total: 0,
+                    page: 1,
+                    pageSize,
+                    totalPages: 0,
+                },
+            };
+        }
+
+        const where: Prisma.DoctorWhereInput = {
+            organizationId: session.organizationId,
+            clinicId: clinicFilter ? clinicFilter : { in: clinicIds },
+            ...(status === "ACTIVE" ? { isActive: true } : {}),
+            ...(status === "INACTIVE" ? { isActive: false } : {}),
+            ...(status === "INVITED"
+                ? { user: { is: { mustChangePassword: true } } }
+                : {}),
+            ...(search
+                ? {
+                    OR: [
+                        { fullNameEn: { contains: search, mode: "insensitive" } },
+                        { fullNameAr: { contains: search, mode: "insensitive" } },
+                        { nationalId: { contains: search } },
+                        {
+                            scfhsLicenseNumber: {
+                                contains: search,
+                                mode: "insensitive",
+                            },
+                        },
+                        {
+                            user: {
+                                is: {
+                                    email: {
+                                        contains: search,
+                                        mode: "insensitive",
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                }
+                : {}),
+        };
+
+        const [total, rows] = await prisma.$transaction([
+            prisma.doctor.count({ where }),
+            prisma.doctor.findMany({
+                where,
+                include: doctorInclude,
+                orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+                skip: (requestedPage - 1) * pageSize,
+                take: pageSize,
+            }),
+        ]);
+
+        return {
+            success: true,
+            data: {
+                doctors: rows.map(mapDoctor),
+                clinics,
+                services,
+                total,
+                page: requestedPage,
+                pageSize,
+                totalPages: Math.ceil(total / pageSize),
+            },
+        };
     } catch (error) {
-        console.error("[getDoctorsSnapshotAction]", error);
+        console.error("[getDoctorsAction]", error);
 
         return {
             success: false,
@@ -336,23 +614,6 @@ export async function getDoctorsSnapshotAction(): Promise<
         };
     }
 }
-
-export async function getDoctorFormOptions(): Promise<
-    DoctorActionResult<DoctorFormOptions>
-> {
-    try {
-        const session = await requirePortalSession("admin");
-        const data = await fetchDoctorFormOptions(session.organizationId);
-
-        return { success: true, data };
-    } catch (error) {
-        return databaseError("getDoctorFormOptions", error);
-    }
-}
-
-/* -------------------------------------------------------------------------- */
-/* Mutations                                                                  */
-/* -------------------------------------------------------------------------- */
 
 export async function createDoctorAction(
     input: CreateDoctorInput,
@@ -473,10 +734,8 @@ export async function createDoctorAction(
             },
         };
     } catch (error) {
-        return (
-            mappedTransactionError<CreateDoctorResultData>(error) ??
-            databaseError("createDoctorAction", error)
-        );
+        return mappedTransactionError<CreateDoctorResultData>(error) ??
+            databaseError("createDoctorAction", error);
     }
 }
 
@@ -489,7 +748,10 @@ export async function updateDoctorAction(
         session = await requirePortalSession("admin");
     } catch (error) {
         console.error("[updateDoctorAction] Authorization failed", error);
-        return invalid("Your session has expired. Sign in and try again.", "UNAUTHORIZED");
+        return invalid(
+            "Your session has expired. Sign in and try again.",
+            "UNAUTHORIZED",
+        );
     }
 
     const doctorId = cleanText(input?.doctorId);
@@ -508,7 +770,9 @@ export async function updateDoctorAction(
 
     try {
         // Resolve the authenticated organization's clinic scope first.
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
+        const clinicIds = await getOrganizationClinicIds(
+            session.organizationId,
+        );
 
         if (clinicIds.length === 0) {
             return invalid(
@@ -522,7 +786,9 @@ export async function updateDoctorAction(
             where: {
                 id: doctorId,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
+                clinicId: {
+                    in: clinicIds,
+                },
             },
             select: {
                 userId: true,
@@ -545,7 +811,9 @@ export async function updateDoctorAction(
             generatedPassword = plainPassword;
         }
 
-        const passwordHash = plainPassword ? await hashPassword(plainPassword) : null;
+        const passwordHash = plainPassword
+            ? await hashPassword(plainPassword)
+            : null;
 
         const updated = await prisma.$transaction(
             async (tx) => {
@@ -553,9 +821,13 @@ export async function updateDoctorAction(
                     where: {
                         id: v.clinicId,
                         organizationId: session.organizationId,
-                        ...(v.clinicId === existing.clinicId ? {} : { isActive: true }),
+                        ...(v.clinicId === existing.clinicId
+                            ? {}
+                            : { isActive: true }),
                     },
-                    select: { id: true },
+                    select: {
+                        id: true,
+                    },
                 });
 
                 if (!clinic) {
@@ -564,12 +836,16 @@ export async function updateDoctorAction(
 
                 const availableServices = await tx.service.findMany({
                     where: {
-                        id: { in: v.serviceIds },
+                        id: {
+                            in: v.serviceIds,
+                        },
                         organizationId: session.organizationId,
                         clinicId: clinic.id,
                         isActive: true,
                     },
-                    select: { id: true },
+                    select: {
+                        id: true,
+                    },
                 });
 
                 if (availableServices.length !== v.serviceIds.length) {
@@ -581,7 +857,9 @@ export async function updateDoctorAction(
                         email: v.email,
                         organizationId: session.organizationId,
                     },
-                    select: { id: true },
+                    select: {
+                        id: true,
+                    },
                 });
 
                 let userId = existing.userId;
@@ -592,7 +870,9 @@ export async function updateDoctorAction(
                     }
 
                     await tx.user.update({
-                        where: { id: userId },
+                        where: {
+                            id: userId,
+                        },
                         data: {
                             email: v.email,
                             fullNameEn: v.fullNameEn,
@@ -621,7 +901,9 @@ export async function updateDoctorAction(
                             isActive: true,
                             mustChangePassword: true,
                         },
-                        select: { id: true },
+                        select: {
+                            id: true,
+                        },
                     });
 
                     userId = user.id;
@@ -658,7 +940,10 @@ export async function updateDoctorAction(
                     include: doctorInclude,
                 });
             },
-            { maxWait: 10_000, timeout: 20_000 },
+            {
+                maxWait: 10_000,
+                timeout: 20_000,
+            },
         );
 
         revalidatePath(MANAGEMENT_PATH);
@@ -695,7 +980,11 @@ export async function setDoctorActiveStatusAction(
         session = await requirePortalSession("admin");
     } catch (error) {
         console.error("[setDoctorActiveStatusAction] Authorization failed", error);
-        return invalid("Your session has expired. Sign in and try again.", "UNAUTHORIZED");
+
+        return invalid(
+            "Your session has expired. Sign in and try again.",
+            "UNAUTHORIZED",
+        );
     }
 
     const id = cleanText(doctorId);
@@ -709,7 +998,9 @@ export async function setDoctorActiveStatusAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
+        const clinicIds = await getOrganizationClinicIds(
+            session.organizationId,
+        );
 
         if (clinicIds.length === 0) {
             return invalid(
@@ -723,7 +1014,9 @@ export async function setDoctorActiveStatusAction(
             where: {
                 id,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
+                clinicId: {
+                    in: clinicIds,
+                },
             },
             select: {
                 id: true,
@@ -739,9 +1032,16 @@ export async function setDoctorActiveStatusAction(
             );
         }
 
-        const actorId = (session as unknown as { userId?: string }).userId;
+        const actorId = (
+            session as unknown as { userId?: string }
+        ).userId;
 
-        if (!isActive && existing.userId && actorId && existing.userId === actorId) {
+        if (
+            !isActive &&
+            existing.userId &&
+            actorId &&
+            existing.userId === actorId
+        ) {
             return invalid(
                 "You cannot deactivate the account you are currently signed in with.",
                 "CANNOT_DEACTIVATE_SELF",
@@ -756,7 +1056,9 @@ export async function setDoctorActiveStatusAction(
                             id: existing.userId,
                             organizationId: session.organizationId,
                         },
-                        data: { isActive },
+                        data: {
+                            isActive,
+                        },
                     });
                 }
 
@@ -766,18 +1068,25 @@ export async function setDoctorActiveStatusAction(
                         organizationId: session.organizationId,
                         clinicId: existing.clinicId,
                     },
-                    data: { isActive },
+                    data: {
+                        isActive,
+                    },
                     include: doctorInclude,
                 });
             },
-            { maxWait: 10_000, timeout: 20_000 },
+            {
+                maxWait: 10_000,
+                timeout: 20_000,
+            },
         );
 
         revalidatePath(MANAGEMENT_PATH);
 
         return {
             success: true,
-            data: { doctor: mapDoctor(updated) },
+            data: {
+                doctor: mapDoctor(updated),
+            },
         };
     } catch (error) {
         return databaseError("setDoctorActiveStatusAction", error);
@@ -793,17 +1102,26 @@ export async function deleteDoctorAction(
         session = await requirePortalSession("admin");
     } catch (error) {
         console.error("[deleteDoctorAction] Authorization failed", error);
-        return invalid("Your session has expired. Sign in and try again.", "UNAUTHORIZED");
+
+        return invalid(
+            "Your session has expired. Sign in and try again.",
+            "UNAUTHORIZED",
+        );
     }
 
     const id = cleanText(doctorId);
 
     if (!validUuid(id)) {
-        return invalid("The selected doctor is invalid.", "INVALID_DOCTOR");
+        return invalid(
+            "The selected doctor is invalid.",
+            "INVALID_DOCTOR",
+        );
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
+        const clinicIds = await getOrganizationClinicIds(
+            session.organizationId,
+        );
 
         if (clinicIds.length === 0) {
             return invalid(
@@ -832,9 +1150,15 @@ export async function deleteDoctorAction(
             );
         }
 
-        const actorId = (session as unknown as { userId?: string }).userId;
+        const actorId = (
+            session as unknown as { userId?: string }
+        ).userId;
 
-        if (doctor.userId && actorId && doctor.userId === actorId) {
+        if (
+            doctor.userId &&
+            actorId &&
+            doctor.userId === actorId
+        ) {
             return invalid(
                 "You cannot delete the account you are currently signed in with.",
                 "CANNOT_DELETE_SELF",
@@ -859,7 +1183,9 @@ export async function deleteDoctorAction(
                 });
 
                 if (!currentDoctor) {
-                    return { status: "not-found" as const };
+                    return {
+                        status: "not-found" as const,
+                    };
                 }
 
                 // Prevent deletion when appointment history exists.
@@ -872,12 +1198,16 @@ export async function deleteDoctorAction(
                 });
 
                 if (appointmentCount > 0) {
-                    return { status: "has-appointments" as const };
+                    return {
+                        status: "has-appointments" as const,
+                    };
                 }
 
                 if (currentDoctor.userId) {
-                    // Explicitly remove this user's audit logs within the current
-                    // organization only. This uses prismaBase intentionally because
+                    // Explicitly remove this user's audit logs within
+                    // the current organization only.
+                    //
+                    // This operation uses prismaBase intentionally because
                     // the normal Prisma client enforces append-only logs.
                     await tx.auditLog.deleteMany({
                         where: {
@@ -897,7 +1227,8 @@ export async function deleteDoctorAction(
                 });
 
                 if (currentDoctor.userId) {
-                    // Delete the associated user only after removing its audit logs.
+                    // Delete the associated user account only after
+                    // removing its audit logs.
                     await tx.user.delete({
                         where: {
                             id: currentDoctor.userId,
@@ -911,7 +1242,10 @@ export async function deleteDoctorAction(
                     id: currentDoctor.id,
                 };
             },
-            { maxWait: 10_000, timeout: 20_000 },
+            {
+                maxWait: 10_000,
+                timeout: 20_000,
+            },
         );
 
         if (result.status === "not-found") {
@@ -932,20 +1266,27 @@ export async function deleteDoctorAction(
 
         return {
             success: true,
-            data: { id: result.id },
+            data: {
+                id: result.id,
+            },
         };
     } catch (error) {
         if (
             error instanceof Prisma.PrismaClientKnownRequestError &&
             error.code === "P2003"
         ) {
-            console.error("[deleteDoctorAction] Foreign key constraint:", error);
+            console.error(
+                "[deleteDoctorAction] Foreign key constraint:",
+                error,
+            );
 
             return invalid(
                 "This doctor or user is still referenced by other records and cannot be deleted.",
                 "HAS_RELATED_RECORDS",
             );
         }
+
+        console.error("[deleteDoctorAction] Error:", error);
 
         return databaseError("deleteDoctorAction", error);
     }
@@ -959,8 +1300,15 @@ export async function regenerateTempPasswordAction(
     try {
         session = await requirePortalSession("admin");
     } catch (error) {
-        console.error("[regenerateTempPasswordAction] Authorization failed", error);
-        return invalid("Your session has expired. Sign in and try again.", "UNAUTHORIZED");
+        console.error(
+            "[regenerateTempPasswordAction] Authorization failed",
+            error,
+        );
+
+        return invalid(
+            "Your session has expired. Sign in and try again.",
+            "UNAUTHORIZED",
+        );
     }
 
     const id = cleanText(doctorId);
@@ -970,7 +1318,9 @@ export async function regenerateTempPasswordAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
+        const clinicIds = await getOrganizationClinicIds(
+            session.organizationId,
+        );
 
         if (clinicIds.length === 0) {
             return invalid(
@@ -984,7 +1334,9 @@ export async function regenerateTempPasswordAction(
             where: {
                 id,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
+                clinicId: {
+                    in: clinicIds,
+                },
             },
             select: {
                 clinicId: true,
@@ -1006,7 +1358,10 @@ export async function regenerateTempPasswordAction(
         }
 
         if (!doctor.user) {
-            return invalid("This doctor does not have a user account.", "NO_ACCOUNT");
+            return invalid(
+                "This doctor does not have a user account.",
+                "NO_ACCOUNT",
+            );
         }
 
         if (!doctor.user.mustChangePassword) {
@@ -1017,6 +1372,7 @@ export async function regenerateTempPasswordAction(
         }
 
         const temporaryPassword = generateTemporaryPassword();
+
         const passwordHash = await hashPassword(temporaryPassword);
 
         await prisma.user.update({
@@ -1042,4 +1398,83 @@ export async function regenerateTempPasswordAction(
     } catch (error) {
         return databaseError("regenerateTempPasswordAction", error);
     }
+}
+
+export async function getDoctorOptionsAction(): Promise<
+    DoctorActionResult<{
+        clinics: DoctorClinicOption[];
+        services: DoctorServiceOption[];
+    }>
+> {
+    try {
+        const session = await requirePortalSession("admin");
+
+        const [clinics, services] = await Promise.all([
+            prisma.clinic.findMany({
+                where: {
+                    organizationId: session.organizationId,
+                    isActive: true,
+                },
+                select: {
+                    id: true,
+                    nameEn: true,
+                    nameAr: true,
+                    isActive: true,
+                },
+                orderBy: { nameEn: "asc" },
+            }),
+            prisma.service.findMany({
+                where: {
+                    organizationId: session.organizationId,
+                    isActive: true,
+                    clinic: {
+                        is: {
+                            organizationId: session.organizationId,
+                            isActive: true,
+                        },
+                    },
+                },
+                select: {
+                    id: true,
+                    clinicId: true,
+                    nameEn: true,
+                    nameAr: true,
+                    code: true,
+                    isActive: true,
+                },
+                orderBy: { nameEn: "asc" },
+            }),
+        ]);
+
+        return {
+            success: true,
+            data: { clinics, services },
+        };
+    } catch (error) {
+        return databaseError("getDoctorOptionsAction", error);
+    }
+}
+
+export async function getDoctorFormOptions(): Promise<
+    DoctorActionResult<{
+        clinics: DoctorClinicOption[];
+        services: DoctorServiceOption[];
+    }>
+> {
+    return getDoctorOptionsAction();
+}
+
+async function getOrganizationClinicIds(
+    organizationId: string,
+): Promise<string[]> {
+    const clinics = await prisma.clinic.findMany({
+        where: {
+            organizationId,
+        },
+        select: {
+            id: true,
+        },
+    });
+
+    return clinics.map((clinic) => clinic.id);
 }
