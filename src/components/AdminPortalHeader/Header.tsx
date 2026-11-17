@@ -1,18 +1,20 @@
-"use client";
+// ============================================================================
+// FILE: components/AdminPortalHeader/Header.tsx
+// SERVER COMPONENT. Static markup only. Interactive leaves:
+//  - <MobileMenuButton />  (drawer toggle)
+//  - <LanguageToggle />    (already a client leaf)
+//  - <ThemeToggle />       (already a client leaf)
+// ============================================================================
 
-import {
-    Bell,
-    Menu,
-    Users,
-} from "lucide-react";
+import { Bell, Users } from "lucide-react";
 
 import { LanguageToggle } from "@/components/portal/language-toggle";
 import { ThemeToggle } from "@/components/portal/theme-toggle";
 import type { Locale } from "@/lib/i18n/types";
+import MobileMenuButton from "./MobileMenuButton";
 
 type AdminHeaderProps = {
     locale: Locale;
-    onMenuOpen: () => void;
 };
 
 const translations = {
@@ -34,10 +36,7 @@ const translations = {
     },
 } as const;
 
-export default function AdminHeader({
-    locale,
-    onMenuOpen,
-}: AdminHeaderProps) {
+export default function AdminHeader({ locale }: AdminHeaderProps) {
     const isRtl = locale === "ar";
     const t = translations[locale];
 
@@ -46,33 +45,20 @@ export default function AdminHeader({
             <div className="flex min-h-[76px] items-center justify-between gap-3 px-4 py-3 sm:px-6 xl:px-8">
                 {/* Greeting and mobile sidebar button */}
                 <div className="flex min-w-0 items-center gap-3">
-                    <button
-                        type="button"
-                        aria-label={t.menuOpen}
-                        aria-controls="admin-sidebar"
-                        onClick={onMenuOpen}
-                        className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-slate-200 text-slate-600 transition hover:bg-slate-50 lg:hidden dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
-                    >
-                        <Menu size={21} />
-                    </button>
+                    <MobileMenuButton label={t.menuOpen} />
 
                     <div className="min-w-0">
                         <p className="truncate text-sm font-bold text-slate-900 dark:text-white sm:text-base">
                             {t.greeting}
                         </p>
 
-                        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                            {t.role}
-                        </p>
+                        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{t.role}</p>
                     </div>
                 </div>
 
                 {/* Header actions */}
                 <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
-                    <LanguageToggle
-                        locale={locale}
-                        variant="header"
-                    />
+                    <LanguageToggle locale={locale} variant="header" />
 
                     <ThemeToggle
                         lightLabel={t.lightMode}
