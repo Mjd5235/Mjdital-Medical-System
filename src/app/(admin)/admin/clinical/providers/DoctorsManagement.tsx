@@ -90,6 +90,8 @@ type DoctorsManagementProps = {
     initialOptions: DoctorFormOptions;
     /** Set when the server-side load failed; the UI shows the retry state. */
     initialError: string | null;
+    /** True only for the Suspense fallback: render the frame with skeleton rows. */
+    initialLoading?: boolean;
 };
 
 type DoctorListItem = Omit<DoctorRow, "services"> & {
@@ -1932,13 +1934,14 @@ export default function DoctorsManagementPage({
     initialDoctors,
     initialOptions,
     initialError,
+    initialLoading = false,
 }: DoctorsManagementProps) {
     const [locale, setLocale] = useState<Locale>(initialLocale);
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [doctors, setDoctors] = useState<DoctorRow[]>(initialDoctors);
     const [options, setOptions] = useState<DoctorFormOptions>(initialOptions);
-    const [loading, setLoading] = useState(false);
-    const [optionsLoading, setOptionsLoading] = useState(false);
+    const [loading, setLoading] = useState(initialLoading);
+    const [optionsLoading, setOptionsLoading] = useState(initialLoading);
     const [loadError, setLoadError] = useState(
         initialError ? (initialError === "LOAD_FAILED" ? messages[initialLocale].loadFailed : initialError) : "",
     );
@@ -1960,8 +1963,8 @@ export default function DoctorsManagementPage({
     const doctorsRef = useRef<DoctorRow[]>(initialDoctors);
     const optionsRef = useRef<DoctorFormOptions>(initialOptions);
     // Options arrive with the server render; when that failed, the first modal open fetches them.
-    const optionsLoadedRef = useRef(!initialError);
-    const optionsFetchedAtRef = useRef(initialError ? 0 : Date.now());
+    const optionsLoadedRef = useRef(!initialError && !initialLoading);
+    const optionsFetchedAtRef = useRef(initialError || initialLoading ? 0 : Date.now());
     const optionsInflightRef = useRef(false);
     const doctorsInflightRef = useRef(false);
     const queueRef = useRef(new Map<string, Promise<void>>());
