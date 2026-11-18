@@ -9,6 +9,7 @@ import {
 import { randomInt } from "node:crypto";
 import { prisma, prismaBase } from "@/lib/db/prisma";
 import { requirePortalSession } from "@/lib/auth/guard";
+import { getSession } from "@/lib/auth/session";
 import { hashPassword } from "@/lib/auth/password";
 
 const TOKEN_EXPIRY_HOURS = 24;
@@ -625,77 +626,291 @@ export async function getDoctorsAction(
     }
 }
 
+type RawDoctorRow = {
+    id: string;
+    userId: string | null;
+    email: string | null;
+    userIsActive: boolean | null;
+    mustChangePassword: boolean | null;
+    fullNameEn: string;
+    specialtyEn: string;
+    specialtyAr: string;
+    nationalId: string;
+    identityType: IdentityType;
+    scfhsLicenseNumber: string;
+    professionalRank: DoctorProfessionalRank;
+    clinicId: string;
+    clinicNameEn: string;
+    clinicNameAr: string;
+    commissionRate: number | string;
+    isActive: boolean;
+    createdAt: string;
+    services: Array<{ id: string; nameEn: string; nameAr: string; code: string }>;
+};
+
+type RawSnapshot = {
+    clinics: DoctorClinicOption[];
+    services: DoctorServiceOption[];
+    doctors: RawDoctorRow[];
+};
+
+function toIsoString(value: string): string {
+    // `timestamp(3)` columns are stored as UTC without an offset.
+    const normalized = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(value) ? value : `${value}Z`;
+    const date = new Date(normalized);
+
+    return Number.isNaN(date.getTime()) ? value : date.toISOString();
+}
+
+function mapRawDoctor(row: RawDoctorRow): DoctorRow {
+    const nameParts = row.fullNameEn.split(/\s+/);
+    const hasUser = row.userId !== null && row.email !== null;
+    const mustChangePassword = Boolean(row.mustChangePassword);
+
+    return {
+        id: row.id,
+        userId: row.userId,
+        email: row.email,
+        firstName: nameParts[0] ?? row.fullNameEn,
+        lastName: nameParts.slice(1).join(" "),
+        fullName: row.fullNameEn,
+        specialty: row.specialtyEn,
+        specialtyAr: row.specialtyAr,
+        nationalId: row.nationalId,
+        identityType: row.identityType,
+        scfhsLicenseNumber: row.scfhsLicenseNumber,
+        professionalRank: row.professionalRank,
+        clinicId: row.clinicId,
+        clinicName: row.clinicNameEn,
+        clinicNameAr: row.clinicNameAr,
+        commissionRate: String(row.commissionRate),
+        isActive: row.isActive,
+        mustChangePassword,
+        accountStatus: !row.isActive
+            ? "INACTIVE"
+            : !hasUser
+                ? "NO_ACCOUNT"
+                : mustChangePassword || !row.userIsActive
+                    ? "INVITED"
+                    : "ACTIVE",
+        createdAt: toIsoString(row.createdAt),
+        services: row.services,
+    };
+}
+
+/**
+ * FAST PATH: clinics + services + doctors (with clinic, user and services)
+ * in ONE SQL statement = ONE database round trip.
+ *
+ * Tenant safety: the only filter input is `organizationId`, taken from the
+ * signed session cookie and re-verified against the database by
+ * requirePortalSession (which runs in parallel and aborts the request if it
+ * fails). Every sub-select is filtered by organization_id as a bound parameter.
+ */
+async function loadSnapshotSingleQuery(organizationId: string): Promise<RawSnapshot> {
+    const rows = await prisma.$queryRaw<Array<{ snapshot: RawSnapshot }>>`
+        SELECT json_build_object(
+            'clinics', (
+                SELECT COALESCE(json_agg(json_build_object(
+                    'id', c.id,
+                    'nameEn', c.name_en,
+                    'nameAr', c.name_ar,
+                    'isActive', c.is_active
+                ) ORDER BY c.is_active DESC, c.name_en ASC), '[]'::json)
+                FROM clinics c
+                WHERE c.organization_id = ${organizationId}::uuid
+            ),
+            'services', (
+                SELECT COALESCE(json_agg(json_build_object(
+                    'id', s.id,
+                    'clinicId', s.clinic_id,
+                    'nameEn', s.name_en,
+                    'nameAr', s.name_ar,
+                    'code', s.code,
+                    'isActive', s.is_active
+                ) ORDER BY s.name_en ASC), '[]'::json)
+                FROM services s
+                WHERE s.organization_id = ${organizationId}::uuid
+            ),
+            'doctors', (
+                SELECT COALESCE(json_agg(json_build_object(
+                    'id', d.id,
+                    'userId', d.user_id,
+                    'email', u.email,
+                    'userIsActive', u.is_active,
+                    'mustChangePassword', u.must_change_password,
+                    'fullNameEn', d.full_name_en,
+                    'specialtyEn', d.specialty_en,
+                    'specialtyAr', d.specialty_ar,
+                    'nationalId', d.national_id,
+                    'identityType', d.identity_type,
+                    'scfhsLicenseNumber', d.scfhs_license_number,
+                    'professionalRank', d.professional_rank,
+                    'clinicId', d.clinic_id,
+                    'clinicNameEn', c.name_en,
+                    'clinicNameAr', c.name_ar,
+                    'commissionRate', d.commission_rate,
+                    'isActive', d.is_active,
+                    'createdAt', d.created_at,
+                    'services', COALESCE((
+                        SELECT json_agg(json_build_object(
+                            'id', sv.id,
+                            'nameEn', sv.name_en,
+                            'nameAr', sv.name_ar,
+                            'code', sv.code
+                        ) ORDER BY sv.name_en ASC)
+                        FROM "_DoctorToService" ds
+                        JOIN services sv ON sv.id = ds."B"
+                        WHERE ds."A" = d.id
+                    ), '[]'::json)
+                ) ORDER BY d.created_at DESC, d.id ASC), '[]'::json)
+                FROM (
+                    SELECT *
+                    FROM doctors
+                    WHERE organization_id = ${organizationId}::uuid
+                    ORDER BY created_at DESC, id ASC
+                    LIMIT ${ALL_DOCTORS_CAP}
+                ) d
+                JOIN clinics c ON c.id = d.clinic_id
+                LEFT JOIN users u ON u.id = d.user_id
+            )
+        ) AS snapshot
+    `;
+
+    const snapshot = rows[0]?.snapshot;
+
+    if (!snapshot) {
+        throw new Error("Empty doctors snapshot");
+    }
+
+    return snapshot;
+}
+
+/** FALLBACK PATH: the original Prisma queries (more round trips, same result). */
+async function loadSnapshotWithPrisma(organizationId: string): Promise<DoctorsPageData> {
+    const clinics = await prisma.clinic.findMany({
+        where: { organizationId },
+        select: { id: true, nameEn: true, nameAr: true, isActive: true },
+        orderBy: [{ isActive: "desc" }, { nameEn: "asc" }],
+    });
+
+    if (clinics.length === 0) {
+        return { doctors: [], options: { clinics: [], services: [] } };
+    }
+
+    const clinicIds = clinics.map((clinic) => clinic.id);
+
+    const [services, rows] = await Promise.all([
+        prisma.service.findMany({
+            where: { organizationId, clinicId: { in: clinicIds } },
+            select: {
+                id: true,
+                clinicId: true,
+                nameEn: true,
+                nameAr: true,
+                code: true,
+                isActive: true,
+            },
+            orderBy: { nameEn: "asc" },
+        }),
+        prisma.doctor.findMany({
+            where: { organizationId, clinicId: { in: clinicIds } },
+            include: doctorInclude,
+            orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+            take: ALL_DOCTORS_CAP,
+        }),
+    ]);
+
+    const activeClinics = clinics.filter((clinic) => clinic.isActive);
+    const activeClinicIds = new Set(activeClinics.map((clinic) => clinic.id));
+
+    return {
+        doctors: rows.map(mapDoctor),
+        options: {
+            clinics: activeClinics,
+            services: services.filter(
+                (service) => service.isActive && activeClinicIds.has(service.clinicId),
+            ),
+        },
+    };
+}
+
+function isNextRedirect(error: unknown): boolean {
+    const digest = (error as { digest?: unknown } | null)?.digest;
+
+    return typeof digest === "string" && digest.startsWith("NEXT_REDIRECT");
+}
+
 /**
  * One-shot snapshot for the Doctors screen: doctors + form options.
  *
- * Round trips: clinics -> (services || doctors). The doctor query uses
- * relationLoadStrategy "join", so clinic/user/services come back in ONE SQL
- * statement instead of 4-5 separate ones. Form options are derived in memory,
- * so no second request is needed.
- *
- * It is called directly by the Server Component (page.tsx) so the HTML arrives
- * with data already inside, and by the client only for retry / resync.
+ * The session is read from the signed cookie (no DB), then the database
+ * verification (requirePortalSession) and the data query run IN PARALLEL, so
+ * the whole screen costs about one database round trip instead of seven.
+ * Data is returned only if the verification passes (it redirects otherwise).
  */
 export async function getDoctorsPageDataAction(): Promise<
     DoctorActionResult<DoctorsPageData>
 > {
+    const t0 = performance.now();
+    const lap = (label: string) => {
+        if (process.env.NODE_ENV !== "production") {
+            console.log(`[doctors-perf] ${label}: ${Math.round(performance.now() - t0)}ms`);
+        }
+    };
+
     try {
-        const session = await requirePortalSession("admin");
-        const organizationId = session.organizationId;
+        const cookieSession = await getSession();
 
-        const clinics = await prisma.clinic.findMany({
-            where: { organizationId },
-            select: { id: true, nameEn: true, nameAr: true, isActive: true },
-            orderBy: [{ isActive: "desc" }, { nameEn: "asc" }],
-        });
+        if (!cookieSession?.organizationId) {
+            // Redirects to the login page.
+            await requirePortalSession("admin");
 
-        if (clinics.length === 0) {
-            return {
-                success: true,
-                data: { doctors: [], options: { clinics: [], services: [] } },
-            };
+            return invalid("Your session has expired. Sign in and try again.", "UNAUTHORIZED");
         }
 
-        const clinicIds = clinics.map((clinic) => clinic.id);
+        const organizationId = cookieSession.organizationId;
 
-        const [services, rows] = await Promise.all([
-            prisma.service.findMany({
-                where: { organizationId, clinicId: { in: clinicIds } },
-                select: {
-                    id: true,
-                    clinicId: true,
-                    nameEn: true,
-                    nameAr: true,
-                    code: true,
-                    isActive: true,
-                },
-                orderBy: { nameEn: "asc" },
-            }),
-            prisma.doctor.findMany({
-                where: { organizationId, clinicId: { in: clinicIds } },
-                include: doctorInclude,
-                orderBy: [{ createdAt: "desc" }, { id: "asc" }],
-                take: ALL_DOCTORS_CAP,
+        const [session, snapshot] = await Promise.all([
+            requirePortalSession("admin"),
+            loadSnapshotSingleQuery(organizationId).catch((error: unknown) => {
+                if (isNextRedirect(error)) throw error;
+
+                console.error("[getDoctorsPageDataAction] single-query path failed", error);
+
+                return null;
             }),
         ]);
 
-        const activeClinics = clinics.filter((clinic) => clinic.isActive);
-        const activeClinicIds = new Set(activeClinics.map((clinic) => clinic.id));
+        lap("verified + fast query");
 
-        return {
-            success: true,
-            data: {
-                doctors: rows.map(mapDoctor),
-                options: {
-                    clinics: activeClinics,
-                    services: services.filter(
-                        (service) =>
-                            service.isActive && activeClinicIds.has(service.clinicId),
-                    ),
+        if (snapshot) {
+            const activeClinics = snapshot.clinics.filter((clinic) => clinic.isActive);
+            const activeClinicIds = new Set(activeClinics.map((clinic) => clinic.id));
+
+            return {
+                success: true,
+                data: {
+                    doctors: snapshot.doctors.map(mapRawDoctor),
+                    options: {
+                        clinics: activeClinics,
+                        services: snapshot.services.filter(
+                            (service) =>
+                                service.isActive && activeClinicIds.has(service.clinicId),
+                        ),
+                    },
                 },
-            },
-        };
+            };
+        }
+
+        const fallback = await loadSnapshotWithPrisma(session.organizationId);
+
+        lap("fallback path");
+
+        return { success: true, data: fallback };
     } catch (error) {
+        if (isNextRedirect(error)) throw error;
+
         console.error("[getDoctorsPageDataAction]", error);
 
         return {
