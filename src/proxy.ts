@@ -532,7 +532,7 @@ export async function proxy(
     return redirectToRoleHome(request, session.role, portal);
   }
 
-  // Already signed in: the login page just forwards to the portal home.
+  // Already signed in: the login page just forwards to the portal home
   if (isLogin) {
     return redirectTo(request, portalHomePath(portal), portal);
   }
