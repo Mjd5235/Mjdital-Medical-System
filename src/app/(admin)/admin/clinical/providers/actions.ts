@@ -7,14 +7,14 @@ import {
     UserRole,
 } from "@prisma/client";
 import { randomInt } from "node:crypto";
-import { revalidatePath } from "next/cache";
 import { prisma, prismaBase } from "@/lib/db/prisma";
 import { requirePortalSession } from "@/lib/auth/guard";
 import { hashPassword } from "@/lib/auth/password";
 
-const MANAGEMENT_PATH = "/admin/clinical/providers";
 const TOKEN_EXPIRY_HOURS = 24;
 const PAGE_SIZE = 10;
+/** Safety cap for the single-query "load everything" snapshot used by the client. */
+const ALL_DOCTORS_CAP = 1000;
 
 export interface DoctorActionResult<T> {
     success: boolean;
@@ -84,6 +84,16 @@ export interface GetDoctorsData {
     page: number;
     pageSize: number;
     totalPages: number;
+}
+
+export interface DoctorFormOptionsData {
+    clinics: DoctorClinicOption[];
+    services: DoctorServiceOption[];
+}
+
+export interface DoctorsPageData {
+    doctors: DoctorRow[];
+    options: DoctorFormOptionsData;
 }
 
 export interface CreateDoctorInput {
@@ -615,6 +625,87 @@ export async function getDoctorsAction(
     }
 }
 
+/**
+ * One-shot snapshot for the Doctors screen: doctors + form options.
+ *
+ * Round trips: clinics -> (services || doctors). The doctor query uses
+ * relationLoadStrategy "join", so clinic/user/services come back in ONE SQL
+ * statement instead of 4-5 separate ones. Form options are derived in memory,
+ * so no second request is needed.
+ *
+ * It is called directly by the Server Component (page.tsx) so the HTML arrives
+ * with data already inside, and by the client only for retry / resync.
+ */
+export async function getDoctorsPageDataAction(): Promise<
+    DoctorActionResult<DoctorsPageData>
+> {
+    try {
+        const session = await requirePortalSession("admin");
+        const organizationId = session.organizationId;
+
+        const clinics = await prisma.clinic.findMany({
+            where: { organizationId },
+            select: { id: true, nameEn: true, nameAr: true, isActive: true },
+            orderBy: [{ isActive: "desc" }, { nameEn: "asc" }],
+        });
+
+        if (clinics.length === 0) {
+            return {
+                success: true,
+                data: { doctors: [], options: { clinics: [], services: [] } },
+            };
+        }
+
+        const clinicIds = clinics.map((clinic) => clinic.id);
+
+        const [services, rows] = await Promise.all([
+            prisma.service.findMany({
+                where: { organizationId, clinicId: { in: clinicIds } },
+                select: {
+                    id: true,
+                    clinicId: true,
+                    nameEn: true,
+                    nameAr: true,
+                    code: true,
+                    isActive: true,
+                },
+                orderBy: { nameEn: "asc" },
+            }),
+            prisma.doctor.findMany({
+                where: { organizationId, clinicId: { in: clinicIds } },
+                include: doctorInclude,
+                orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+                take: ALL_DOCTORS_CAP,
+            }),
+        ]);
+
+        const activeClinics = clinics.filter((clinic) => clinic.isActive);
+        const activeClinicIds = new Set(activeClinics.map((clinic) => clinic.id));
+
+        return {
+            success: true,
+            data: {
+                doctors: rows.map(mapDoctor),
+                options: {
+                    clinics: activeClinics,
+                    services: services.filter(
+                        (service) =>
+                            service.isActive && activeClinicIds.has(service.clinicId),
+                    ),
+                },
+            },
+        };
+    } catch (error) {
+        console.error("[getDoctorsPageDataAction]", error);
+
+        return {
+            success: false,
+            error: "Unable to load doctors. Please refresh the page and try again.",
+            code: "FETCH_DOCTORS_FAILED",
+        };
+    }
+}
+
 export async function createDoctorAction(
     input: CreateDoctorInput,
 ): Promise<DoctorActionResult<CreateDoctorResultData>> {
@@ -722,8 +813,6 @@ export async function createDoctorAction(
             },
             { maxWait: 10_000, timeout: 20_000 },
         );
-
-        revalidatePath(MANAGEMENT_PATH);
 
         return {
             success: true,
@@ -946,8 +1035,6 @@ export async function updateDoctorAction(
             },
         );
 
-        revalidatePath(MANAGEMENT_PATH);
-
         return {
             success: true,
             data: {
@@ -1079,8 +1166,6 @@ export async function setDoctorActiveStatusAction(
                 timeout: 20_000,
             },
         );
-
-        revalidatePath(MANAGEMENT_PATH);
 
         return {
             success: true,
@@ -1262,8 +1347,6 @@ export async function deleteDoctorAction(
             );
         }
 
-        revalidatePath(MANAGEMENT_PATH);
-
         return {
             success: true,
             data: {
@@ -1385,8 +1468,6 @@ export async function regenerateTempPasswordAction(
                 mustChangePassword: true,
             },
         });
-
-        revalidatePath(MANAGEMENT_PATH);
 
         return {
             success: true,

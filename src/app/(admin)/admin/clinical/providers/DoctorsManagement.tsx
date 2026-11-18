@@ -68,7 +68,7 @@ import {
     createDoctorAction,
     deleteDoctorAction,
     getDoctorFormOptions,
-    getDoctorsAction,
+    getDoctorsPageDataAction,
     regenerateTempPasswordAction,
     setDoctorActiveStatusAction,
     updateDoctorAction,
@@ -84,6 +84,12 @@ const TEMP_ID_PREFIX = "tmp-";
 
 type DoctorsManagementProps = {
     initialLocale: Locale;
+    /** Server-fetched rows (page.tsx) so the first paint already has data. */
+    initialDoctors: DoctorRow[];
+    /** Server-fetched clinics/services for filters and the form. */
+    initialOptions: DoctorFormOptions;
+    /** Set when the server-side load failed; the UI shows the retry state. */
+    initialError: string | null;
 };
 
 type DoctorListItem = Omit<DoctorRow, "services"> & {
@@ -627,32 +633,14 @@ function buildOptimisticRow(
 }
 
 async function fetchAllDoctors(): Promise<{ rows: DoctorRow[] } | { error: string | null }> {
-    const first = await getDoctorsAction({ page: 1, pageSize: 100 });
+    // Single server round trip (one action, one joined query) instead of N paged actions.
+    const result = await getDoctorsPageDataAction();
 
-    if (!first.success || !first.data) {
-        return { error: first.error ?? null };
+    if (!result.success || !result.data) {
+        return { error: result.error ?? null };
     }
 
-    const rows: DoctorRow[] = Array.isArray(first.data.doctors) ? [...first.data.doctors] : [];
-    const totalPages = first.data.totalPages ?? 1;
-
-    if (totalPages > 1) {
-        const rest = await Promise.all(
-            Array.from({ length: totalPages - 1 }, (_, index) =>
-                getDoctorsAction({ page: index + 2, pageSize: 100 }),
-            ),
-        );
-
-        for (const result of rest) {
-            if (!result.success || !result.data) {
-                return { error: result.error ?? null };
-            }
-
-            rows.push(...result.data.doctors);
-        }
-    }
-
-    return { rows };
+    return { rows: result.data.doctors };
 }
 
 function Field({
@@ -1939,15 +1927,21 @@ function DoctorFormModal({
     );
 }
 
-export default function DoctorsManagementPage({ initialLocale,
+export default function DoctorsManagementPage({
+    initialLocale,
+    initialDoctors,
+    initialOptions,
+    initialError,
 }: DoctorsManagementProps) {
     const [locale, setLocale] = useState<Locale>(initialLocale);
     const [sidebarOpen, setSidebarOpen] = useState(false);
-    const [doctors, setDoctors] = useState<DoctorRow[]>([]);
-    const [options, setOptions] = useState<DoctorFormOptions>(EMPTY_OPTIONS);
-    const [loading, setLoading] = useState(true);
-    const [optionsLoading, setOptionsLoading] = useState(true);
-    const [loadError, setLoadError] = useState("");
+    const [doctors, setDoctors] = useState<DoctorRow[]>(initialDoctors);
+    const [options, setOptions] = useState<DoctorFormOptions>(initialOptions);
+    const [loading, setLoading] = useState(false);
+    const [optionsLoading, setOptionsLoading] = useState(false);
+    const [loadError, setLoadError] = useState(
+        initialError ? (initialError === "LOAD_FAILED" ? messages[initialLocale].loadFailed : initialError) : "",
+    );
     const [optionsError, setOptionsError] = useState("");
     const [query, setQuery] = useState("");
     const [clinicFilter, setClinicFilter] = useState("ALL");
@@ -1963,10 +1957,11 @@ export default function DoctorsManagementPage({ initialLocale,
 
     // Always-fresh mirrors so background tasks never read stale closures.
     const tRef = useRef<Messages>(t);
-    const doctorsRef = useRef<DoctorRow[]>([]);
-    const optionsRef = useRef<DoctorFormOptions>(EMPTY_OPTIONS);
-    const optionsLoadedRef = useRef(false);
-    const optionsFetchedAtRef = useRef(0);
+    const doctorsRef = useRef<DoctorRow[]>(initialDoctors);
+    const optionsRef = useRef<DoctorFormOptions>(initialOptions);
+    // Options arrive with the server render; when that failed, the first modal open fetches them.
+    const optionsLoadedRef = useRef(!initialError);
+    const optionsFetchedAtRef = useRef(initialError ? 0 : Date.now());
     const optionsInflightRef = useRef(false);
     const doctorsInflightRef = useRef(false);
     const queueRef = useRef(new Map<string, Promise<void>>());
@@ -2148,11 +2143,8 @@ export default function DoctorsManagementPage({ initialLocale,
         [],
     );
 
-    // Loaders are stable (no locale dependency), so this runs exactly once on mount.
-    useEffect(() => {
-        void loadDoctors();
-        void loadOptions();
-    }, [loadDoctors, loadOptions]);
+    // No mount-time fetch: page.tsx already delivered doctors + options with the HTML.
+    // loadDoctors() is only used by the retry button; loadOptions(true) by the modals.
 
     /* --------------------- optimistic settle / rollback -------------- */
 

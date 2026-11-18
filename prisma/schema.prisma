@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
 }
 
 datasource db {
@@ -340,8 +341,7 @@ model Clinic {
   servicePrices      ServicePrice[]
   shifts             Shift[]
 
-  @@index([organizationId])
-  @@index([organizationId, isActive])
+  @@index([organizationId, isActive, nameEn])
   @@map("clinics")
 }
 
@@ -371,9 +371,7 @@ model Service {
   prices       ServicePrice[]
 
   @@unique([organizationId, clinicId, code])
-  @@index([organizationId])
-  @@index([organizationId, clinicId])
-  @@index([organizationId, isActive])
+  @@index([organizationId, clinicId, isActive, nameEn])
   @@map("services")
 }
 
@@ -488,8 +486,8 @@ model Doctor {
 
   @@unique([organizationId, scfhsLicenseNumber])
   @@unique([organizationId, nationalId])
-  @@index([organizationId])
-  @@index([organizationId, clinicId])
+  @@index([organizationId, clinicId, createdAt(sort: Desc), id])
+  @@index([organizationId, isActive])
   @@map("doctors")
 }
 
