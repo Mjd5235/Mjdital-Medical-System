@@ -268,21 +268,41 @@ async function lookupAccount(
   session: SessionUser,
 ): Promise<AccountLookup> {
   try {
-    const account = await prisma.user.findFirst({
-      where: {
-        id: session.userId,
-        organizationId: session.organizationId,
-      },
-      select: {
-        isActive: true,
-        mustChangePassword: true,
-        doctor: {
-          select: {
-            isActive: true,
-          },
-        },
-      },
-    });
+    // ONE round trip (user + linked doctor) instead of two sequential Prisma
+    // queries. Same semantics as before: no row -> account is null; no doctor
+    // row -> doctor is null. Both ids are bound parameters and the userId /
+    // organizationId were already validated as UUIDs by parseSessionToken.
+    const rows = await prisma.$queryRaw<
+      Array<{
+        isActive: boolean;
+        mustChangePassword: boolean;
+        hasDoctor: boolean;
+        doctorIsActive: boolean | null;
+      }>
+    >`
+      SELECT
+        u.is_active AS "isActive",
+        u.must_change_password AS "mustChangePassword",
+        (d.id IS NOT NULL) AS "hasDoctor",
+        d.is_active AS "doctorIsActive"
+      FROM users u
+      LEFT JOIN doctors d ON d.user_id = u.id
+      WHERE u.id = ${session.userId}::uuid
+        AND u.organization_id = ${session.organizationId}::uuid
+      LIMIT 1
+    `;
+
+    const row = rows[0];
+
+    const account: AccountStatus | null = row
+      ? {
+        isActive: row.isActive,
+        mustChangePassword: row.mustChangePassword,
+        doctor: row.hasDoctor
+          ? { isActive: Boolean(row.doctorIsActive) }
+          : null,
+      }
+      : null;
 
     return { ok: true, account };
   } catch (error) {
