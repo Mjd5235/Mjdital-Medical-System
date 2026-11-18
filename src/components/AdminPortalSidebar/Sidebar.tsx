@@ -173,7 +173,7 @@ export default function AdminSidebar({
                     type="button"
                     aria-label={t.menuClose}
                     onClick={onClose}
-                    className="fixed inset-0 z-40 bg-slate-950/40 backdrop-blur-[2px] lg:hidden"
+                    className="fixed inset-0 z-40 bg-slate-950/40 lg:hidden"
                 />
             )}
 
