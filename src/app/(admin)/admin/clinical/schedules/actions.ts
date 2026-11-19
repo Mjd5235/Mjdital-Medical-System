@@ -80,7 +80,7 @@ export interface ShiftServiceOption {
 
 export interface ShiftDoctorOption {
     id: string;
-    clinicId: string;
+    clinicId: string | null;
     fullNameEn: string;
     fullNameAr: string;
     specialtyEn: string;

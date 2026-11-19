@@ -1656,6 +1656,21 @@ function ShiftFormModal({
             return;
         }
 
+        if (!target.clinicId) {
+            patch({
+                doctorId: "",
+                clinicId: "",
+                serviceId: "",
+            });
+
+            setErrors((current) => ({
+                ...current,
+                clinicId: t.errClinic,
+            }));
+
+            return;
+        }
+
         const available = servicesFor(target.id, target.clinicId);
         const keep = available.some((item) => item.id === values.serviceId);
 
@@ -1664,7 +1679,12 @@ function ShiftFormModal({
             clinicId: target.clinicId,
             serviceId: keep ? values.serviceId : (available[0]?.id ?? ""),
         });
-        setErrors((current) => ({ ...current, doctorId: undefined, clinicId: undefined }));
+
+        setErrors((current) => ({
+            ...current,
+            doctorId: undefined,
+            clinicId: undefined,
+        }));
     };
 
     const onClinicChange = (clinicId: string) => {
