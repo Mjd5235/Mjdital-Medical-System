@@ -1,21 +1,35 @@
 // app/admin/clinical/services/actions.ts
 //
-// SERVER-SIDE SPEED CHANGES (behaviour is unchanged):
-//  - `revalidatePath` removed everywhere: the client owns its state now.
-//  - updateServiceAction: one clinic lookup instead of two, and no code-numbering queries
-//    when the clinic did not change.
-//  - toggleServiceStatusAction: a single read + a single write (no transaction).
-//  - Shorter transaction timeouts so a stuck request fails fast instead of hanging.
+// SCHEMA NOTE: schema.prisma needs NO change for this step. It already guarantees that doctors survive:
+//  - Doctor.clinicId is nullable and Doctor.clinic uses onDelete: SetNull.
+//  - Doctor <-> Service is an implicit many-to-many; deleting a service only removes the join rows
+//    (never the doctor).
+//  - Shift.doctor uses onDelete: Cascade from the DOCTOR side only (deleting a doctor removes its shifts,
+//    never the other way around).
 //
-// NEW: deleteClinicAction / deleteServiceAction
-//  - A clinic can only be deleted when it has no services, doctors or shifts.
-//  - A service can only be deleted when no shift uses it.
-//  - Any other foreign-key reference (e.g. appointments) is caught via Prisma P2003
-//    and returned as a friendly message.
+// TENANT GUARD NOTE (src/lib/db/prisma.ts): every top-level query on a clinic-scoped model
+// (Doctor, Service, Shift, ...) must filter by clinicId. To respect that, doctors are unassigned from
+// services through the SERVICE side (service.update with `doctors: { set: [] }`, where the service
+// query itself filters by clinicId). This only removes join rows; doctor rows are never touched or deleted.
 //
-// Recommended indexes (Prisma schema, then `prisma migrate`):
-//   model Service { @@index([organizationId, clinicId]) }
-//   model Clinic  { @@index([organizationId, isActive]) }
+// CLINIC DELETION (safe mode):
+//  - deleteClinicAction(id) removes ONLY the clinic, its services (service prices go with them,
+//    by cascade) and the doctor shifts of the clinic, inside ONE transaction.
+//  - Doctors and their user accounts are NEVER deleted: doctors are unassigned from the
+//    clinic's services (join rows removed) and detached from the clinic (Doctor.clinicId = null),
+//    so they can be re-linked from the doctors page.
+//  - Sensitive records are NEVER deleted. If the clinic still owns patients, appointments,
+//    invoices or insurance providers/policies, the deletion is refused with a clear message
+//    (the admin can deactivate the clinic instead).
+//  - audit_logs.clinic_id must be nullable with onDelete: SetNull in schema.prisma (migration
+//    required) so audit history is preserved when a clinic is deleted.
+//
+// SERVICE DELETION (safe mode):
+//  - deleteServiceAction(id) removes ONLY the service, its service prices (by cascade) and the shifts
+//    that point to it, inside ONE transaction.
+//  - Doctors are NEVER deleted: they are unassigned from the service and keep their record,
+//    clinic link and every other service.
+//
 "use server";
 
 import { Prisma } from "@prisma/client";
@@ -42,6 +56,12 @@ const ALLOWED_VAT_RATES = [0, 15] as const;
 const TX_OPTIONS = {
     maxWait: 5_000,
     timeout: 10_000,
+} as const;
+
+// Cascading deletes touch more tables, so they get a little more headroom.
+const CASCADE_TX_OPTIONS = {
+    maxWait: 5_000,
+    timeout: 20_000,
 } as const;
 
 export type ClinicSpecialty = (typeof ALLOWED_SPECIALTIES)[number];
@@ -361,6 +381,15 @@ const serviceClinicInclude = {
     },
 } as const;
 
+class ClinicDeletionBlockedError extends Error {
+    readonly details: string;
+
+    constructor(details: string) {
+        super("CLINIC_HAS_RECORDS");
+        this.details = details;
+    }
+}
+
 export async function getClinicsData() {
     const session = await requirePortalSession("admin");
 
@@ -531,8 +560,11 @@ export async function toggleClinicStatusAction(
 }
 
 /**
- * Deletes a clinic. Refused while the clinic still has services, doctors or shifts
- * (disable it instead). Any other reference (e.g. appointments) is caught via P2003.
+ * Deletes a clinic together with its services and the doctor shifts that belong to it,
+ * atomically. Doctors are NEVER deleted: they are unassigned from the clinic's services and
+ * detached from the clinic (clinicId = null). Sensitive records (patients, appointments,
+ * invoices, insurance data) are never deleted: if any exist, nothing is deleted and the
+ * reason is returned.
  */
 export async function deleteClinicAction(
     id: string,
@@ -543,66 +575,134 @@ export async function deleteClinicAction(
         return notFound("Invalid clinic identifier.", "INVALID_CLINIC_ID");
     }
 
+    const organizationId = session.organizationId;
+    let deletionStage = "initialization";
+
     try {
-        const existing = await prisma.clinic.findFirst({
-            where: { id, organizationId: session.organizationId },
-            select: { id: true },
-        });
+        await prisma.$transaction(async (tx) => {
+            const existing = await tx.clinic.findFirst({
+                where: { id, organizationId },
+                select: { id: true },
+            });
 
-        if (!existing) {
-            return notFound(
-                "The clinic was not found in your organization.",
-                "CLINIC_NOT_FOUND",
-            );
-        }
+            if (!existing) throw new Error("CLINIC_NOT_FOUND");
 
-        const [serviceCount, doctorCount, shiftCount] = await Promise.all([
-            prisma.service.count({
-                where: { clinicId: existing.id, organizationId: session.organizationId },
-            }),
-            prisma.doctor.count({
-                where: { clinicId: existing.id, organizationId: session.organizationId },
-            }),
-            prisma.shift.count({
-                where: { clinicId: existing.id, organizationId: session.organizationId },
-            }),
-        ]);
+            const clinicId = existing.id;
 
-        if (serviceCount > 0) {
-            return notFound(
-                "This clinic cannot be deleted because it still has services. Delete the services first or disable the clinic.",
-                "CLINIC_HAS_SERVICES",
-            );
-        }
+            // ---- 1) Refuse when sensitive records exist (all filters include clinicId) ----
+            deletionStage = "safety-checks";
 
-        if (doctorCount > 0 || shiftCount > 0) {
-            return notFound(
-                "This clinic cannot be deleted because doctors or shifts are linked to it. Disable it instead.",
-                "CLINIC_IN_USE",
-            );
-        }
+            const [patients, appointments, invoices, providers, policies] = [
+                await tx.patient.count({ where: { organizationId, clinicId } }),
+                await tx.appointment.count({ where: { organizationId, clinicId } }),
+                await tx.invoice.count({ where: { organizationId, clinicId } }),
+                await tx.insuranceProvider.count({ where: { organizationId, clinicId } }),
+                await tx.insurancePolicy.count({ where: { organizationId, clinicId } }),
+            ];
 
-        const result = await prisma.clinic.deleteMany({
-            where: { id: existing.id, organizationId: session.organizationId },
-        });
+            const blockers: string[] = [];
+            if (invoices > 0) blockers.push(`invoices (${invoices})`);
+            if (appointments > 0) blockers.push(`appointments (${appointments})`);
+            if (patients > 0) blockers.push(`patients (${patients})`);
+            if (providers > 0) blockers.push(`insurance providers (${providers})`);
+            if (policies > 0) blockers.push(`insurance policies (${policies})`);
 
-        if (result.count !== 1) {
-            return notFound(
-                "The clinic was not found in your organization.",
-                "CLINIC_NOT_FOUND",
-            );
-        }
+            if (blockers.length > 0) {
+                throw new ClinicDeletionBlockedError(blockers.join(", "));
+            }
 
-        return { success: true, data: { id: existing.id } };
+            // ---- 2) Unassign doctors from the services that are about to be deleted ----
+            //         Done from the SERVICE side so every top-level query filters by clinicId
+            //         (tenant guard). Only doctor <-> service join rows are removed; no doctor
+            //         row is read, updated or deleted here.
+            deletionStage = "unassign-doctors-from-services";
+
+            const clinicServices = await tx.service.findMany({
+                where: { organizationId, clinicId },
+                select: { id: true, doctors: { select: { id: true } } },
+            });
+
+            for (const service of clinicServices) {
+                if (service.doctors.length === 0) continue;
+
+                await tx.service.update({
+                    where: { id: service.id, organizationId, clinicId },
+                    data: { doctors: { set: [] } },
+                    select: { id: true },
+                });
+            }
+
+            // ---- 3) Doctor shifts of this clinic (schedules only, never the doctors) ----
+            deletionStage = "shifts";
+            await tx.shift.deleteMany({
+                where: { organizationId, clinicId },
+            });
+
+            // ---- 4) Services (service prices are removed by onDelete: Cascade) ----
+            deletionStage = "services";
+            await tx.service.deleteMany({
+                where: { organizationId, clinicId },
+            });
+
+            // ---- 5) Doctors are NEVER deleted. They are only detached from the clinic
+            //         (Doctor.clinicId is nullable, onDelete: SetNull) so they can be linked
+            //         again to another clinic/service from the doctors management page.
+            //         Their rows in `doctors` and their `users` accounts stay untouched. ----
+            deletionStage = "detach-doctors";
+            await tx.doctor.updateMany({
+                where: { organizationId, clinicId },
+                data: { clinicId: null },
+            });
+
+            // ---- 6) The clinic. audit_logs.clinic_id becomes NULL (onDelete: SetNull). ----
+            deletionStage = "clinic";
+            const result = await tx.clinic.deleteMany({
+                where: { id: clinicId, organizationId },
+            });
+
+            if (result.count !== 1) throw new Error("CLINIC_NOT_FOUND");
+        }, CASCADE_TX_OPTIONS);
+
+        return { success: true, data: { id } };
     } catch (error) {
+        if (error instanceof ClinicDeletionBlockedError) {
+            return notFound(
+                `This clinic cannot be deleted because it still has: ${error.details}. Nothing was deleted. You can deactivate the clinic instead.`,
+                "CLINIC_HAS_RECORDS",
+            );
+        }
+
+        if (error instanceof Error && error.message === "CLINIC_NOT_FOUND") {
+            return notFound(
+                "The clinic was not found in your organization.",
+                "CLINIC_NOT_FOUND",
+            );
+        }
+
         if (
             error instanceof Prisma.PrismaClientKnownRequestError &&
             error.code === "P2003"
         ) {
-            console.error("[deleteClinicAction]", error);
+            const constraint = String(
+                (error.meta as { constraint?: unknown } | undefined)?.constraint ?? "",
+            );
+
+            console.error("[deleteClinicAction] Foreign key constraint:", {
+                deletionStage,
+                code: error.code,
+                meta: error.meta,
+                message: error.message,
+            });
+
+            if (constraint.includes("audit_logs")) {
+                return notFound(
+                    "Audit logs still block this deletion. Apply the AuditLog.clinicId (nullable, onDelete: SetNull) migration, then try again. Nothing was deleted.",
+                    "AUDIT_LOG_MIGRATION_REQUIRED",
+                );
+            }
 
             return notFound(
-                "This clinic cannot be deleted because other records (such as appointments) reference it. Disable it instead.",
+                `The clinic or its related records are still referenced by other records (stage: ${deletionStage}). Nothing was deleted.`,
                 "CLINIC_IN_USE",
             );
         }
@@ -728,6 +828,7 @@ export async function updateServiceAction(
     }
 
     const clinicId = cleanText(input?.clinicId);
+
     if (!validUuid(clinicId)) {
         return notFound("Select a valid clinic.", "INVALID_CLINIC");
     }
@@ -898,8 +999,10 @@ export async function toggleServiceStatusAction(
 }
 
 /**
- * Deletes a service. Refused while any shift uses it (disable it instead).
- * Other references (e.g. appointments) are caught via Prisma P2003.
+ * Deletes a service atomically, together with its service prices (cascade) and the doctor
+ * shifts that point to it. Doctors are NEVER deleted: they are only unassigned from the
+ * service (doctor <-> service link removed) and keep their record, clinic and other services.
+ * Other references (e.g. unexpected foreign keys) are caught via Prisma P2003.
  */
 export async function deleteServiceAction(
     id: string,
@@ -910,47 +1013,54 @@ export async function deleteServiceAction(
         return notFound("Invalid service identifier.", "INVALID_SERVICE_ID");
     }
 
+    const organizationId = session.organizationId;
+
     try {
-        const existing = await prisma.service.findFirst({
-            where: {
-                id,
-                organizationId: session.organizationId,
-                clinic: { is: { organizationId: session.organizationId } },
-            },
-            select: { id: true },
-        });
+        await prisma.$transaction(async (tx) => {
+            const existing = await tx.service.findFirst({
+                where: {
+                    id,
+                    organizationId,
+                    clinic: { is: { organizationId } },
+                },
+                select: { id: true, clinicId: true },
+            });
 
-        if (!existing) {
-            return notFound(
-                "The service was not found in your organization.",
-                "SERVICE_NOT_FOUND",
-            );
-        }
+            if (!existing) throw new Error("SERVICE_NOT_FOUND");
 
-        const shiftCount = await prisma.shift.count({
-            where: { serviceId: existing.id, organizationId: session.organizationId },
-        });
+            const serviceId = existing.id;
+            const clinicId = existing.clinicId;
 
-        if (shiftCount > 0) {
-            return notFound(
-                "This service cannot be deleted because it is used in doctor shifts. Disable it instead.",
-                "SERVICE_IN_USE",
-            );
-        }
+            // ---- 1) Unassign doctors from this service (join rows only, doctors are kept).
+            //         Done from the service side so the query filters by clinicId (tenant guard). ----
+            await tx.service.update({
+                where: { id: serviceId, organizationId, clinicId },
+                data: { doctors: { set: [] } },
+                select: { id: true },
+            });
 
-        const result = await prisma.service.deleteMany({
-            where: { id: existing.id, organizationId: session.organizationId },
-        });
+            // ---- 2) Shifts that use this service (schedules only, never the doctors) ----
+            await tx.shift.deleteMany({
+                where: { organizationId, clinicId, serviceId },
+            });
 
-        if (result.count !== 1) {
-            return notFound(
-                "The service was not found in your organization.",
-                "SERVICE_NOT_FOUND",
-            );
-        }
+            // ---- 3) The service (service prices are removed by onDelete: Cascade) ----
+            const result = await tx.service.deleteMany({
+                where: { id: serviceId, organizationId, clinicId },
+            });
 
-        return { success: true, data: { id: existing.id } };
+            if (result.count !== 1) throw new Error("SERVICE_NOT_FOUND");
+        }, CASCADE_TX_OPTIONS);
+
+        return { success: true, data: { id } };
     } catch (error) {
+        if (error instanceof Error && error.message === "SERVICE_NOT_FOUND") {
+            return notFound(
+                "The service was not found in your organization.",
+                "SERVICE_NOT_FOUND",
+            );
+        }
+
         if (
             error instanceof Prisma.PrismaClientKnownRequestError &&
             error.code === "P2003"
@@ -958,7 +1068,7 @@ export async function deleteServiceAction(
             console.error("[deleteServiceAction]", error);
 
             return notFound(
-                "This service cannot be deleted because other records (such as appointments) reference it. Disable it instead.",
+                "This service cannot be deleted because other records reference it. Disable it instead.",
                 "SERVICE_IN_USE",
             );
         }

@@ -1,3 +1,7 @@
+// ============================================================================
+// actions.ts  (page.tsx is unchanged: the props passed to the client component
+// keep the same shape, so no edit is needed there)
+// ============================================================================
 "use server";
 
 import {
@@ -53,8 +57,11 @@ export interface DoctorRow {
     identityType: IdentityType;
     scfhsLicenseNumber: string;
     professionalRank: DoctorProfessionalRank;
-    clinicId: string;
+    /** `null` when the doctor is not assigned to any clinic (Doctor.clinicId is nullable). */
+    clinicId: string | null;
+    /** Empty string when the doctor has no clinic. */
     clinicName: string;
+    /** Empty string when the doctor has no clinic. */
     clinicNameAr: string;
     commissionRate: string;
     isActive: boolean;
@@ -73,6 +80,8 @@ export interface GetDoctorsInput {
     clinicId?: string;
     search?: string;
     status?: "ALL" | "ACTIVE" | "INACTIVE" | "INVITED";
+    /** "UNASSIGNED" returns doctors without a clinic or without any service. */
+    assignment?: "ALL" | "UNASSIGNED";
     page?: number;
     pageSize?: number;
 }
@@ -336,9 +345,10 @@ function mapDoctor(doctor: DoctorWithRelations): DoctorRow {
         identityType: doctor.identityType,
         scfhsLicenseNumber: doctor.scfhsLicenseNumber,
         professionalRank: doctor.professionalRank,
+        // Doctor.clinicId is nullable (onDelete: SetNull): never assume a clinic exists.
         clinicId: doctor.clinicId,
-        clinicName: doctor.clinic.nameEn,
-        clinicNameAr: doctor.clinic.nameAr,
+        clinicName: doctor.clinic?.nameEn ?? "",
+        clinicNameAr: doctor.clinic?.nameAr ?? "",
         commissionRate: doctor.commissionRate.toString(),
         isActive: doctor.isActive,
         mustChangePassword,
@@ -489,6 +499,7 @@ export async function getDoctorsAction(
 
         const search = cleanText(input.search).slice(0, 120);
         const status = input.status ?? "ALL";
+        const assignment = input.assignment === "UNASSIGNED" ? "UNASSIGNED" : "ALL";
         const clinicFilter = cleanText(input.clinicId);
 
         if (clinicFilter && !validUuid(clinicFilter)) {
@@ -508,11 +519,7 @@ export async function getDoctorsAction(
             orderBy: [{ isActive: "desc" }, { nameEn: "asc" }],
         });
 
-        const clinicsInScope = clinicFilter
-            ? clinics.filter((clinic) => clinic.id === clinicFilter)
-            : clinics;
-
-        if (clinicFilter && clinicsInScope.length === 0) {
+        if (clinicFilter && !clinics.some((clinic) => clinic.id === clinicFilter)) {
             return invalid(
                 "The selected clinic was not found in your organization.",
                 "CLINIC_NOT_FOUND",
@@ -540,56 +547,56 @@ export async function getDoctorsAction(
             orderBy: { nameEn: "asc" },
         });
 
-        const clinicIds = clinicsInScope.map((clinic) => clinic.id);
+        // Tenant isolation comes from `organizationId` (stored on every doctor).
+        // Doctors without a clinic (clinicId = null) MUST stay in the result set,
+        // so there is no `clinicId IN (...)` constraint unless a clinic filter is chosen.
+        const conditions: Prisma.DoctorWhereInput[] = [];
 
-        if (clinicIds.length === 0) {
-            return {
-                success: true,
-                data: {
-                    doctors: [],
-                    clinics,
-                    services,
-                    total: 0,
-                    page: 1,
-                    pageSize,
-                    totalPages: 0,
-                },
-            };
+        if (clinicFilter) {
+            conditions.push({ clinicId: clinicFilter });
+        }
+
+        if (assignment === "UNASSIGNED") {
+            conditions.push({
+                OR: [{ clinicId: null }, { services: { none: {} } }],
+            });
+        }
+
+        if (status === "ACTIVE") conditions.push({ isActive: true });
+        if (status === "INACTIVE") conditions.push({ isActive: false });
+        if (status === "INVITED") {
+            conditions.push({ user: { is: { mustChangePassword: true } } });
+        }
+
+        if (search) {
+            conditions.push({
+                OR: [
+                    { fullNameEn: { contains: search, mode: "insensitive" } },
+                    { fullNameAr: { contains: search, mode: "insensitive" } },
+                    { nationalId: { contains: search } },
+                    {
+                        scfhsLicenseNumber: {
+                            contains: search,
+                            mode: "insensitive",
+                        },
+                    },
+                    {
+                        user: {
+                            is: {
+                                email: {
+                                    contains: search,
+                                    mode: "insensitive",
+                                },
+                            },
+                        },
+                    },
+                ],
+            });
         }
 
         const where: Prisma.DoctorWhereInput = {
             organizationId: session.organizationId,
-            clinicId: clinicFilter ? clinicFilter : { in: clinicIds },
-            ...(status === "ACTIVE" ? { isActive: true } : {}),
-            ...(status === "INACTIVE" ? { isActive: false } : {}),
-            ...(status === "INVITED"
-                ? { user: { is: { mustChangePassword: true } } }
-                : {}),
-            ...(search
-                ? {
-                    OR: [
-                        { fullNameEn: { contains: search, mode: "insensitive" } },
-                        { fullNameAr: { contains: search, mode: "insensitive" } },
-                        { nationalId: { contains: search } },
-                        {
-                            scfhsLicenseNumber: {
-                                contains: search,
-                                mode: "insensitive",
-                            },
-                        },
-                        {
-                            user: {
-                                is: {
-                                    email: {
-                                        contains: search,
-                                        mode: "insensitive",
-                                    },
-                                },
-                            },
-                        },
-                    ],
-                }
-                : {}),
+            ...(conditions.length > 0 ? { AND: conditions } : {}),
         };
 
         const [total, rows] = await prisma.$transaction([
@@ -639,9 +646,9 @@ type RawDoctorRow = {
     identityType: IdentityType;
     scfhsLicenseNumber: string;
     professionalRank: DoctorProfessionalRank;
-    clinicId: string;
-    clinicNameEn: string;
-    clinicNameAr: string;
+    clinicId: string | null;
+    clinicNameEn: string | null;
+    clinicNameAr: string | null;
     commissionRate: number | string;
     isActive: boolean;
     createdAt: string;
@@ -681,8 +688,8 @@ function mapRawDoctor(row: RawDoctorRow): DoctorRow {
         scfhsLicenseNumber: row.scfhsLicenseNumber,
         professionalRank: row.professionalRank,
         clinicId: row.clinicId,
-        clinicName: row.clinicNameEn,
-        clinicNameAr: row.clinicNameAr,
+        clinicName: row.clinicNameEn ?? "",
+        clinicNameAr: row.clinicNameAr ?? "",
         commissionRate: String(row.commissionRate),
         isActive: row.isActive,
         mustChangePassword,
@@ -706,6 +713,10 @@ function mapRawDoctor(row: RawDoctorRow): DoctorRow {
  * signed session cookie and re-verified against the database by
  * requirePortalSession (which runs in parallel and aborts the request if it
  * fails). Every sub-select is filtered by organization_id as a bound parameter.
+ *
+ * IMPORTANT: the clinic join is a LEFT JOIN. Doctors whose clinic_id is NULL
+ * (unassigned) must never be dropped from the snapshot. The clinic join is also
+ * constrained to the same organization.
  */
 async function loadSnapshotSingleQuery(organizationId: string): Promise<RawSnapshot> {
     const rows = await prisma.$queryRaw<Array<{ snapshot: RawSnapshot }>>`
@@ -771,7 +782,9 @@ async function loadSnapshotSingleQuery(organizationId: string): Promise<RawSnaps
                     ORDER BY created_at DESC, id ASC
                     LIMIT ${ALL_DOCTORS_CAP}
                 ) d
-                JOIN clinics c ON c.id = d.clinic_id
+                LEFT JOIN clinics c
+                    ON c.id = d.clinic_id
+                    AND c.organization_id = ${organizationId}::uuid
                 LEFT JOIN users u ON u.id = d.user_id
             )
         ) AS snapshot
@@ -786,7 +799,13 @@ async function loadSnapshotSingleQuery(organizationId: string): Promise<RawSnaps
     return snapshot;
 }
 
-/** FALLBACK PATH: the original Prisma queries (more round trips, same result). */
+/**
+ * FALLBACK PATH: the original Prisma queries (more round trips, same result).
+ *
+ * Doctors are loaded in two scoped queries (assigned to one of the organization's
+ * clinics, and unassigned with clinicId = null) and merged, so unassigned
+ * doctors are never excluded, even when the organization has no clinics at all.
+ */
 async function loadSnapshotWithPrisma(organizationId: string): Promise<DoctorsPageData> {
     const clinics = await prisma.clinic.findMany({
         where: { organizationId },
@@ -794,13 +813,9 @@ async function loadSnapshotWithPrisma(organizationId: string): Promise<DoctorsPa
         orderBy: [{ isActive: "desc" }, { nameEn: "asc" }],
     });
 
-    if (clinics.length === 0) {
-        return { doctors: [], options: { clinics: [], services: [] } };
-    }
-
     const clinicIds = clinics.map((clinic) => clinic.id);
 
-    const [services, rows] = await Promise.all([
+    const [services, assignedRows, unassignedRows] = await Promise.all([
         prisma.service.findMany({
             where: { organizationId, clinicId: { in: clinicIds } },
             select: {
@@ -819,7 +834,20 @@ async function loadSnapshotWithPrisma(organizationId: string): Promise<DoctorsPa
             orderBy: [{ createdAt: "desc" }, { id: "asc" }],
             take: ALL_DOCTORS_CAP,
         }),
+        prisma.doctor.findMany({
+            where: { organizationId, clinicId: null },
+            include: doctorInclude,
+            orderBy: [{ createdAt: "desc" }, { id: "asc" }],
+            take: ALL_DOCTORS_CAP,
+        }),
     ]);
+
+    const rows = [...assignedRows, ...unassignedRows]
+        .sort(
+            (a, b) =>
+                b.createdAt.getTime() - a.createdAt.getTime() || a.id.localeCompare(b.id),
+        )
+        .slice(0, ALL_DOCTORS_CAP);
 
     const activeClinics = clinics.filter((clinic) => clinic.isActive);
     const activeClinicIds = new Set(activeClinics.map((clinic) => clinic.id));
@@ -1073,32 +1101,12 @@ export async function updateDoctorAction(
     const v = parsed.value;
 
     try {
-        // Resolve the authenticated organization's clinic scope first.
-        const clinicIds = await getOrganizationClinicIds(
+        // Works for assigned AND unassigned (clinicId = null) doctors, always
+        // scoped to the authenticated organization.
+        const existing = await findDoctorInOrganization(
             session.organizationId,
+            doctorId,
         );
-
-        if (clinicIds.length === 0) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
-        // IMPORTANT: clinicId is mandatory for Doctor.findFirst.
-        const existing = await prisma.doctor.findFirst({
-            where: {
-                id: doctorId,
-                organizationId: session.organizationId,
-                clinicId: {
-                    in: clinicIds,
-                },
-            },
-            select: {
-                userId: true,
-                clinicId: true,
-            },
-        });
 
         if (!existing) {
             return invalid(
@@ -1213,8 +1221,9 @@ export async function updateDoctorAction(
                     userId = user.id;
                 }
 
-                // Include the ORIGINAL clinicId in the update filter.
-                // This allows moving the doctor to another clinic safely.
+                // Include the ORIGINAL clinicId (possibly null) in the update filter.
+                // This allows moving the doctor to another clinic, or assigning a
+                // clinic to a previously unassigned doctor, safely.
                 return tx.doctor.update({
                     where: {
                         id: doctorId,
@@ -1300,32 +1309,10 @@ export async function setDoctorActiveStatusAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(
+        const existing = await findDoctorInOrganization(
             session.organizationId,
+            id,
         );
-
-        if (clinicIds.length === 0) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
-        // IMPORTANT: clinicId is required by the Doctor tenant middleware.
-        const existing = await prisma.doctor.findFirst({
-            where: {
-                id,
-                organizationId: session.organizationId,
-                clinicId: {
-                    in: clinicIds,
-                },
-            },
-            select: {
-                id: true,
-                clinicId: true,
-                userId: true,
-            },
-        });
 
         if (!existing) {
             return invalid(
@@ -1419,29 +1406,10 @@ export async function deleteDoctorAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(
+        const doctor = await findDoctorInOrganization(
             session.organizationId,
+            id,
         );
-
-        if (clinicIds.length === 0) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
-        const doctor = await prisma.doctor.findFirst({
-            where: {
-                id,
-                organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
-            },
-            select: {
-                id: true,
-                clinicId: true,
-                userId: true,
-            },
-        });
 
         if (!doctor) {
             return invalid(
@@ -1489,10 +1457,12 @@ export async function deleteDoctorAction(
                 }
 
                 // Prevent deletion when appointment history exists.
+                // The count is tenant-scoped by organization and doctor only, so it
+                // also protects unassigned doctors (clinicId = null) whose past
+                // appointments still reference a clinic.
                 const appointmentCount = await tx.appointment.count({
                     where: {
                         organizationId: session.organizationId,
-                        clinicId: currentDoctor.clinicId,
                         doctorId: currentDoctor.id,
                     },
                 });
@@ -1616,37 +1586,10 @@ export async function regenerateTempPasswordAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(
+        const doctor = await findDoctorInOrganization(
             session.organizationId,
+            id,
         );
-
-        if (clinicIds.length === 0) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
-        // IMPORTANT: clinicId is required by the Doctor tenant middleware.
-        const doctor = await prisma.doctor.findFirst({
-            where: {
-                id,
-                organizationId: session.organizationId,
-                clinicId: {
-                    in: clinicIds,
-                },
-            },
-            select: {
-                clinicId: true,
-                user: {
-                    select: {
-                        id: true,
-                        email: true,
-                        mustChangePassword: true,
-                    },
-                },
-            },
-        });
 
         if (!doctor) {
             return invalid(
@@ -1655,14 +1598,33 @@ export async function regenerateTempPasswordAction(
             );
         }
 
-        if (!doctor.user) {
+        if (!doctor.userId) {
             return invalid(
                 "This doctor does not have a user account.",
                 "NO_ACCOUNT",
             );
         }
 
-        if (!doctor.user.mustChangePassword) {
+        const user = await prisma.user.findFirst({
+            where: {
+                id: doctor.userId,
+                organizationId: session.organizationId,
+            },
+            select: {
+                id: true,
+                email: true,
+                mustChangePassword: true,
+            },
+        });
+
+        if (!user) {
+            return invalid(
+                "This doctor does not have a user account.",
+                "NO_ACCOUNT",
+            );
+        }
+
+        if (!user.mustChangePassword) {
             return invalid(
                 "A temporary password can only be regenerated for invited accounts that have not set their own password yet.",
                 "NOT_INVITED",
@@ -1675,7 +1637,7 @@ export async function regenerateTempPasswordAction(
 
         await prisma.user.update({
             where: {
-                id: doctor.user.id,
+                id: user.id,
                 organizationId: session.organizationId,
             },
             data: {
@@ -1687,7 +1649,7 @@ export async function regenerateTempPasswordAction(
         return {
             success: true,
             data: {
-                email: doctor.user.email,
+                email: user.email,
                 temporaryPassword,
             },
         };
@@ -1773,4 +1735,54 @@ async function getOrganizationClinicIds(
     });
 
     return clinics.map((clinic) => clinic.id);
+}
+
+type ScopedDoctor = {
+    id: string;
+    clinicId: string | null;
+    userId: string | null;
+};
+
+/**
+ * Finds one doctor of the authenticated organization, whether the doctor is
+ * assigned to a clinic or not (Doctor.clinicId is nullable).
+ *
+ * Every query keeps an explicit `clinicId` condition (the Doctor tenant
+ * middleware requires it) and is always scoped by `organizationId`:
+ *   1. doctors assigned to one of the organization's clinics, then
+ *   2. unassigned doctors (clinicId = null) of the same organization.
+ */
+async function findDoctorInOrganization(
+    organizationId: string,
+    doctorId: string,
+): Promise<ScopedDoctor | null> {
+    const select = {
+        id: true,
+        clinicId: true,
+        userId: true,
+    } satisfies Prisma.DoctorSelect;
+
+    const clinicIds = await getOrganizationClinicIds(organizationId);
+
+    if (clinicIds.length > 0) {
+        const assigned = await prisma.doctor.findFirst({
+            where: {
+                id: doctorId,
+                organizationId,
+                clinicId: { in: clinicIds },
+            },
+            select,
+        });
+
+        if (assigned) return assigned;
+    }
+
+    return prisma.doctor.findFirst({
+        where: {
+            id: doctorId,
+            organizationId,
+            clinicId: null,
+        },
+        select,
+    });
 }

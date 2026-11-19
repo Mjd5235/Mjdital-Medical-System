@@ -12,6 +12,15 @@
  * - Optional server-side win: remove `revalidatePath(MANAGEMENT_PATH)` from the actions in
  *   ./actions.ts. This client component owns its data, and each revalidation makes every Server
  *   Action response heavier and slower because it re-renders the route.
+ *
+ * Unassigned doctors
+ * ------------------
+ * - Doctors without a clinic (clinicId === null) or without any service are never dropped from the
+ *   table. In the single "Clinic & Service" column they get one muted "Unassigned" badge with
+ *   "No clinic · No service" fallback text, and a compact "Assign" action in the Actions column that
+ *   opens the edit modal pre-loaded with the doctor's data.
+ * - The filter bar carries a compact "N Unassigned" count pill and an "Unassigned only" toggle button
+ *   (no full-width warning banner).
  */
 
 import {
@@ -28,6 +37,7 @@ import {
     type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { AnimatePresence, motion } from "framer-motion";
 import { DoctorProfessionalRank, IdentityType } from "@prisma/client";
 import {
     Activity,
@@ -56,6 +66,7 @@ import {
     Search,
     Stethoscope,
     Trash2,
+    TriangleAlert,
     UserCheck,
     UserRound,
     UserX,
@@ -97,6 +108,12 @@ type DoctorsManagementProps = {
 type DoctorListItem = Omit<DoctorRow, "services"> & {
     services: Array<{ id: string; name: string }>;
     searchText: string;
+    /** True when the doctor has no clinic. */
+    missingClinic: boolean;
+    /** True when the doctor has no service. */
+    missingServices: boolean;
+    /** True when the doctor has no clinic or no service (needs reassignment). */
+    isUnassigned: boolean;
 };
 
 type DoctorFormOptions = {
@@ -135,12 +152,19 @@ type Notice = {
 
 type ToastItem = Notice & { id: number };
 
-type ModalState = { mode: "create" } | { mode: "edit"; doctor: DoctorRow } | null;
+type ModalState =
+    | { mode: "create" }
+    | { mode: "edit"; doctor: DoctorRow; assign?: boolean }
+    | null;
+
+type AssignmentFilter = "ALL" | "UNASSIGNED";
 
 type DropdownOption = {
     value: string;
     label: string;
 };
+
+type PageItem = number | "start-ellipsis" | "end-ellipsis";
 
 const EMPTY_OPTIONS: DoctorFormOptions = { clinics: [], services: [] };
 
@@ -178,15 +202,14 @@ const messages = {
         search: "Search doctors, ID or license",
         allClinics: "All clinics",
         allStatuses: "All statuses",
-        filters: "Filters",
         resetFilters: "Reset filters",
         profile: "Doctor Profile",
         nationalId: "National ID / Iqama",
         license: "SCFHS License No.",
-        clinic: "Assigned Clinic",
-        services: "Offered Services",
+        clinicService: "Clinic & Service",
         commission: "Commission Rate",
         status: "Account Status",
+        actions: "Actions",
         active: "Active",
         invited: "Invited",
         inactive: "Inactive",
@@ -200,6 +223,7 @@ const messages = {
         optionsError: "Unable to load clinics and services.",
         modalAdd: "Add New Doctor & Practitioner",
         modalEdit: "Edit Practitioner",
+        modalAssign: "Assign Clinic & Service",
         credentials: "Authentication & Credentials",
         email: "Doctor Email",
         emailPlaceholder: "doctor@hospital.sa",
@@ -272,11 +296,21 @@ const messages = {
         failed: "The operation could not be completed. Please try again.",
         success: "Doctor created successfully. Share the temporary password with the doctor securely.",
         updated: "Practitioner updated successfully.",
+        assigned: "Clinic and services assigned successfully.",
         previous: "Previous page",
         next: "Next page",
         showing: "Showing",
         of: "of",
         doctors: "doctors",
+        unassigned: "Unassigned",
+        unassignedOnly: "Unassigned only",
+        noClinic: "No clinic",
+        noService: "No service",
+        assign: "Assign",
+        assignAction: "Assign Clinic & Service",
+        assignHint:
+            "This doctor has no clinic or no services assigned. Select an active clinic and at least one service to complete the setup.",
+        unassignedRegion: "Unassigned doctors",
     },
     ar: {
         title: "الأطباء والممارسون الصحيون",
@@ -286,15 +320,14 @@ const messages = {
         search: "البحث بالاسم أو الهوية أو الترخيص",
         allClinics: "جميع العيادات",
         allStatuses: "جميع الحالات",
-        filters: "التصفية",
         resetFilters: "إعادة ضبط التصفية",
         profile: "ملف الطبيب",
         nationalId: "رقم الهوية / الإقامة",
         license: "رقم ترخيص الهيئة",
-        clinic: "العيادة",
-        services: "الخدمات المقدمة",
+        clinicService: "العيادة والخدمة",
         commission: "نسبة العمولة",
         status: "حالة الحساب",
+        actions: "الإجراءات",
         active: "نشط",
         invited: "بانتظار التفعيل",
         inactive: "معطّل",
@@ -308,6 +341,7 @@ const messages = {
         optionsError: "تعذر تحميل العيادات والخدمات.",
         modalAdd: "إضافة طبيب وممارس جديد",
         modalEdit: "تعديل بيانات الممارس",
+        modalAssign: "تعيين عيادة وخدمة",
         credentials: "بيانات الدخول والتواصل",
         email: "البريد الإلكتروني للطبيب",
         emailPlaceholder: "doctor@hospital.sa",
@@ -378,11 +412,21 @@ const messages = {
         failed: "تعذر إكمال العملية. يرجى المحاولة مرة أخرى.",
         success: "تم إنشاء الطبيب بنجاح. شارك كلمة المرور المؤقتة مع الطبيب بطريقة آمنة.",
         updated: "تم تحديث بيانات الممارس بنجاح.",
+        assigned: "تم تعيين العيادة والخدمات بنجاح.",
         previous: "الصفحة السابقة",
         next: "الصفحة التالية",
         showing: "عرض",
         of: "من",
         doctors: "طبيب",
+        unassigned: "غير معيّن",
+        unassignedOnly: "غير المعيّنين فقط",
+        noClinic: "بدون عيادة",
+        noService: "بدون خدمة",
+        assign: "تعيين",
+        assignAction: "تعيين عيادة وخدمة",
+        assignHint:
+            "هذا الطبيب بلا عيادة أو بلا خدمات معيّنة. اختر عيادة نشطة وخدمة واحدة على الأقل لإكمال إعداد الطبيب.",
+        unassignedRegion: "الأطباء غير المعيّنين",
     },
 } as const;
 
@@ -401,6 +445,21 @@ const baseInput =
 
 const tealButton =
     "inline-flex items-center justify-center gap-2 rounded-lg bg-teal-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50";
+
+/** Modal open/close animation shared with the Clinics & Services page. */
+const backdropMotion = {
+    initial: { opacity: 0 },
+    animate: { opacity: 1 },
+    exit: { opacity: 0 },
+    transition: { duration: 0.2, ease: "easeOut" },
+} as const;
+
+const panelMotion = {
+    initial: { opacity: 0, scale: 0.96, y: 16 },
+    animate: { opacity: 1, scale: 1, y: 0 },
+    exit: { opacity: 0, scale: 0.97, y: 10 },
+    transition: { duration: 0.22, ease: [0.22, 1, 0.36, 1] },
+} as const;
 
 const outlineButton =
     "inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 text-sm font-semibold text-slate-900 dark:text-slate-100 transition hover:border-teal-500 hover:text-teal-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50";
@@ -432,6 +491,11 @@ function toListItem(doctor: DoctorRow, locale: Locale): DoctorListItem {
         name: locale === "ar" ? service.nameAr : service.nameEn,
     }));
 
+    // A doctor without a clinic or without any service must still be listed and findable.
+    const missingClinic = !doctor.clinicId;
+    const missingServices = doctor.services.length === 0;
+    const isUnassigned = missingClinic || missingServices;
+
     const searchText = [
         doctor.fullName,
         doctor.email ?? "",
@@ -440,6 +504,7 @@ function toListItem(doctor: DoctorRow, locale: Locale): DoctorListItem {
         specialty,
         clinicName,
         ...services.map((service) => service.name),
+        isUnassigned ? "unassigned غير معيّن" : "",
     ]
         .join(" ")
         .toLocaleLowerCase(locale);
@@ -450,6 +515,9 @@ function toListItem(doctor: DoctorRow, locale: Locale): DoctorListItem {
         specialty,
         services,
         searchText,
+        missingClinic,
+        missingServices,
+        isUnassigned,
     };
 
     listItemCache.set(doctor, { locale, item });
@@ -475,13 +543,29 @@ function maskIdentity(value: string): string {
     return value.length > 4 ? `${value.slice(0, 2)}•••••${value.slice(-4)}` : value;
 }
 
-function pageWindow(current: number, total: number): number[] {
+/** Page buttons with ellipses, e.g. 1 2 3 4 5 … 12 (matches the reference design). */
+function pageItems(current: number, total: number): PageItem[] {
     if (total <= 7) {
         return Array.from({ length: total }, (_, index) => index + 1);
     }
 
-    const start = Math.min(Math.max(1, current - 2), total - 4);
-    return Array.from({ length: 5 }, (_, index) => start + index);
+    if (current <= 4) {
+        return [1, 2, 3, 4, 5, "end-ellipsis", total];
+    }
+
+    if (current >= total - 3) {
+        return [
+            1,
+            "start-ellipsis",
+            total - 4,
+            total - 3,
+            total - 2,
+            total - 1,
+            total,
+        ];
+    }
+
+    return [1, "start-ellipsis", current - 1, current, current + 1, "end-ellipsis", total];
 }
 
 function randomIndex(max: number): number {
@@ -1026,12 +1110,53 @@ function StatusBadge({
 
     return (
         <span
-            className={`inline-flex items-center gap-2 whitespace-nowrap rounded-lg px-4 py-2.5 text-sm font-semibold ${config.wrap}`}
+            className={`inline-flex items-center gap-2 whitespace-nowrap rounded-lg px-3.5 py-2 text-sm font-semibold ${config.wrap}`}
         >
             <span className={`h-2.5 w-2.5 rounded-full ${config.dot}`} />
             {config.label}
         </span>
     );
+}
+
+/** Single, quiet "Unassigned" badge for doctors that have no clinic or no service. */
+function UnassignedBadge({ t }: { t: Messages }) {
+    return (
+        <span className="inline-flex items-center whitespace-nowrap rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 text-sm font-semibold text-amber-600 dark:text-amber-400">
+            {t.unassigned}
+        </span>
+    );
+}
+
+/** Compact one-click action that opens the pre-loaded assignment modal. */
+function AssignButton({
+    t,
+    name,
+    onClick,
+}: {
+    t: Messages;
+    name: string;
+    onClick: () => void;
+}) {
+    return (
+        <button
+            type="button"
+            onClick={onClick}
+            aria-label={`${t.assignAction}: ${name}`}
+            className="inline-flex h-9 items-center whitespace-nowrap rounded-lg px-3 text-sm font-semibold text-teal-600 transition hover:bg-teal-600/10 hover:text-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 dark:text-teal-400 dark:hover:text-teal-300"
+        >
+            {t.assign}
+        </button>
+    );
+}
+
+/** Muted fallback line, e.g. "No clinic · No service" (or "Clinic name · No service"). */
+function unassignedSummary(doctor: DoctorListItem, t: Messages): string {
+    const clinicPart = doctor.missingClinic ? t.noClinic : doctor.clinicName || t.noClinic;
+    const servicePart = doctor.missingServices
+        ? t.noService
+        : doctor.services.map((service) => service.name).join(", ");
+
+    return `${clinicPart} · ${servicePart}`;
 }
 
 function SkeletonRows() {
@@ -1048,7 +1173,7 @@ function SkeletonRows() {
                             </div>
                         </div>
                     </td>
-                    {[96, 96, 112, 160, 48, 96].map((width, cell) => (
+                    {[96, 112, 160, 48, 96].map((width, cell) => (
                         <td key={cell} className="px-4 py-5 align-middle">
                             <div
                                 className="h-4 rounded bg-slate-200 dark:bg-slate-800"
@@ -1392,6 +1517,7 @@ function validateForm(
 
 function DoctorFormModal({
     doctor,
+    assignMode,
     options,
     optionsLoading,
     optionsError,
@@ -1402,6 +1528,8 @@ function DoctorFormModal({
     onReloadOptions,
 }: {
     doctor: DoctorRow | null;
+    /** True when opened through "Assign": focuses the assignment section. */
+    assignMode: boolean;
     options: DoctorFormOptions;
     optionsLoading: boolean;
     optionsError: string;
@@ -1413,6 +1541,7 @@ function DoctorFormModal({
 }) {
     const isEdit = Boolean(doctor);
     const isRtl = locale === "ar";
+    const needsAssignment = Boolean(doctor) && (!doctor?.clinicId || doctor.services.length === 0);
 
     const [errors, setErrors] = useState<FormErrors>({});
     const [formError, setFormError] = useState("");
@@ -1424,13 +1553,20 @@ function DoctorFormModal({
     );
     const [password, setPassword] = useState("");
     const [showPassword, setShowPassword] = useState(false);
+    const integrationRef = useRef<HTMLElement>(null);
 
     // Inputs forced to dir="ltr" resolve ps-/pe- physically (start = left),
     // so the padding must be mirrored in RTL to stay on the icon's side.
     const ltrInputPadding = isRtl ? "ps-3 pe-11 text-end" : "ps-11 pe-3";
 
     const clinicOptions = useMemo(() => {
-        if (doctor && !options.clinics.some((clinic) => clinic.id === doctor.clinicId)) {
+        // Only keep a stale (inactive/removed) clinic option when the doctor really has one.
+        // Unassigned doctors (clinicId === null) have nothing to preserve.
+        if (
+            doctor &&
+            doctor.clinicId &&
+            !options.clinics.some((clinic) => clinic.id === doctor.clinicId)
+        ) {
             return [
                 ...options.clinics,
                 {
@@ -1494,6 +1630,19 @@ function DoctorFormModal({
         return () => document.removeEventListener("keydown", onKeyDown);
     }, [onClose]);
 
+    // "Assign" jumps straight to the assignment section and focuses the clinic picker
+    // once the open animation has finished.
+    useEffect(() => {
+        if (!assignMode) return;
+
+        const timer = window.setTimeout(() => {
+            integrationRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+            document.getElementById("doctor-clinic")?.focus({ preventScroll: true });
+        }, 260);
+
+        return () => window.clearTimeout(timer);
+    }, [assignMode]);
+
     const clearError = (key: keyof FormErrors) =>
         setErrors((current) => (current[key] ? { ...current, [key]: undefined } : current));
 
@@ -1544,13 +1693,17 @@ function DoctorFormModal({
     }
 
     return (
-        <div
-            className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 dark:bg-slate-950/80 p-3 -sm sm:p-6"
+        <motion.div
+            key="doctor-modal-backdrop"
+            {...backdropMotion}
+            className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 dark:bg-slate-950/80 p-3 sm:p-6"
             onMouseDown={(event) => {
                 if (event.target === event.currentTarget) onClose();
             }}
         >
-            <section
+            <motion.section
+                key="doctor-modal-content"
+                {...panelMotion}
                 role="dialog"
                 aria-modal="true"
                 aria-labelledby="doctor-modal-title"
@@ -1562,7 +1715,7 @@ function DoctorFormModal({
                             id="doctor-modal-title"
                             className="text-xl font-extrabold text-slate-900 dark:text-white sm:text-2xl"
                         >
-                            {isEdit ? t.modalEdit : t.modalAdd}
+                            {assignMode ? t.modalAssign : isEdit ? t.modalEdit : t.modalAdd}
                         </h2>
 
                         <button
@@ -1576,6 +1729,16 @@ function DoctorFormModal({
                     </div>
 
                     <div className="max-h-[calc(100dvh-190px)] space-y-7 overflow-y-auto px-5 pb-6 sm:px-7">
+                        {needsAssignment && (
+                            <div
+                                role="note"
+                                className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300"
+                            >
+                                <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                                <p>{t.assignHint}</p>
+                            </div>
+                        )}
+
                         <section className="space-y-4">
                             <SectionTitle icon={UserRound}>{t.credentials}</SectionTitle>
 
@@ -1772,7 +1935,7 @@ function DoctorFormModal({
                             </div>
                         </section>
 
-                        <section className="space-y-4">
+                        <section ref={integrationRef} className="space-y-4">
                             <SectionTitle icon={Activity}>{t.integration}</SectionTitle>
 
                             {optionsError && (
@@ -1803,6 +1966,7 @@ function DoctorFormModal({
                                         icon={Building2}
                                         isRtl={isRtl}
                                         disabled={optionsLoading || clinicOptions.length === 0}
+                                        invalid={Boolean(errors.clinicId)}
                                         className="h-12"
                                     />
 
@@ -1924,8 +2088,8 @@ function DoctorFormModal({
                         </button>
                     </footer>
                 </form>
-            </section>
-        </div>
+            </motion.section>
+        </motion.div>
     );
 }
 
@@ -1949,6 +2113,7 @@ export default function DoctorsManagementPage({
     const [query, setQuery] = useState("");
     const [clinicFilter, setClinicFilter] = useState("ALL");
     const [statusFilter, setStatusFilter] = useState("ALL");
+    const [assignmentFilter, setAssignmentFilter] = useState<AssignmentFilter>("ALL");
     const [page, setPage] = useState(1);
     const [modal, setModal] = useState<ModalState>(null);
     const [deleteTarget, setDeleteTarget] = useState<DoctorRow | null>(null);
@@ -2228,6 +2393,22 @@ export default function DoctorsManagementPage({
         [doctors],
     );
 
+    // Counted over ALL doctors (not the filtered view) so the pill always tells the full story.
+    const unassignedCount = useMemo(
+        () =>
+            displayDoctors.reduce(
+                (count, doctor) => (doctor.isUnassigned && !isTempId(doctor.id) ? count + 1 : count),
+                0,
+            ),
+        [displayDoctors],
+    );
+
+    // Once the last unassigned doctor is fixed the filter has nothing left to show, so fall back to "ALL".
+    const effectiveAssignmentFilter: AssignmentFilter =
+        unassignedCount === 0 ? "ALL" : assignmentFilter;
+
+    // Doctors with no clinic/service are intentionally NOT excluded here: the clinic filter only narrows
+    // when a specific clinic is picked, and "ALL" keeps every row (including clinicId === null).
     const filteredDoctors = useMemo(() => {
         const normalized = deferredQuery.trim().toLocaleLowerCase(locale);
 
@@ -2235,9 +2416,10 @@ export default function DoctorsManagementPage({
             (doctor) =>
                 (!normalized || doctor.searchText.includes(normalized)) &&
                 (clinicFilter === "ALL" || doctor.clinicId === clinicFilter) &&
-                (statusFilter === "ALL" || doctor.accountStatus === statusFilter),
+                (statusFilter === "ALL" || doctor.accountStatus === statusFilter) &&
+                (effectiveAssignmentFilter === "ALL" || doctor.isUnassigned),
         );
-    }, [displayDoctors, deferredQuery, clinicFilter, statusFilter, locale]);
+    }, [displayDoctors, deferredQuery, clinicFilter, statusFilter, effectiveAssignmentFilter, locale]);
 
     const clinicFilterOptions = useMemo<DropdownOption[]>(
         () => [
@@ -2286,10 +2468,16 @@ export default function DoctorsManagementPage({
         setPage(1);
     }
 
+    function toggleAssignmentFilter() {
+        setAssignmentFilter((current) => (current === "UNASSIGNED" ? "ALL" : "UNASSIGNED"));
+        setPage(1);
+    }
+
     function resetFilters() {
         setQuery("");
         setClinicFilter("ALL");
         setStatusFilter("ALL");
+        setAssignmentFilter("ALL");
         setPage(1);
     }
 
@@ -2307,6 +2495,12 @@ export default function DoctorsManagementPage({
         void loadOptions(true);
     }
 
+    // Same edit modal, pre-loaded with the doctor's data and focused on clinic + service assignment.
+    function openAssign(doctor: DoctorRow) {
+        setModal({ mode: "edit", doctor, assign: true });
+        void loadOptions(true);
+    }
+
     /* ----------------------- optimistic mutations -------------------- */
 
     function submitDoctor(input: CreateDoctorInput) {
@@ -2320,10 +2514,14 @@ export default function DoctorsManagementPage({
                 doctorsRef.current.find((item) => item.id === currentModal.doctor.id) ??
                 currentModal.doctor;
             const optimistic = buildOptimisticRow(input, base, base.id, optionsRef.current);
+            const wasUnassigned = !base.clinicId || base.services.length === 0;
 
             updateDoctors((list) => list.map((item) => (item.id === base.id ? optimistic : item)));
 
-            const toastId = pushNotice({ kind: "success", message: t.updated });
+            const toastId = pushNotice({
+                kind: "success",
+                message: wasUnassigned ? t.assigned : t.updated,
+            });
 
             enqueue(base.id, async () => {
                 try {
@@ -2493,6 +2691,12 @@ export default function DoctorsManagementPage({
     const showingTo = Math.min(currentPage * PAGE_SIZE, filteredDoctors.length);
     const PrevIcon = isRtl ? ChevronRight : ChevronLeft;
     const NextIcon = isRtl ? ChevronLeft : ChevronRight;
+    const unassignedFilterActive = effectiveAssignmentFilter === "UNASSIGNED";
+    const hasActiveFilters =
+        query.trim() !== "" ||
+        clinicFilter !== "ALL" ||
+        statusFilter !== "ALL" ||
+        unassignedFilterActive;
 
     return (
         <div
@@ -2573,15 +2777,31 @@ export default function DoctorsManagementPage({
                                 className="h-[54px] bg-white dark:bg-slate-900/60"
                             />
 
-                            <button
-                                type="button"
-                                title={t.resetFilters}
-                                onClick={resetFilters}
-                                className={`${outlineButton} h-[54px] bg-white dark:bg-slate-900/60 px-6`}
-                            >
-                                <Filter className="h-5 w-5" />
-                                {t.filters}
-                            </button>
+                            <div className="flex flex-wrap items-center gap-3">
+                                {unassignedCount > 0 && (
+                                    <span
+                                        title={t.unassignedRegion}
+                                        aria-label={`${t.unassignedRegion}: ${unassignedCount}`}
+                                        className="inline-flex h-9 items-center whitespace-nowrap rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 text-sm font-semibold text-amber-600 dark:text-amber-400"
+                                    >
+                                        {unassignedCount} {t.unassigned}
+                                    </span>
+                                )}
+
+                                <button
+                                    type="button"
+                                    onClick={toggleAssignmentFilter}
+                                    aria-pressed={unassignedFilterActive}
+                                    disabled={unassignedCount === 0}
+                                    className={`inline-flex h-[54px] items-center justify-center gap-2 whitespace-nowrap rounded-lg border px-6 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-50 ${unassignedFilterActive
+                                        ? "border-amber-500 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                                        : "border-slate-200 bg-white text-slate-900 hover:border-teal-500 hover:text-teal-400 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-100"
+                                        }`}
+                                >
+                                    <Filter className="h-5 w-5" />
+                                    {t.unassignedOnly}
+                                </button>
+                            </div>
                         </section>
 
                         <section className="overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/60 shadow-xl shadow-black/20">
@@ -2600,7 +2820,7 @@ export default function DoctorsManagementPage({
                             ) : (
                                 <>
                                     <div className="overflow-x-auto">
-                                        <table className="w-full min-w-[1100px] border-collapse text-start">
+                                        <table className="w-full min-w-[1000px] border-collapse text-start">
                                             <caption className="sr-only">
                                                 {loading ? t.loading : t.title}
                                             </caption>
@@ -2609,13 +2829,10 @@ export default function DoctorsManagementPage({
                                                     <th className="px-6 py-5 text-start align-middle">{t.profile}</th>
                                                     <th className="px-4 py-5 text-start align-middle">{t.nationalId}</th>
                                                     <th className="px-4 py-5 text-start align-middle">{t.license}</th>
-                                                    <th className="px-4 py-5 text-start align-middle">{t.clinic}</th>
-                                                    <th className="px-4 py-5 text-start align-middle">{t.services}</th>
-                                                    <th className="px-4 py-5 text-center align-middle">{t.commission}</th>
+                                                    <th className="px-4 py-5 text-start align-middle">{t.clinicService}</th>
+                                                    <th className="px-4 py-5 text-start align-middle">{t.commission}</th>
                                                     <th className="px-4 py-5 text-start align-middle">{t.status}</th>
-                                                    <th className="w-16 px-4 py-5 align-middle">
-                                                        <span className="sr-only">{t.rowActions}</span>
-                                                    </th>
+                                                    <th className="w-40 px-4 py-5 text-end align-middle">{t.actions}</th>
                                                 </tr>
                                             </thead>
 
@@ -2628,16 +2845,32 @@ export default function DoctorsManagementPage({
                                                 ) : visibleDoctors.length === 0 ? (
                                                     <tr>
                                                         <td
-                                                            colSpan={8}
+                                                            colSpan={7}
                                                             className="h-56 text-center align-middle text-sm text-slate-500 dark:text-slate-400"
                                                         >
-                                                            {t.empty}
+                                                            <div className="flex flex-col items-center gap-3">
+                                                                <span>{t.empty}</span>
+                                                                {hasActiveFilters && (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={resetFilters}
+                                                                        className="font-semibold text-teal-500 underline hover:text-teal-400"
+                                                                    >
+                                                                        {t.resetFilters}
+                                                                    </button>
+                                                                )}
+                                                            </div>
                                                         </td>
                                                     </tr>
                                                 ) : (
                                                     visibleDoctors.map((doctor) => {
                                                         const source = doctorById.get(doctor.id);
                                                         const pendingCreate = isTempId(doctor.id);
+                                                        const canAssign =
+                                                            Boolean(source) && !pendingCreate && doctor.isUnassigned;
+                                                        const servicesText = doctor.services
+                                                            .map((service) => service.name)
+                                                            .join(", ");
 
                                                         return (
                                                             <tr
@@ -2671,25 +2904,30 @@ export default function DoctorsManagementPage({
                                                                     <span dir="ltr">{doctor.scfhsLicenseNumber}</span>
                                                                 </td>
 
-                                                                <td className="px-4 py-5 align-middle text-base text-slate-900 dark:text-slate-100">
-                                                                    {doctor.clinicName}
-                                                                </td>
-
                                                                 <td className="px-4 py-5 align-middle">
-                                                                    <div className="flex max-w-64 flex-wrap gap-2">
-                                                                        {doctor.services.map((service) => (
-                                                                            <span
-                                                                                key={service.id}
-                                                                                className="inline-flex max-w-40 items-center gap-2 rounded-lg bg-teal-600/10 px-3 py-2 text-sm text-teal-300"
-                                                                            >
-                                                                                <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-teal-500" />
-                                                                                <span className="truncate">{service.name}</span>
+                                                                    {doctor.isUnassigned ? (
+                                                                        <div className="flex flex-col items-start gap-1.5">
+                                                                            <UnassignedBadge t={t} />
+                                                                            <span className="max-w-64 truncate text-sm text-slate-500 dark:text-slate-400">
+                                                                                {unassignedSummary(doctor, t)}
                                                                             </span>
-                                                                        ))}
-                                                                    </div>
+                                                                        </div>
+                                                                    ) : (
+                                                                        <div className="min-w-0 max-w-64">
+                                                                            <p className="truncate text-base text-slate-900 dark:text-slate-100">
+                                                                                {doctor.clinicName || "—"}
+                                                                            </p>
+                                                                            <p
+                                                                                title={servicesText}
+                                                                                className="mt-0.5 truncate text-sm text-slate-500 dark:text-slate-400"
+                                                                            >
+                                                                                {servicesText}
+                                                                            </p>
+                                                                        </div>
+                                                                    )}
                                                                 </td>
 
-                                                                <td className="px-4 py-5 text-center align-middle text-base font-semibold text-slate-900 dark:text-slate-100">
+                                                                <td className="px-4 py-5 align-middle text-base text-slate-900 dark:text-slate-100">
                                                                     <span dir="ltr">{doctor.commissionRate}%</span>
                                                                 </td>
 
@@ -2699,17 +2937,27 @@ export default function DoctorsManagementPage({
 
                                                                 <td className="px-4 py-5 text-end align-middle">
                                                                     {source && (
-                                                                        <RowActions
-                                                                            doctor={doctor}
-                                                                            t={t}
-                                                                            isRtl={isRtl}
-                                                                            busy={busyId === doctor.id}
-                                                                            disabled={pendingCreate}
-                                                                            onEdit={() => openEdit(source)}
-                                                                            onDelete={() => setDeleteTarget(source)}
-                                                                            onToggleStatus={() => handleToggleStatus(source)}
-                                                                            onRegenerate={() => handleRegenerate(source)}
-                                                                        />
+                                                                        <div className="flex items-center justify-end gap-1">
+                                                                            {canAssign && (
+                                                                                <AssignButton
+                                                                                    t={t}
+                                                                                    name={displayName(doctor.fullName, locale)}
+                                                                                    onClick={() => openAssign(source)}
+                                                                                />
+                                                                            )}
+
+                                                                            <RowActions
+                                                                                doctor={doctor}
+                                                                                t={t}
+                                                                                isRtl={isRtl}
+                                                                                busy={busyId === doctor.id}
+                                                                                disabled={pendingCreate}
+                                                                                onEdit={() => openEdit(source)}
+                                                                                onDelete={() => setDeleteTarget(source)}
+                                                                                onToggleStatus={() => handleToggleStatus(source)}
+                                                                                onRegenerate={() => handleRegenerate(source)}
+                                                                            />
+                                                                        </div>
                                                                     )}
                                                                 </td>
                                                             </tr>
@@ -2741,20 +2989,30 @@ export default function DoctorsManagementPage({
                                                 <PrevIcon className="h-4 w-4" />
                                             </button>
 
-                                            {pageWindow(currentPage, totalPages).map((pageNumber) => (
-                                                <button
-                                                    type="button"
-                                                    key={pageNumber}
-                                                    aria-current={pageNumber === currentPage ? "page" : undefined}
-                                                    onClick={() => setPage(pageNumber)}
-                                                    className={`h-10 min-w-10 rounded-lg border px-3 text-sm font-semibold transition ${pageNumber === currentPage
-                                                        ? "border-teal-600 bg-teal-600 text-white"
-                                                        : "border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-teal-500 hover:text-teal-400"
-                                                        }`}
-                                                >
-                                                    {pageNumber}
-                                                </button>
-                                            ))}
+                                            {pageItems(currentPage, totalPages).map((item) =>
+                                                typeof item === "number" ? (
+                                                    <button
+                                                        type="button"
+                                                        key={item}
+                                                        aria-current={item === currentPage ? "page" : undefined}
+                                                        onClick={() => setPage(item)}
+                                                        className={`h-10 min-w-10 rounded-lg border px-3 text-sm font-semibold transition ${item === currentPage
+                                                            ? "border-teal-600 bg-teal-600 text-white"
+                                                            : "border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-teal-500 hover:text-teal-400"
+                                                            }`}
+                                                    >
+                                                        {item}
+                                                    </button>
+                                                ) : (
+                                                    <span
+                                                        key={item}
+                                                        aria-hidden="true"
+                                                        className="grid h-10 w-8 place-items-center text-slate-500 dark:text-slate-400"
+                                                    >
+                                                        <MoreHorizontal className="h-4 w-4" />
+                                                    </span>
+                                                ),
+                                            )}
 
                                             <button
                                                 type="button"
@@ -2776,71 +3034,80 @@ export default function DoctorsManagementPage({
                 </main>
             </div>
 
-            {modal && (
-                <DoctorFormModal
-                    key={modal.mode === "edit" ? modal.doctor.id : "create"}
-                    doctor={modal.mode === "edit" ? modal.doctor : null}
-                    options={options}
-                    optionsLoading={optionsLoading}
-                    optionsError={optionsError}
-                    locale={locale}
-                    t={t}
-                    onClose={closeModal}
-                    onSubmit={submitDoctor}
-                    onReloadOptions={() => void loadOptions()}
-                />
-            )}
+            <AnimatePresence>
+                {modal && (
+                    <DoctorFormModal
+                        key={modal.mode === "edit" ? modal.doctor.id : "create"}
+                        doctor={modal.mode === "edit" ? modal.doctor : null}
+                        assignMode={modal.mode === "edit" && Boolean(modal.assign)}
+                        options={options}
+                        optionsLoading={optionsLoading}
+                        optionsError={optionsError}
+                        locale={locale}
+                        t={t}
+                        onClose={closeModal}
+                        onSubmit={submitDoctor}
+                        onReloadOptions={() => void loadOptions()}
+                    />
+                )}
+            </AnimatePresence>
 
-            {deleteTarget && (
-                <div
-                    className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/40 dark:bg-slate-950/80 p-4 -sm"
-                    onMouseDown={(event) => {
-                        if (event.target === event.currentTarget) setDeleteTarget(null);
-                    }}
-                >
-                    <section
-                        role="alertdialog"
-                        aria-modal="true"
-                        aria-labelledby="delete-doctor-title"
-                        className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-6 shadow-2xl shadow-black/60"
+            <AnimatePresence>
+                {deleteTarget && (
+                    <motion.div
+                        key="delete-doctor-backdrop"
+                        {...backdropMotion}
+                        className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/40 dark:bg-slate-950/80 p-4"
+                        onMouseDown={(event) => {
+                            if (event.target === event.currentTarget) setDeleteTarget(null);
+                        }}
                     >
-                        <div className="flex items-start gap-4">
-                            <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-rose-500/10 text-rose-400">
-                                <Trash2 className="h-5 w-5" />
+                        <motion.section
+                            key="delete-doctor-content"
+                            {...panelMotion}
+                            role="alertdialog"
+                            aria-modal="true"
+                            aria-labelledby="delete-doctor-title"
+                            className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-6 shadow-2xl shadow-black/60"
+                        >
+                            <div className="flex items-start gap-4">
+                                <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-rose-500/10 text-rose-400">
+                                    <Trash2 className="h-5 w-5" />
+                                </div>
+
+                                <div className="min-w-0">
+                                    <h2 id="delete-doctor-title" className="text-lg font-bold text-slate-900 dark:text-white">
+                                        {t.deleteTitle}
+                                    </h2>
+                                    <p className="mt-1 truncate text-sm font-semibold text-slate-700 dark:text-slate-200">
+                                        {displayName(deleteTarget.fullName, locale)}
+                                    </p>
+                                    <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{t.deleteBody}</p>
+                                </div>
                             </div>
 
-                            <div className="min-w-0">
-                                <h2 id="delete-doctor-title" className="text-lg font-bold text-slate-900 dark:text-white">
-                                    {t.deleteTitle}
-                                </h2>
-                                <p className="mt-1 truncate text-sm font-semibold text-slate-700 dark:text-slate-200">
-                                    {displayName(deleteTarget.fullName, locale)}
-                                </p>
-                                <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{t.deleteBody}</p>
+                            <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                                <button
+                                    type="button"
+                                    onClick={() => setDeleteTarget(null)}
+                                    className={`${outlineButton} h-11 px-6`}
+                                >
+                                    {t.cancel}
+                                </button>
+
+                                <button
+                                    type="button"
+                                    onClick={confirmDelete}
+                                    className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                    <Trash2 className="h-4 w-4" />
+                                    {t.deleteConfirm}
+                                </button>
                             </div>
-                        </div>
-
-                        <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-                            <button
-                                type="button"
-                                onClick={() => setDeleteTarget(null)}
-                                className={`${outlineButton} h-11 px-6`}
-                            >
-                                {t.cancel}
-                            </button>
-
-                            <button
-                                type="button"
-                                onClick={confirmDelete}
-                                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                                <Trash2 className="h-4 w-4" />
-                                {t.deleteConfirm}
-                            </button>
-                        </div>
-                    </section>
-                </div>
-            )}
+                        </motion.section>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             <div
                 role="status"

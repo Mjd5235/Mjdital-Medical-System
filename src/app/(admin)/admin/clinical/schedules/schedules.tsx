@@ -13,6 +13,7 @@ import {
     type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { AnimatePresence, motion } from "framer-motion";
 import {
     Building2,
     CalendarDays,
@@ -1770,13 +1771,21 @@ function ShiftFormModal({
         ) : null;
 
     return (
-        <div
+        <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
             className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-900/50 p-0 -sm dark:bg-slate-950/80 sm:items-center sm:p-4"
             onMouseDown={(event) => {
                 if (event.target === event.currentTarget) onClose();
             }}
         >
-            <div
+            <motion.div
+                initial={{ opacity: 0, scale: 0.96, y: 12 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.97, y: 8 }}
+                transition={{ duration: 0.2, ease: "easeOut" }}
                 ref={dialogRef}
                 role="dialog"
                 aria-modal="true"
@@ -2042,8 +2051,8 @@ function ShiftFormModal({
                         </button>
                     </div>
                 </form>
-            </div>
-        </div>
+            </motion.div>
+        </motion.div>
     );
 }
 
@@ -2857,69 +2866,81 @@ export default function SchedulesShiftsPage({ initialLocale,
                 </main>
             </div>
 
-            {modal && (
-                <ShiftFormModal
-                    key={modal.mode === "edit" ? modal.shift.id : "create"}
-                    shift={modal.mode === "edit" ? modal.shift : null}
-                    allShifts={data.shifts}
-                    data={data}
-                    locale={locale}
-                    t={t}
-                    onClose={() => setModal(null)}
-                    onSubmit={submitShift}
-                />
-            )}
+            <AnimatePresence>
+                {modal && (
+                    <ShiftFormModal
+                        key={modal.mode === "edit" ? modal.shift.id : "create"}
+                        shift={modal.mode === "edit" ? modal.shift : null}
+                        allShifts={data.shifts}
+                        data={data}
+                        locale={locale}
+                        t={t}
+                        onClose={() => setModal(null)}
+                        onSubmit={submitShift}
+                    />
+                )}
+            </AnimatePresence>
 
-            {deleteTarget && (
-                <div
-                    className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/50 p-4 -sm dark:bg-slate-950/80"
-                    onMouseDown={(event) => {
-                        if (event.target === event.currentTarget) setDeleteTarget(null);
-                    }}
-                >
-                    <section
-                        role="alertdialog"
-                        aria-modal="true"
-                        aria-labelledby="delete-shift-title"
-                        className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl shadow-black/60 dark:border-slate-700 dark:bg-slate-900"
+            <AnimatePresence>
+                {deleteTarget && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={{ duration: 0.18, ease: "easeOut" }}
+                        className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/50 p-4 -sm dark:bg-slate-950/80"
+                        onMouseDown={(event) => {
+                            if (event.target === event.currentTarget) setDeleteTarget(null);
+                        }}
                     >
-                        <div className="flex items-start gap-4">
-                            <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-rose-500/10 text-rose-500">
-                                <Trash2 className="h-5 w-5" />
+                        <motion.section
+                            initial={{ opacity: 0, scale: 0.96, y: 12 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            exit={{ opacity: 0, scale: 0.97, y: 8 }}
+                            transition={{ duration: 0.2, ease: "easeOut" }}
+                            role="alertdialog"
+                            aria-modal="true"
+                            aria-labelledby="delete-shift-title"
+                            className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl shadow-black/60 dark:border-slate-700 dark:bg-slate-900"
+                        >
+                            <div className="flex items-start gap-4">
+                                <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-rose-500/10 text-rose-500">
+                                    <Trash2 className="h-5 w-5" />
+                                </div>
+
+                                <div className="min-w-0">
+                                    <h2 id="delete-shift-title" className="text-lg font-bold text-slate-900 dark:text-white">
+                                        {t.deleteTitle}
+                                    </h2>
+                                    <p className="mt-1 truncate text-sm font-semibold text-slate-700 dark:text-slate-200">
+                                        {doctorLabel(names(deleteTarget, locale).doctor, locale, t)} ·{" "}
+                                        <bdi>{timeRange(deleteTarget, locale)}</bdi>
+                                    </p>
+                                    <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{t.deleteBody}</p>
+                                </div>
                             </div>
 
-                            <div className="min-w-0">
-                                <h2 id="delete-shift-title" className="text-lg font-bold text-slate-900 dark:text-white">
-                                    {t.deleteTitle}
-                                </h2>
-                                <p className="mt-1 truncate text-sm font-semibold text-slate-700 dark:text-slate-200">
-                                    {doctorLabel(names(deleteTarget, locale).doctor, locale, t)} ·{" "}
-                                    <bdi>{timeRange(deleteTarget, locale)}</bdi>
-                                </p>
-                                <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{t.deleteBody}</p>
+                            <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                                <button
+                                    type="button"
+                                    onClick={() => setDeleteTarget(null)}
+                                    className={cn(outlineButton, "px-6")}
+                                >
+                                    {t.cancel}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={confirmDelete}
+                                    className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950"
+                                >
+                                    <Trash2 className="h-4 w-4" />
+                                    {t.deleteConfirm}
+                                </button>
                             </div>
-                        </div>
-
-                        <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-                            <button
-                                type="button"
-                                onClick={() => setDeleteTarget(null)}
-                                className={cn(outlineButton, "px-6")}
-                            >
-                                {t.cancel}
-                            </button>
-                            <button
-                                type="button"
-                                onClick={confirmDelete}
-                                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950"
-                            >
-                                <Trash2 className="h-4 w-4" />
-                                {t.deleteConfirm}
-                            </button>
-                        </div>
-                    </section>
-                </div>
-            )}
+                        </motion.section>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {notice && (
                 <div

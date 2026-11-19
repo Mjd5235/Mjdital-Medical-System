@@ -461,7 +461,7 @@ model User {
 model Doctor {
   id                 String                @id @default(uuid()) @db.Uuid
   organizationId     String                @map("organization_id") @db.Uuid
-  clinicId           String                @map("clinic_id") @db.Uuid
+  clinicId           String?               @map("clinic_id") @db.Uuid
   userId             String?               @unique @map("user_id") @db.Uuid
   fullNameAr         String                @map("full_name_ar")
   fullNameEn         String                @map("full_name_en")
@@ -478,7 +478,7 @@ model Doctor {
   updatedAt          DateTime              @updatedAt @map("updated_at")
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
-  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  clinic       Clinic?      @relation(fields: [clinicId], references: [id], onDelete: SetNull)
   user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
   services     Service[]
   appointments Appointment[]
@@ -609,7 +609,7 @@ model Appointment {
 model AuditLog {
   id             String          @id @default(uuid()) @db.Uuid
   organizationId String          @map("organization_id") @db.Uuid
-  clinicId       String          @map("clinic_id") @db.Uuid
+  clinicId       String?         @map("clinic_id") @db.Uuid
   userId         String          @map("user_id") @db.Uuid
   actionType     AuditActionType @map("action_type")
   targetTable    String          @map("target_table")
@@ -620,7 +620,7 @@ model AuditLog {
   timestamp      DateTime        @default(now())
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
-  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+  clinic       Clinic?      @relation(fields: [clinicId], references: [id], onDelete: SetNull)
   user         User         @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@index([organizationId, timestamp])

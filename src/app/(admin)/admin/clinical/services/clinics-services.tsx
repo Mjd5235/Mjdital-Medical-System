@@ -4,12 +4,15 @@
 import {
     useCallback,
     useEffect,
+    useId,
     useMemo,
     useRef,
     useState,
     type FormEvent,
+    type KeyboardEvent as ReactKeyboardEvent,
     type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 
 import {
     Activity,
@@ -29,6 +32,7 @@ import {
     Search,
     ShieldCheck,
     Trash2,
+    TriangleAlert,
     X,
 } from "lucide-react";
 
@@ -53,7 +57,7 @@ import {
     type UpdateServiceInput,
 } from "./actions";
 import AdminHeader from "@/components/AdminPortalHeader/Header";
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from "framer-motion";
 
 type ClinicsServicesProps = {
     initialLocale: Locale;
@@ -170,7 +174,7 @@ const translations = {
         saveClinic: "حفظ العيادة",
         saveService: "حفظ الخدمة",
         saveChanges: "حفظ التعديلات",
-        loading: "جارٍ تحميل البيانات...",
+        loading: "جارٍ التحميل",
         loadingError: "تعذر تحميل البيانات. حاول إعادة التحميل.",
         noClinics: "لا توجد عيادات مطابقة للبحث.",
         noServices: "لا توجد خدمات مطابقة للبحث.",
@@ -202,9 +206,11 @@ const translations = {
         confirmDeleteClinic: "هل أنت متأكد من حذف العيادة",
         confirmDeleteService: "هل أنت متأكد من حذف الخدمة",
         deleteWarning: "لا يمكن التراجع عن هذا الإجراء.",
-        deleteClinicHint: "لا يمكن حذف عيادة مرتبطة بخدمات أو أطباء أو شفتات. عطّلها بدلاً من ذلك.",
+        deleteClinicHint: "سيؤدي حذف العيادة إلى حذف كل ما يرتبط بها نهائياً. إذا أردت الاحتفاظ بالبيانات فعطّل العيادة بدلاً من حذفها.",
         deleteServiceHint: "لا يمكن حذف خدمة مستخدمة في شفتات أو مواعيد. عطّلها بدلاً من ذلك.",
         clinicHasServices: "لا يمكن حذف هذه العيادة لأنها تحتوي على خدمات. احذف الخدمات أولاً أو عطّل العيادة.",
+        clinicCascadeWarning: "تحذير: حذف هذه العيادة سيؤدي إلى حذف جميع الخدمات المرتبطة بها وشفتات الأطباء والسجلات ذات الصلة بشكل نهائي.",
+        deleteEverything: "حذف العيادة وكل بياناتها",
         deletedClinic: "تم حذف العيادة.",
         deletedService: "تم حذف الخدمة.",
         confirm: "تأكيد العملية",
@@ -222,7 +228,7 @@ const translations = {
         zatca: "ضريبة القيمة المضافة وفق إعدادات ZATCA",
         vatNote: "يتم احتساب الضريبة تلقائياً وفق النسبة المختارة.",
         statusNote: "يمكن تغيير حالة العيادة من إجراءات الجدول.",
-        nphiesNote: "الرمز المعروض رمز داخلي للتخصص وليس معرف تسجيل رسمي لدى نفيس.",
+        nphiesNote: "الرمز المعروض رمز داخلي للتخصص وليس معرف تسجيل رسمي لدى نفيس. يتم تحديثه تلقائياً عند تغيير التخصص.",
         platform: "منصة إدارة الرعاية الصحية",
         footer: "جميع الحقوق محفوظة",
         systemOnline: "النظام يعمل بشكل طبيعي",
@@ -273,7 +279,7 @@ const translations = {
         saveClinic: "Save Clinic",
         saveService: "Save Service",
         saveChanges: "Save Changes",
-        loading: "Loading data...",
+        loading: "Loading",
         loadingError: "Unable to load data. Please try again.",
         noClinics: "No clinics match your search.",
         noServices: "No services match your search.",
@@ -305,9 +311,11 @@ const translations = {
         confirmDeleteClinic: "Are you sure you want to delete the clinic",
         confirmDeleteService: "Are you sure you want to delete the service",
         deleteWarning: "This action cannot be undone.",
-        deleteClinicHint: "A clinic linked to services, doctors or shifts cannot be deleted. Disable it instead.",
+        deleteClinicHint: "Deleting a clinic permanently removes everything linked to it. To keep the data, disable the clinic instead.",
         deleteServiceHint: "A service used in shifts or appointments cannot be deleted. Disable it instead.",
         clinicHasServices: "This clinic cannot be deleted because it still has services. Delete the services first or disable the clinic.",
+        clinicCascadeWarning: "Warning: Deleting this clinic will permanently delete all its associated services, doctor shifts, and related records.",
+        deleteEverything: "Delete clinic and all its data",
         deletedClinic: "Clinic deleted.",
         deletedService: "Service deleted.",
         confirm: "Confirm Action",
@@ -325,7 +333,7 @@ const translations = {
         zatca: "VAT settings for ZATCA compliance",
         vatNote: "VAT is calculated automatically using the selected rate.",
         statusNote: "Change the clinic status using the table actions.",
-        nphiesNote: "The displayed code is an internal catalog code, not an official NPHIES enrollment identifier.",
+        nphiesNote: "The displayed code is an internal catalog code, not an official NPHIES enrollment identifier. It updates automatically when the specialty changes.",
         platform: "Healthcare Management Platform",
         footer: "All rights reserved",
         systemOnline: "All systems operational",
@@ -423,11 +431,525 @@ function Field({
     );
 }
 
+
+
+/* ---------------------- shared design system (same as Doctors) ---------------------- */
+
 const inputClass =
-    "h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-white dark:disabled:bg-slate-800";
+    "h-11 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950/60 px-3 text-sm text-slate-900 dark:text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 disabled:cursor-not-allowed disabled:opacity-50";
+
+const tealButton =
+    "inline-flex items-center justify-center gap-2 rounded-lg bg-teal-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50";
+
+const outlineButton =
+    "inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 text-sm font-semibold text-slate-900 dark:text-slate-100 transition hover:border-teal-500 hover:text-teal-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50";
+
+const dangerButton =
+    "inline-flex items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50";
+
+const cardSurface =
+    "rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/60 shadow-xl shadow-black/20";
+
+const iconButtonClass =
+    "grid h-10 w-10 place-items-center rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 transition hover:border-teal-500 hover:text-teal-400 focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
 
 const deleteButtonClass =
-    "grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-500 transition hover:border-rose-300 hover:bg-rose-50 hover:text-rose-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-400 dark:hover:border-rose-900 dark:hover:bg-rose-950/40 dark:hover:text-rose-400";
+    "grid h-10 w-10 place-items-center rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 transition hover:border-rose-500 hover:text-rose-400 focus:outline-none focus:ring-2 focus:ring-rose-500 disabled:cursor-not-allowed disabled:opacity-50";
+
+const modalBackdropClass =
+    "fixed inset-0 flex items-center justify-center overflow-y-auto bg-slate-900/40 dark:bg-slate-950/80 p-3 sm:p-6";
+
+const modalPanelClass =
+    "rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-2xl shadow-black/60";
+
+/** Modal open/close animation shared with the Doctors page. */
+const backdropMotion = {
+    initial: { opacity: 0 },
+    animate: { opacity: 1 },
+    exit: { opacity: 0 },
+    transition: { duration: 0.2, ease: "easeOut" },
+} as const;
+
+const panelMotion = {
+    initial: { opacity: 0, scale: 0.96, y: 16 },
+    animate: { opacity: 1, scale: 1, y: 0 },
+    exit: { opacity: 0, scale: 0.97, y: 10 },
+    transition: { duration: 0.22, ease: [0.22, 1, 0.36, 1] },
+} as const;
+
+function StatusBadge({
+    active,
+    activeLabel,
+    inactiveLabel,
+}: {
+    active: boolean;
+    activeLabel: string;
+    inactiveLabel: string;
+}) {
+    return (
+        <span
+            className={cn(
+                "inline-flex items-center gap-2 whitespace-nowrap rounded-lg px-4 py-2.5 text-sm font-semibold",
+                active
+                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                    : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+            )}
+        >
+            <span
+                className={cn(
+                    "h-2.5 w-2.5 rounded-full",
+                    active ? "bg-emerald-500 dark:bg-emerald-400" : "bg-amber-500 dark:bg-amber-400",
+                )}
+            />
+            {active ? activeLabel : inactiveLabel}
+        </span>
+    );
+}
+
+/* ------------------------------- skeleton loading ------------------------------- */
+
+/** Shimmering placeholder block (slate-200 / slate-800 base with a moving highlight). */
+function Skeleton({ className }: { className?: string }) {
+    return (
+        <span
+            aria-hidden="true"
+            className={cn(
+                "relative block overflow-hidden rounded-md bg-slate-200 dark:bg-slate-800",
+                "after:absolute after:inset-0 after:-translate-x-full after:animate-[mj-shimmer_1.6s_ease-in-out_infinite] after:bg-gradient-to-r after:from-transparent after:via-white/70 after:to-transparent dark:after:via-slate-600/30",
+                className,
+            )}
+        />
+    );
+}
+
+function TableSkeleton({
+    variant,
+    headers,
+    loadingLabel,
+}: {
+    variant: "clinics" | "services";
+    headers: string[];
+    loadingLabel: string;
+}) {
+    const rows = Array.from({ length: 6 }, (_, index) => index);
+    const isClinics = variant === "clinics";
+
+    return (
+        <table
+            aria-busy="true"
+            className={cn(
+                "w-full border-collapse text-start text-sm",
+                isClinics ? "min-w-[900px]" : "min-w-[1100px]",
+            )}
+        >
+            <caption className="sr-only">{loadingLabel}</caption>
+
+            <thead>
+                <tr className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-sm font-bold text-slate-900 dark:text-slate-100">
+                    {headers.map((header, index) => (
+                        <th
+                            key={`${header}-${index}`}
+                            scope="col"
+                            className={cn(
+                                "py-5 text-start align-middle",
+                                index === 0 || index === headers.length - 1
+                                    ? "px-6"
+                                    : "px-4",
+                            )}
+                        >
+                            {header}
+                        </th>
+                    ))}
+                </tr>
+            </thead>
+
+            <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                {rows.map((row) =>
+                    isClinics ? (
+                        <tr key={row}>
+                            <td className="px-6 py-5">
+                                <div className="flex items-center gap-3">
+                                    <Skeleton className="h-12 w-12 shrink-0 rounded-full" />
+                                    <div className="space-y-2">
+                                        <Skeleton className="h-4 w-40" />
+                                        <Skeleton className="h-3 w-28" />
+                                    </div>
+                                </div>
+                            </td>
+                            <td className="px-4 py-5">
+                                <Skeleton className="h-4 w-28" />
+                            </td>
+                            <td className="px-4 py-5">
+                                <Skeleton className="h-8 w-24 rounded-lg" />
+                            </td>
+                            <td className="px-6 py-5">
+                                <Skeleton className="h-10 w-28 rounded-lg" />
+                            </td>
+                            <td className="px-6 py-5">
+                                <div className="flex items-center gap-2">
+                                    <Skeleton className="h-10 w-10 rounded-lg" />
+                                    <Skeleton className="h-10 w-10 rounded-lg" />
+                                    <Skeleton className="h-10 w-10 rounded-lg" />
+                                </div>
+                            </td>
+                        </tr>
+                    ) : (
+                        <tr key={row}>
+                            <td className="px-6 py-5">
+                                <Skeleton className="h-8 w-20 rounded-lg" />
+                            </td>
+                            <td className="px-4 py-5">
+                                <Skeleton className="h-4 w-28" />
+                            </td>
+                            <td className="px-4 py-5">
+                                <div className="space-y-2">
+                                    <Skeleton className="h-4 w-40" />
+                                    <Skeleton className="h-3 w-28" />
+                                </div>
+                            </td>
+                            <td className="px-4 py-5">
+                                <Skeleton className="h-4 w-24" />
+                            </td>
+                            <td className="px-4 py-5">
+                                <Skeleton className="h-8 w-16 rounded-lg" />
+                            </td>
+                            <td className="px-6 py-5">
+                                <div className="space-y-2">
+                                    <Skeleton className="h-4 w-28" />
+                                    <Skeleton className="h-3 w-20" />
+                                </div>
+                            </td>
+                            <td className="px-4 py-5">
+                                <Skeleton className="h-10 w-28 rounded-lg" />
+                            </td>
+                            <td className="px-6 py-5">
+                                <div className="flex items-center gap-2">
+                                    <Skeleton className="h-10 w-10 rounded-lg" />
+                                    <Skeleton className="h-10 w-10 rounded-lg" />
+                                    <Skeleton className="h-10 w-10 rounded-lg" />
+                                </div>
+                            </td>
+                        </tr>
+                    ),
+                )}
+            </tbody>
+        </table>
+    );
+}
+
+/* ------------------------------ modern dropdown (select) ------------------------------ */
+
+type SelectOption = {
+    value: string;
+    label: string;
+    disabled?: boolean;
+};
+
+type SelectPosition = {
+    left: number;
+    width: number;
+    top?: number;
+    bottom?: number;
+    maxHeight: number;
+};
+
+/**
+ * Dark-theme dropdown used for every select in this page.
+ * Teal accents, a check mark + teal background on the selected item, keyboard support
+ * (arrows / Home / End / Enter / Escape) and a portal-based panel so it is never clipped
+ * by a scrolling modal.
+ */
+function SelectField({
+    value,
+    onChange,
+    options,
+    placeholder,
+    isRtl,
+    ariaLabel,
+    disabled,
+}: {
+    value: string;
+    onChange: (value: string) => void;
+    options: SelectOption[];
+    placeholder?: string;
+    isRtl: boolean;
+    ariaLabel: string;
+    disabled?: boolean;
+}) {
+    const [open, setOpen] = useState(false);
+    const [activeIndex, setActiveIndex] = useState(-1);
+    const [position, setPosition] = useState<SelectPosition | null>(null);
+
+    const triggerRef = useRef<HTMLButtonElement>(null);
+    const listRef = useRef<HTMLUListElement>(null);
+    const listId = useId();
+
+    const selectedIndex = options.findIndex((option) => option.value === value);
+    const selectedOption = selectedIndex >= 0 ? options[selectedIndex] : null;
+
+    const updatePosition = useCallback(() => {
+        const trigger = triggerRef.current;
+
+        if (!trigger) return;
+
+        const rect = trigger.getBoundingClientRect();
+        const gap = 6;
+        const desired = 288;
+        const spaceBelow = window.innerHeight - rect.bottom - gap - 12;
+        const spaceAbove = rect.top - gap - 12;
+        const placeAbove = spaceBelow < Math.min(desired, 200) && spaceAbove > spaceBelow;
+        const available = placeAbove ? spaceAbove : spaceBelow;
+
+        setPosition({
+            left: rect.left,
+            width: rect.width,
+            maxHeight: Math.max(120, Math.min(desired, available)),
+            ...(placeAbove
+                ? { bottom: window.innerHeight - rect.top + gap }
+                : { top: rect.bottom + gap }),
+        });
+    }, []);
+
+    const firstEnabled = useCallback(() => options.findIndex((option) => !option.disabled), [options]);
+
+    const lastEnabled = useCallback(() => {
+        for (let index = options.length - 1; index >= 0; index -= 1) {
+            if (!options[index].disabled) return index;
+        }
+
+        return -1;
+    }, [options]);
+
+    const move = useCallback(
+        (from: number, step: 1 | -1) => {
+            if (options.length === 0) return -1;
+
+            let index = from;
+
+            for (let count = 0; count < options.length; count += 1) {
+                index = (index + step + options.length) % options.length;
+
+                if (!options[index].disabled) return index;
+            }
+
+            return from;
+        },
+        [options],
+    );
+
+    const openList = useCallback(() => {
+        if (disabled) return;
+
+        updatePosition();
+        setActiveIndex(selectedIndex >= 0 && !options[selectedIndex].disabled ? selectedIndex : firstEnabled());
+        setOpen(true);
+    }, [disabled, updatePosition, selectedIndex, options, firstEnabled]);
+
+    const closeList = useCallback(() => setOpen(false), []);
+
+    const choose = useCallback(
+        (next: string) => {
+            onChange(next);
+            setOpen(false);
+            triggerRef.current?.focus();
+        },
+        [onChange],
+    );
+
+    useEffect(() => {
+        if (!open) return;
+
+        const handlePointerDown = (event: MouseEvent) => {
+            const target = event.target as Node;
+
+            if (triggerRef.current?.contains(target) || listRef.current?.contains(target)) return;
+
+            setOpen(false);
+        };
+
+        const handleReposition = () => updatePosition();
+
+        document.addEventListener("mousedown", handlePointerDown);
+        window.addEventListener("resize", handleReposition);
+        window.addEventListener("scroll", handleReposition, true);
+
+        return () => {
+            document.removeEventListener("mousedown", handlePointerDown);
+            window.removeEventListener("resize", handleReposition);
+            window.removeEventListener("scroll", handleReposition, true);
+        };
+    }, [open, updatePosition]);
+
+    useEffect(() => {
+        if (!open || activeIndex < 0) return;
+
+        document
+            .getElementById(`${listId}-option-${activeIndex}`)
+            ?.scrollIntoView({ block: "nearest" });
+    }, [open, activeIndex, listId]);
+
+    const handleKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+        switch (event.key) {
+            case "ArrowDown":
+                event.preventDefault();
+                if (!open) openList();
+                else setActiveIndex((current) => move(current, 1));
+                break;
+
+            case "ArrowUp":
+                event.preventDefault();
+                if (!open) openList();
+                else setActiveIndex((current) => move(current, -1));
+                break;
+
+            case "Home":
+                if (open) {
+                    event.preventDefault();
+                    setActiveIndex(firstEnabled());
+                }
+                break;
+
+            case "End":
+                if (open) {
+                    event.preventDefault();
+                    setActiveIndex(lastEnabled());
+                }
+                break;
+
+            case "Enter":
+            case " ":
+                event.preventDefault();
+                if (!open) {
+                    openList();
+                } else if (activeIndex >= 0 && !options[activeIndex]?.disabled) {
+                    choose(options[activeIndex].value);
+                }
+                break;
+
+            case "Escape":
+                if (open) {
+                    // Closes only the dropdown, not the surrounding modal.
+                    event.preventDefault();
+                    event.stopPropagation();
+                    closeList();
+                }
+                break;
+
+            case "Tab":
+                closeList();
+                break;
+
+            default:
+                break;
+        }
+    };
+
+    return (
+        <>
+            <button
+                ref={triggerRef}
+                type="button"
+                role="combobox"
+                aria-label={ariaLabel}
+                aria-haspopup="listbox"
+                aria-expanded={open}
+                aria-controls={open ? listId : undefined}
+                aria-activedescendant={
+                    open && activeIndex >= 0 ? `${listId}-option-${activeIndex}` : undefined
+                }
+                disabled={disabled}
+                onClick={() => (open ? closeList() : openList())}
+                onKeyDown={handleKeyDown}
+                className={cn(
+                    inputClass,
+                    "flex items-center justify-between gap-2 text-start",
+                    open && "border-teal-500 ring-2 ring-teal-500/20",
+                )}
+            >
+                <span
+                    className={cn(
+                        "min-w-0 truncate",
+                        !selectedOption && "text-slate-500 dark:text-slate-400",
+                    )}
+                >
+                    {selectedOption?.label ?? placeholder ?? ""}
+                </span>
+
+                <ChevronDown
+                    size={16}
+                    className={cn(
+                        "shrink-0 text-slate-400 transition-transform duration-200",
+                        open && "rotate-180 text-teal-500",
+                    )}
+                />
+            </button>
+
+            {open &&
+                position &&
+                typeof document !== "undefined" &&
+                createPortal(
+                    <ul
+                        ref={listRef}
+                        id={listId}
+                        role="listbox"
+                        aria-label={ariaLabel}
+                        dir={isRtl ? "rtl" : "ltr"}
+                        style={{
+                            position: "fixed",
+                            left: position.left,
+                            width: position.width,
+                            top: position.top,
+                            bottom: position.bottom,
+                            maxHeight: position.maxHeight,
+                        }}
+                        className="z-[80] overflow-y-auto rounded-xl border border-slate-200 bg-white p-1.5 shadow-2xl shadow-black/60 dark:border-teal-500/20 dark:bg-slate-900"
+                    >
+                        {options.map((option, index) => {
+                            const selected = option.value === value;
+                            const active = index === activeIndex;
+
+                            return (
+                                <li
+                                    key={option.value || `option-${index}`}
+                                    id={`${listId}-option-${index}`}
+                                    role="option"
+                                    aria-selected={selected}
+                                    aria-disabled={option.disabled || undefined}
+                                    onMouseEnter={() => {
+                                        if (!option.disabled) setActiveIndex(index);
+                                    }}
+                                    onMouseDown={(event) => event.preventDefault()}
+                                    onClick={() => {
+                                        if (!option.disabled) choose(option.value);
+                                    }}
+                                    className={cn(
+                                        "flex cursor-pointer items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors",
+                                        selected
+                                            ? "bg-teal-500/15 font-semibold text-teal-700 dark:bg-teal-600/20 dark:text-teal-300"
+                                            : "text-slate-700 dark:text-slate-200",
+                                        active &&
+                                        !selected &&
+                                        "bg-slate-100 dark:bg-slate-800",
+                                        option.disabled && "cursor-not-allowed opacity-45",
+                                    )}
+                                >
+                                    <span className="min-w-0 truncate">{option.label}</span>
+
+                                    {selected && (
+                                        <Check
+                                            size={16}
+                                            className="shrink-0 text-teal-600 dark:text-teal-400"
+                                        />
+                                    )}
+                                </li>
+                            );
+                        })}
+                    </ul>,
+                    document.body,
+                )}
+        </>
+    );
+}
 
 export default function ClinicsServicesPage({ initialLocale,
 }: ClinicsServicesProps) {
@@ -777,6 +1299,22 @@ export default function ClinicsServicesPage({ initialLocale,
         nameEn: string;
     }) => (isRtl ? clinic.nameAr : clinic.nameEn);
 
+    const specialtyOptions: SelectOption[] = specialties.map((item) => ({
+        value: item.code,
+        label: locale === "ar" ? item.ar : item.en,
+    }));
+
+    const clinicOptions: SelectOption[] = clinics.map((clinic) => ({
+        value: clinic.id,
+        label: `${clinicName(clinic)}${!clinic.isActive ? ` (${t.inactive})` : ""}`,
+        disabled: !clinic.isActive || isTempId(clinic.id),
+    }));
+
+    const vatOptions: SelectOption[] = [
+        { value: "15", label: t.standardVat },
+        { value: "0", label: t.exemptVat },
+    ];
+
     const resetClinicForm = () => {
         setClinicForm({
             nameEn: "",
@@ -893,15 +1431,6 @@ export default function ClinicsServicesPage({ initialLocale,
 
         setError("");
         setSuccess("");
-
-        // Instant client-side guard (the server enforces the same rule).
-        if (
-            type === "clinic" &&
-            servicesRef.current.some((service) => service.clinicId === item.id)
-        ) {
-            notifyError(t.clinicHasServices);
-            return;
-        }
 
         const name =
             type === "clinic"
@@ -1374,13 +1903,21 @@ export default function ClinicsServicesPage({ initialLocale,
 
     /* --------------------------------- deletion ---------------------------------- */
 
-    /** The row disappears at 0ms; it is restored (with a toast) only if the server refuses. */
+    const closeDeleteModal = () => {
+        setDeleteTarget(null);
+    };
+
+    /**
+     * The row disappears at 0ms; it is restored (with a toast) only if the server refuses.
+     * Deleting a clinic also removes its services from the table, because the server deletes
+     * the clinic together with everything linked to it (the dialog warns about this beforehand).
+     */
     const handleConfirmDelete = () => {
         if (!deleteTarget) return;
 
         const target = deleteTarget;
 
-        setDeleteTarget(null);
+        closeDeleteModal();
         setError("");
 
         if (isTempId(target.id)) return;
@@ -1391,13 +1928,18 @@ export default function ClinicsServicesPage({ initialLocale,
 
             if (!removed) return;
 
-            // Final guard in case services were added while the dialog was open.
-            if (servicesRef.current.some((service) => service.clinicId === target.id)) {
-                notifyError(t.clinicHasServices);
-                return;
-            }
+            const removedServices = servicesRef.current.filter(
+                (service) => service.clinicId === target.id,
+            );
 
             setClinics((current) => current.filter((clinic) => clinic.id !== target.id));
+
+            if (removedServices.length > 0) {
+                setServices((current) =>
+                    current.filter((service) => service.clinicId !== target.id),
+                );
+            }
+
             setSuccess(t.deletedClinic);
 
             enqueue(target.id, async () => {
@@ -1407,6 +1949,18 @@ export default function ClinicsServicesPage({ initialLocale,
                             ? current
                             : insertAt(current, removed, index),
                     );
+
+                    if (removedServices.length > 0) {
+                        setServices((current) => {
+                            const present = new Set(current.map((service) => service.id));
+
+                            return [
+                                ...current,
+                                ...removedServices.filter((service) => !present.has(service.id)),
+                            ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+                        });
+                    }
+
                     setSuccess("");
                     notifyError(message);
                 };
@@ -1465,10 +2019,6 @@ export default function ClinicsServicesPage({ initialLocale,
         setError("");
     };
 
-    const closeDeleteModal = () => {
-        setDeleteTarget(null);
-    };
-
     return (
         <div
             dir={isRtl ? "rtl" : "ltr"}
@@ -1494,7 +2044,7 @@ export default function ClinicsServicesPage({ initialLocale,
                     <main className="mx-auto max-w-[1800px] space-y-6 p-4 sm:p-6 xl:p-8">
                         <section className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
                             <div>
-                                <div className="mb-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                                <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.dashboard}</span>
                                     <ChevronLeft
                                         size={13}
@@ -1505,52 +2055,60 @@ export default function ClinicsServicesPage({ initialLocale,
                                     </span>
                                 </div>
 
-                                <h1 className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-3xl">
+                                <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">
                                     {t.title}
                                 </h1>
 
-                                <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+                                <p className="mt-3 text-base text-slate-600 dark:text-slate-300">
                                     {t.subtitle}
                                 </p>
                             </div>
 
-                            <div className="flex items-center gap-2 self-start rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600 sm:self-auto dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                            <div className="flex items-center gap-2 self-start rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-600 sm:self-auto dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
                                 <ShieldCheck size={16} className="text-teal-600 dark:text-teal-400" />
                                 {t.zatca}
                             </div>
                         </section>
 
                         <section className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-                            <article className="dashboard-card flex items-center gap-4 p-4 sm:p-5">
-                                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-teal-50 text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
+                            <article className={`${cardSurface} flex items-center gap-4 p-5`}>
+                                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-teal-500/10 text-teal-600 dark:text-teal-400">
                                     <Hospital size={23} />
                                 </div>
                                 <div>
                                     <p className="text-sm text-slate-500 dark:text-slate-400">
                                         {t.clinicTab}
                                     </p>
-                                    <p className="mt-1 text-2xl font-extrabold text-slate-900 dark:text-white">
-                                        {clinics.length}
-                                    </p>
+                                    <div className="mt-1 text-3xl font-extrabold text-slate-900 dark:text-white">
+                                        {loading ? (
+                                            <Skeleton className="mt-2 h-8 w-12" />
+                                        ) : (
+                                            clinics.length
+                                        )}
+                                    </div>
                                 </div>
                             </article>
 
-                            <article className="dashboard-card flex items-center gap-4 p-4 sm:p-5">
-                                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-blue-50 text-blue-700 dark:bg-blue-950/50 dark:text-blue-400">
+                            <article className={`${cardSurface} flex items-center gap-4 p-5`}>
+                                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-teal-500/10 text-teal-600 dark:text-teal-400">
                                     <ClipboardList size={23} />
                                 </div>
                                 <div>
                                     <p className="text-sm text-slate-500 dark:text-slate-400">
                                         {t.catalog}
                                     </p>
-                                    <p className="mt-1 text-2xl font-extrabold text-slate-900 dark:text-white">
-                                        {services.length}
-                                    </p>
+                                    <div className="mt-1 text-3xl font-extrabold text-slate-900 dark:text-white">
+                                        {loading ? (
+                                            <Skeleton className="mt-2 h-8 w-12" />
+                                        ) : (
+                                            services.length
+                                        )}
+                                    </div>
                                 </div>
                             </article>
 
-                            <article className="dashboard-card flex items-center gap-4 p-4 sm:p-5">
-                                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400">
+                            <article className={`${cardSurface} flex items-center gap-4 p-5`}>
+                                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
                                     <Activity size={23} />
                                 </div>
                                 <div>
@@ -1565,8 +2123,8 @@ export default function ClinicsServicesPage({ initialLocale,
                             </article>
                         </section>
 
-                        <section className="dashboard-card min-w-0 overflow-hidden">
-                            <div className="flex flex-col gap-4 border-b border-slate-100 px-4 pt-4 sm:px-5 dark:border-slate-800">
+                        <section className={`${cardSurface} min-w-0 overflow-hidden`}>
+                            <div className="flex flex-col gap-4 border-b border-slate-200 px-4 pt-4 sm:px-6 dark:border-slate-800">
                                 <div
                                     role="tablist"
                                     aria-label={t.title}
@@ -1585,7 +2143,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                         className={cn(
                                             "flex shrink-0 items-center gap-2 border-b-2 px-1 pb-3 text-sm font-bold transition-colors",
                                             tab === "clinics"
-                                                ? "border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400"
+                                                ? "border-teal-600 text-teal-600 dark:border-teal-400 dark:text-teal-400"
                                                 : "border-transparent text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white",
                                         )}
                                     >
@@ -1606,7 +2164,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                         className={cn(
                                             "flex shrink-0 items-center gap-2 border-b-2 px-1 pb-3 text-sm font-bold transition-colors",
                                             tab === "services"
-                                                ? "border-blue-600 text-blue-600 dark:border-blue-400 dark:text-blue-400"
+                                                ? "border-teal-600 text-teal-600 dark:border-teal-400 dark:text-teal-400"
                                                 : "border-transparent text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white",
                                         )}
                                     >
@@ -1615,15 +2173,11 @@ export default function ClinicsServicesPage({ initialLocale,
                                     </button>
                                 </div>
 
-                                <div className="flex flex-col gap-3 pb-4 lg:flex-row lg:items-center lg:justify-between">
-                                    <label className="relative block w-full lg:max-w-sm">
+                                <div className="flex flex-col gap-3 pb-5 lg:flex-row lg:items-center lg:justify-between">
+                                    <label className="relative block w-full lg:max-w-md">
                                         <Search
-                                            size={17}
                                             aria-hidden="true"
-                                            className={cn(
-                                                "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                isRtl ? "right-3" : "left-3",
-                                            )}
+                                            className="pointer-events-none absolute start-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-600 dark:text-slate-300"
                                         />
                                         <input
                                             type="search"
@@ -1631,10 +2185,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                             onChange={(event) => setSearch(event.target.value)}
                                             placeholder={tab === "clinics" ? t.searchClinic : t.searchService}
                                             aria-label={tab === "clinics" ? t.searchClinic : t.searchService}
-                                            className={cn(
-                                                inputClass,
-                                                isRtl ? "pr-10 text-right" : "pl-10 text-left",
-                                            )}
+                                            className={cn(inputClass, "h-[54px] bg-white dark:bg-slate-900/60 ps-12")}
                                         />
                                     </label>
 
@@ -1642,9 +2193,9 @@ export default function ClinicsServicesPage({ initialLocale,
                                         type="button"
                                         onClick={() => openModal(tab === "clinics" ? "clinic" : "service")}
                                         disabled={tab === "services" && activeClinics.length === 0}
-                                        className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 dark:focus-visible:ring-offset-slate-950"
+                                        className={`${tealButton} h-[54px] px-6`}
                                     >
-                                        <Plus size={19} />
+                                        <Plus className="h-5 w-5" />
                                         {tab === "clinics" ? t.addClinic : t.addService}
                                     </button>
                                 </div>
@@ -1653,7 +2204,7 @@ export default function ClinicsServicesPage({ initialLocale,
                             {success && (
                                 <div
                                     role="status"
-                                    className="mx-4 mt-4 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300 sm:mx-5"
+                                    className="mx-4 mt-4 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300 sm:mx-6"
                                 >
                                     <Check size={17} />
                                     <span className="flex-1">{success}</span>
@@ -1692,39 +2243,61 @@ export default function ClinicsServicesPage({ initialLocale,
 
                             <div className="min-w-0 overflow-x-auto">
                                 {loading ? (
-                                    <div className="grid min-h-64 place-items-center px-5 py-12 text-sm text-slate-500 dark:text-slate-400">
-                                        <div className="flex items-center gap-3">
-                                            <span className="h-5 w-5 animate-spin rounded-full border-2 border-teal-600 border-t-transparent" />
-                                            {t.loading}
-                                        </div>
-                                    </div>
+                                    tab === "clinics" ? (
+                                        <TableSkeleton
+                                            variant="clinics"
+                                            loadingLabel={t.loading}
+                                            headers={[
+                                                t.clinicName,
+                                                t.specialty,
+                                                t.nphies,
+                                                t.status,
+                                                t.actions,
+                                            ]}
+                                        />
+                                    ) : (
+                                        <TableSkeleton
+                                            variant="services"
+                                            loadingLabel={t.loading}
+                                            headers={[
+                                                t.serviceCode,
+                                                t.clinicName,
+                                                t.serviceEn,
+                                                t.basePrice,
+                                                t.vat,
+                                                t.totalPrice,
+                                                t.status,
+                                                t.actions,
+                                            ]}
+                                        />
+                                    )
                                 ) : tab === "clinics" ? (
-                                    <table className="w-full min-w-[900px] text-start text-sm">
+                                    <table className="w-full min-w-[900px] border-collapse text-start text-sm">
                                         <thead>
-                                            <tr className="bg-slate-50/80 text-xs font-semibold text-slate-500 dark:bg-slate-900/70 dark:text-slate-400">
-                                                <th scope="col" className="px-5 py-4 text-left">
+                                            <tr className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-sm font-bold text-slate-900 dark:text-slate-100">
+                                                <th scope="col" className="px-6 py-5 text-start align-middle">
                                                     {t.clinicName}
                                                 </th>
 
-                                                <th scope="col" className="px-4 py-4 text-left">
+                                                <th scope="col" className="px-4 py-5 text-start align-middle">
                                                     {t.specialty}
                                                 </th>
 
-                                                <th scope="col" className="px-4 py-4 text-left">
+                                                <th scope="col" className="px-4 py-5 text-start align-middle">
                                                     {t.nphies}
                                                 </th>
 
-                                                <th scope="col" className="px-5 py-4 text-left">
+                                                <th scope="col" className="px-6 py-5 text-start align-middle">
                                                     {t.status}
                                                 </th>
 
-                                                <th scope="col" className="px-5 py-4 text-left">
+                                                <th scope="col" className="px-6 py-5 text-start align-middle">
                                                     {t.actions}
                                                 </th>
                                             </tr>
                                         </thead>
 
-                                        <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                                        <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                                             {filteredClinics.map((clinic) => {
                                                 const rowTemp = isTempId(clinic.id);
                                                 const rowSyncing = syncing.has(clinic.id);
@@ -1740,52 +2313,41 @@ export default function ClinicsServicesPage({ initialLocale,
                                                             rowSyncing && !rowTemp && "opacity-80",
                                                         )}
                                                     >
-                                                        <td className="px-5 py-4">
+                                                        <td className="px-6 py-5">
                                                             <div className="flex items-center gap-3">
-                                                                <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-teal-50 text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
+                                                                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-full bg-slate-100 text-teal-600 dark:bg-slate-800 dark:text-teal-400">
                                                                     <Hospital size={20} />
                                                                 </div>
                                                                 <div className="min-w-0">
-                                                                    <p className="font-semibold text-slate-800 dark:text-slate-100">
+                                                                    <p className="font-bold text-slate-900 dark:text-white">
                                                                         {clinicName(clinic)}
                                                                     </p>
-                                                                    <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                                    <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
                                                                         {isRtl ? clinic.nameEn : clinic.nameAr}
                                                                     </p>
                                                                 </div>
                                                             </div>
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-4 py-4 text-slate-600 dark:text-slate-300">
+                                                        <td className="whitespace-nowrap px-4 py-5 text-slate-600 dark:text-slate-300">
                                                             {getSpecialtyLabel(clinic.specialty, locale)}
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-4 py-4">
-                                                            <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                                                        <td className="whitespace-nowrap px-4 py-5">
+                                                            <span className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
                                                                 {clinic.nphiesCode || "—"}
                                                             </span>
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-5 py-4">
-                                                            <span
-                                                                className={cn(
-                                                                    "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors",
-                                                                    clinic.isActive
-                                                                        ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
-                                                                        : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
-                                                                )}
-                                                            >
-                                                                <span
-                                                                    className={cn(
-                                                                        "h-2 w-2 rounded-full",
-                                                                        clinic.isActive ? "bg-emerald-500" : "bg-slate-400",
-                                                                    )}
-                                                                />
-                                                                {clinic.isActive ? t.active : t.inactive}
-                                                            </span>
+                                                        <td className="whitespace-nowrap px-6 py-5">
+                                                            <StatusBadge
+                                                                active={clinic.isActive}
+                                                                activeLabel={t.active}
+                                                                inactiveLabel={t.inactive}
+                                                            />
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                        <td className="whitespace-nowrap px-6 py-5">
                                                             <div className="flex items-center gap-2">
                                                                 <button
                                                                     type="button"
@@ -1793,7 +2355,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                                                     onClick={() => openEditClinic(clinic)}
                                                                     title={t.edit}
                                                                     aria-label={`${t.editClinic}: ${clinicName(clinic)}`}
-                                                                    className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-600 transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:border-teal-900 dark:hover:bg-teal-950/40 dark:hover:text-teal-400"
+                                                                    className={iconButtonClass}
                                                                 >
                                                                     <Pencil size={16} />
                                                                 </button>
@@ -1805,10 +2367,10 @@ export default function ClinicsServicesPage({ initialLocale,
                                                                     title={clinic.isActive ? t.disable : t.enable}
                                                                     aria-label={`${clinic.isActive ? t.disable : t.enable}: ${clinicName(clinic)}`}
                                                                     className={cn(
-                                                                        "grid h-9 w-9 place-items-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                                                                        "grid h-10 w-10 place-items-center rounded-lg border transition focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
                                                                         clinic.isActive
-                                                                            ? "border-rose-200 text-rose-600 hover:bg-rose-50 focus-visible:ring-rose-500 dark:border-rose-900 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                                                                            : "border-emerald-200 text-emerald-700 hover:bg-emerald-50 focus-visible:ring-emerald-500 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950/40",
+                                                                            ? "border-rose-500/40 text-rose-500 hover:bg-rose-500/10 focus:ring-rose-500 dark:text-rose-400"
+                                                                            : "border-teal-500/40 text-teal-600 hover:bg-teal-500/10 focus:ring-teal-500 dark:text-teal-400",
                                                                     )}
                                                                 >
                                                                     {clinic.isActive
@@ -1834,7 +2396,7 @@ export default function ClinicsServicesPage({ initialLocale,
 
                                             {filteredClinics.length === 0 && (
                                                 <tr>
-                                                    <td colSpan={5} className="px-5 py-16 text-center text-sm text-slate-500 dark:text-slate-400">
+                                                    <td colSpan={5} className="px-6 py-16 text-center text-sm text-slate-500 dark:text-slate-400">
                                                         {t.noClinics}
                                                     </td>
                                                 </tr>
@@ -1842,21 +2404,21 @@ export default function ClinicsServicesPage({ initialLocale,
                                         </tbody>
                                     </table>
                                 ) : (
-                                    <table className="w-full min-w-[1100px] text-start text-sm">
+                                    <table className="w-full min-w-[1100px] border-collapse text-start text-sm">
                                         <thead>
-                                            <tr className="bg-slate-50/80 text-xs font-semibold text-slate-500 dark:bg-slate-900/70 dark:text-slate-400">
-                                                <th scope="col" className="px-5 py-4">{t.serviceCode}</th>
-                                                <th scope="col" className="px-4 py-4">{t.clinicName}</th>
-                                                <th scope="col" className="px-4 py-4">{t.serviceEn}</th>
-                                                <th scope="col" className="px-4 py-4">{t.basePrice}</th>
-                                                <th scope="col" className="px-4 py-4">{t.vat}</th>
-                                                <th scope="col" className="px-5 py-4">{t.totalPrice}</th>
-                                                <th scope="col" className="px-4 py-4">{t.status}</th>
-                                                <th scope="col" className="px-5 py-4">{t.actions}</th>
+                                            <tr className="border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-sm font-bold text-slate-900 dark:text-slate-100">
+                                                <th scope="col" className="px-6 py-5 text-start align-middle">{t.serviceCode}</th>
+                                                <th scope="col" className="px-4 py-5 text-start align-middle">{t.clinicName}</th>
+                                                <th scope="col" className="px-4 py-5 text-start align-middle">{t.serviceEn}</th>
+                                                <th scope="col" className="px-4 py-5 text-start align-middle">{t.basePrice}</th>
+                                                <th scope="col" className="px-4 py-5 text-start align-middle">{t.vat}</th>
+                                                <th scope="col" className="px-6 py-5 text-start align-middle">{t.totalPrice}</th>
+                                                <th scope="col" className="px-4 py-5 text-start align-middle">{t.status}</th>
+                                                <th scope="col" className="px-6 py-5 text-start align-middle">{t.actions}</th>
                                             </tr>
                                         </thead>
 
-                                        <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                                        <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                                             {filteredServices.map((service) => {
                                                 const rowTemp = isTempId(service.id);
                                                 const rowSyncing = syncing.has(service.id);
@@ -1872,71 +2434,60 @@ export default function ClinicsServicesPage({ initialLocale,
                                                             rowSyncing && !rowTemp && "opacity-80",
                                                         )}
                                                     >
-                                                        <td className="whitespace-nowrap px-5 py-4">
-                                                            <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 font-mono text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                                                        <td className="whitespace-nowrap px-6 py-5">
+                                                            <span className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-sm font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
                                                                 {service.code}
                                                             </span>
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-4 py-4 text-slate-600 dark:text-slate-300">
+                                                        <td className="whitespace-nowrap px-4 py-5 text-slate-600 dark:text-slate-300">
                                                             {clinicName(service.clinic)}
                                                         </td>
 
-                                                        <td className="px-4 py-4">
-                                                            <p className="font-semibold text-slate-800 dark:text-slate-100">
+                                                        <td className="px-4 py-5">
+                                                            <p className="font-bold text-slate-900 dark:text-white">
                                                                 {isRtl ? service.nameAr : service.nameEn}
                                                             </p>
-                                                            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                            <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
                                                                 {isRtl ? service.nameEn : service.nameAr}
                                                             </p>
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-4 py-4 text-slate-700 dark:text-slate-300">
+                                                        <td className="whitespace-nowrap px-4 py-5 text-slate-700 dark:text-slate-300">
                                                             {money(service.basePrice, locale)} {t.sar}
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-4 py-4">
+                                                        <td className="whitespace-nowrap px-4 py-5">
                                                             <span
                                                                 className={cn(
-                                                                    "rounded-full px-2.5 py-1.5 text-xs font-semibold",
+                                                                    "rounded-lg px-3 py-1.5 text-sm font-semibold",
                                                                     Number(service.vatRate) === 0
-                                                                        ? "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-                                                                        : "bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-400",
+                                                                        ? "bg-slate-100 text-slate-600 dark:bg-slate-500/10 dark:text-slate-400"
+                                                                        : "bg-teal-500/10 text-teal-600 dark:text-teal-400",
                                                                 )}
                                                             >
                                                                 {money(service.vatRate, locale)}%
                                                             </span>
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                        <td className="whitespace-nowrap px-6 py-5">
                                                             <p className="font-bold text-teal-700 dark:text-teal-400">
                                                                 {money(service.totalPrice, locale)} {t.sar}
                                                             </p>
-                                                            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                            <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
                                                                 {t.taxAmount}: {money(service.vatAmount, locale)}
                                                             </p>
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-4 py-4">
-                                                            <span
-                                                                className={cn(
-                                                                    "inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors",
-                                                                    service.isActive
-                                                                        ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
-                                                                        : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
-                                                                )}
-                                                            >
-                                                                <span
-                                                                    className={cn(
-                                                                        "h-2 w-2 rounded-full",
-                                                                        service.isActive ? "bg-emerald-500" : "bg-slate-400",
-                                                                    )}
-                                                                />
-                                                                {service.isActive ? t.active : t.inactive}
-                                                            </span>
+                                                        <td className="whitespace-nowrap px-4 py-5">
+                                                            <StatusBadge
+                                                                active={service.isActive}
+                                                                activeLabel={t.active}
+                                                                inactiveLabel={t.inactive}
+                                                            />
                                                         </td>
 
-                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                        <td className="whitespace-nowrap px-6 py-5">
                                                             <div className="flex items-center gap-2">
                                                                 <button
                                                                     type="button"
@@ -1944,7 +2495,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                                                     onClick={() => openEditService(service)}
                                                                     title={t.edit}
                                                                     aria-label={`${t.editService}: ${service.nameEn}`}
-                                                                    className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 text-slate-600 transition hover:border-teal-200 hover:bg-teal-50 hover:text-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:border-teal-900 dark:hover:bg-teal-950/40 dark:hover:text-teal-400"
+                                                                    className={iconButtonClass}
                                                                 >
                                                                     <Pencil size={16} />
                                                                 </button>
@@ -1956,10 +2507,10 @@ export default function ClinicsServicesPage({ initialLocale,
                                                                     title={service.isActive ? t.disable : t.enable}
                                                                     aria-label={`${service.isActive ? t.disable : t.enable}: ${service.nameEn}`}
                                                                     className={cn(
-                                                                        "grid h-9 w-9 place-items-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                                                                        "grid h-10 w-10 place-items-center rounded-lg border transition focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
                                                                         service.isActive
-                                                                            ? "border-rose-200 text-rose-600 hover:bg-rose-50 focus-visible:ring-rose-500 dark:border-rose-900 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                                                                            : "border-emerald-200 text-emerald-700 hover:bg-emerald-50 focus-visible:ring-emerald-500 dark:border-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-950/40",
+                                                                            ? "border-rose-500/40 text-rose-500 hover:bg-rose-500/10 focus:ring-rose-500 dark:text-rose-400"
+                                                                            : "border-teal-500/40 text-teal-600 hover:bg-teal-500/10 focus:ring-teal-500 dark:text-teal-400",
                                                                     )}
                                                                 >
                                                                     {service.isActive
@@ -1985,7 +2536,7 @@ export default function ClinicsServicesPage({ initialLocale,
 
                                             {filteredServices.length === 0 && (
                                                 <tr>
-                                                    <td colSpan={8} className="px-5 py-16 text-center text-sm text-slate-500 dark:text-slate-400">
+                                                    <td colSpan={8} className="px-6 py-16 text-center text-sm text-slate-500 dark:text-slate-400">
                                                         {t.noServices}
                                                     </td>
                                                 </tr>
@@ -1995,13 +2546,17 @@ export default function ClinicsServicesPage({ initialLocale,
                                 )}
                             </div>
 
-                            <div className="flex flex-col gap-3 border-t border-slate-100 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5 dark:border-slate-800">
-                                <span className="text-xs text-slate-500 dark:text-slate-400">
-                                    {t.showing} {currentCount} {t.of} {totalCount}{" "}
-                                    {tab === "clinics" ? t.clinics : t.services}
-                                </span>
+                            <div className="flex flex-col gap-3 border-t border-slate-200 px-6 py-5 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800">
+                                {loading ? (
+                                    <Skeleton className="h-4 w-48" />
+                                ) : (
+                                    <span className="text-sm text-slate-500 dark:text-slate-400">
+                                        {t.showing} {currentCount} {t.of} {totalCount}{" "}
+                                        {tab === "clinics" ? t.clinics : t.services}
+                                    </span>
+                                )}
 
-                                <span className="inline-flex items-center gap-2 text-xs font-semibold text-slate-500 dark:text-slate-400">
+                                <span className="inline-flex items-center gap-2 text-sm font-semibold text-slate-500 dark:text-slate-400">
                                     <ShieldCheck size={15} className="text-teal-600 dark:text-teal-400" />
                                     {t.zatca}
                                 </span>
@@ -2023,7 +2578,7 @@ export default function ClinicsServicesPage({ initialLocale,
                         animate={{ opacity: 1 }}
                         exit={{ opacity: 0 }}
                         transition={{ duration: 0.2, ease: "easeOut" }}
-                        className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-3 sm:p-6"
+                        className={`${modalBackdropClass} z-50`}
                         onMouseDown={(event) => {
                             if (event.target === event.currentTarget) closeModal();
                         }}
@@ -2052,11 +2607,11 @@ export default function ClinicsServicesPage({ initialLocale,
                             role="dialog"
                             aria-modal="true"
                             aria-labelledby="management-modal-title"
-                            className="my-auto max-h-[95vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-950"
+                            className={`${modalPanelClass} my-auto max-h-[95vh] w-full max-w-xl overflow-y-auto`}
                         >
-                            <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-5 py-5 sm:px-6 dark:border-slate-800">
+                            <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-5 sm:px-6 dark:border-slate-700">
                                 <div className="flex items-start gap-3">
-                                    <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-teal-50 text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
+                                    <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-teal-500/10 text-teal-600 dark:text-teal-400">
                                         {modal === "clinic" ? (
                                             <Hospital size={22} />
                                         ) : (
@@ -2148,69 +2703,41 @@ export default function ClinicsServicesPage({ initialLocale,
                                     </div>
 
                                     <Field label={t.specialty}>
-                                        <div className="relative">
-                                            <select
-                                                required
-                                                value={clinicForm.specialty}
-                                                onChange={(event) => {
-                                                    const selected = specialties.find(
-                                                        (item) =>
-                                                            item.code === event.target.value
-                                                    );
+                                        <SelectField
+                                            value={clinicForm.specialty}
+                                            options={specialtyOptions}
+                                            placeholder={t.chooseSpecialty}
+                                            ariaLabel={t.specialty}
+                                            isRtl={isRtl}
+                                            onChange={(code) => {
+                                                const selected = specialties.find(
+                                                    (item) => item.code === code,
+                                                );
 
-                                                    if (!selected) return;
+                                                if (!selected) return;
 
-                                                    setClinicForm((current) => ({
-                                                        ...current,
-                                                        specialty: selected.code,
-                                                        nphiesCode: selected.nphies,
-                                                    }));
-                                                }}
-                                                className={cn(
-                                                    inputClass,
-                                                    "appearance-none pe-10"
-                                                )}
-                                            >
-                                                {specialties.map((specialty) => (
-                                                    <option
-                                                        key={specialty.code}
-                                                        value={specialty.code}
-                                                    >
-                                                        {locale === "ar"
-                                                            ? specialty.ar
-                                                            : specialty.en}
-                                                    </option>
-                                                ))}
-                                            </select>
-
-                                            <ChevronDown
-                                                size={16}
-                                                className={cn(
-                                                    "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                    isRtl ? "left-3" : "right-3"
-                                                )}
-                                            />
-                                        </div>
-                                    </Field>
-
-                                    <Field label={t.clinicCode} hint={t.nphiesNote}>
-                                        <input
-                                            required
-                                            minLength={2}
-                                            maxLength={30}
-                                            pattern="[A-Za-z0-9-]{2,30}"
-                                            value={clinicForm.nphiesCode}
-                                            onChange={(event) =>
+                                                // The NPHIES code follows the specialty automatically.
                                                 setClinicForm((current) => ({
                                                     ...current,
-                                                    nphiesCode:
-                                                        event.target.value.toUpperCase(),
-                                                }))
-                                            }
+                                                    specialty: selected.code,
+                                                    nphiesCode: selected.nphies,
+                                                }));
+                                            }}
+                                        />
+                                    </Field>
+
+                                    <Field label={t.nphies} hint={t.nphiesNote}>
+                                        <input
+                                            disabled
+                                            readOnly
+                                            tabIndex={-1}
+                                            aria-readonly="true"
+                                            aria-label={t.nphies}
+                                            value={clinicForm.nphiesCode}
                                             placeholder="DENT-01"
                                             className={cn(
                                                 inputClass,
-                                                "font-mono text-left"
+                                                "cursor-not-allowed select-none border-slate-200 bg-slate-100 font-mono text-left text-slate-500 opacity-100 dark:border-slate-800 dark:bg-slate-800/60 dark:text-slate-400"
                                             )}
                                             dir="ltr"
                                         />
@@ -2261,18 +2788,18 @@ export default function ClinicsServicesPage({ initialLocale,
                                         </div>
                                     )}
 
-                                    <div className="flex flex-col-reverse gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end dark:border-slate-800">
+                                    <div className="flex flex-col-reverse gap-3 border-t border-slate-200 pt-5 sm:flex-row sm:justify-end dark:border-slate-700">
                                         <button
                                             type="button"
                                             onClick={closeModal}
-                                            className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                            className={`${outlineButton} h-11 px-6`}
                                         >
                                             {t.cancel}
                                         </button>
 
                                         <button
                                             type="submit"
-                                            className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700"
+                                            className={`${tealButton} h-11 px-6`}
                                         >
                                             {editingClinic
                                                 ? t.saveChanges
@@ -2341,69 +2868,35 @@ export default function ClinicsServicesPage({ initialLocale,
                                     </Field>
 
                                     <Field label={t.associatedClinic}>
-                                        <div className="relative">
-                                            <select
-                                                required
-                                                value={serviceForm.clinicId}
-                                                onChange={(event) => {
-                                                    const clinicId = event.target.value;
+                                        <SelectField
+                                            value={serviceForm.clinicId}
+                                            options={clinicOptions}
+                                            placeholder={t.chooseClinic}
+                                            ariaLabel={t.associatedClinic}
+                                            isRtl={isRtl}
+                                            onChange={(clinicId) => {
+                                                const selectedClinic = clinics.find(
+                                                    (clinic) => clinic.id === clinicId
+                                                );
 
-                                                    const selectedClinic = clinics.find(
-                                                        (clinic) =>
-                                                            clinic.id === clinicId
+                                                setServiceForm((current) => ({
+                                                    ...current,
+                                                    clinicId,
+                                                    code: generateServiceCode(clinicId),
+                                                }));
+
+                                                if (
+                                                    selectedClinic &&
+                                                    !selectedClinic.isActive
+                                                ) {
+                                                    setError(
+                                                        t.serviceClinicDisabledSelect
                                                     );
-
-                                                    setServiceForm((current) => ({
-                                                        ...current,
-                                                        clinicId,
-                                                        code: generateServiceCode(clinicId),
-                                                    }));
-
-                                                    if (
-                                                        selectedClinic &&
-                                                        !selectedClinic.isActive
-                                                    ) {
-                                                        setError(
-                                                            t.serviceClinicDisabledSelect
-                                                        );
-                                                    } else {
-                                                        setError("");
-                                                    }
-                                                }}
-                                                className={cn(
-                                                    inputClass,
-                                                    "appearance-none pe-10"
-                                                )}
-                                            >
-                                                <option value="" disabled>
-                                                    {t.chooseClinic}
-                                                </option>
-
-                                                {clinics.map((clinic) => (
-                                                    <option
-                                                        key={clinic.id}
-                                                        value={clinic.id}
-                                                        disabled={
-                                                            !clinic.isActive ||
-                                                            isTempId(clinic.id)
-                                                        }
-                                                    >
-                                                        {clinicName(clinic)}
-                                                        {!clinic.isActive
-                                                            ? ` (${t.inactive})`
-                                                            : ""}
-                                                    </option>
-                                                ))}
-                                            </select>
-
-                                            <ChevronDown
-                                                size={16}
-                                                className={cn(
-                                                    "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                    isRtl ? "left-3" : "right-3"
-                                                )}
-                                            />
-                                        </div>
+                                                } else {
+                                                    setError("");
+                                                }
+                                            }}
+                                        />
                                     </Field>
 
                                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -2432,38 +2925,18 @@ export default function ClinicsServicesPage({ initialLocale,
                                         </Field>
 
                                         <Field label={t.vat}>
-                                            <div className="relative">
-                                                <select
-                                                    value={serviceForm.vatRate}
-                                                    onChange={(event) =>
-                                                        setServiceForm((current) => ({
-                                                            ...current,
-                                                            vatRate: Number(
-                                                                event.target.value
-                                                            ) as 0 | 15,
-                                                        }))
-                                                    }
-                                                    className={cn(
-                                                        inputClass,
-                                                        "appearance-none pe-10"
-                                                    )}
-                                                >
-                                                    <option value={15}>
-                                                        {t.standardVat}
-                                                    </option>
-                                                    <option value={0}>
-                                                        {t.exemptVat}
-                                                    </option>
-                                                </select>
-
-                                                <ChevronDown
-                                                    size={16}
-                                                    className={cn(
-                                                        "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                        isRtl ? "left-3" : "right-3"
-                                                    )}
-                                                />
-                                            </div>
+                                            <SelectField
+                                                value={String(serviceForm.vatRate)}
+                                                options={vatOptions}
+                                                ariaLabel={t.vat}
+                                                isRtl={isRtl}
+                                                onChange={(rate) =>
+                                                    setServiceForm((current) => ({
+                                                        ...current,
+                                                        vatRate: Number(rate) as 0 | 15,
+                                                    }))
+                                                }
+                                            />
                                         </Field>
                                     </div>
 
@@ -2478,7 +2951,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                                     {t.billing}
                                                 </p>
 
-                                                <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                                                <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
                                                     {t.vatNote}
                                                 </p>
                                             </div>
@@ -2534,11 +3007,11 @@ export default function ClinicsServicesPage({ initialLocale,
                                         </div>
                                     </div>
 
-                                    <div className="flex flex-col-reverse gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end dark:border-slate-800">
+                                    <div className="flex flex-col-reverse gap-3 border-t border-slate-200 pt-5 sm:flex-row sm:justify-end dark:border-slate-700">
                                         <button
                                             type="button"
                                             onClick={closeModal}
-                                            className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                            className={`${outlineButton} h-11 px-6`}
                                         >
                                             {t.cancel}
                                         </button>
@@ -2550,7 +3023,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                                 (!editingService &&
                                                     activeClinics.length === 0)
                                             }
-                                            className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-teal-600 px-6 text-sm font-bold text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                            className={`${tealButton} h-11 px-6`}
                                         >
                                             {editingService
                                                 ? t.saveChanges
@@ -2564,30 +3037,34 @@ export default function ClinicsServicesPage({ initialLocale,
                 )}
             </AnimatePresence>
 
-            {
-                statusTarget && (
-                    <div
-                        className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
+            <AnimatePresence>
+                {statusTarget && (
+                    <motion.div
+                        key="status-dialog-backdrop"
+                        {...backdropMotion}
+                        className={`${modalBackdropClass} z-[60]`}
                         onMouseDown={(event) => {
                             if (event.target === event.currentTarget) {
                                 closeStatusModal();
                             }
                         }}
                     >
-                        <section
+                        <motion.section
+                            key="status-dialog-content"
+                            {...panelMotion}
                             role="alertdialog"
                             aria-modal="true"
                             aria-labelledby="status-dialog-title"
                             aria-describedby="status-dialog-description"
-                            className="my-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-950 sm:p-6"
+                            className={`${modalPanelClass} my-auto w-full max-w-md p-5 sm:p-6`}
                         >
                             <div className="flex items-start gap-3">
                                 <div
                                     className={cn(
                                         "grid h-11 w-11 shrink-0 place-items-center rounded-xl",
                                         statusTarget.isActive
-                                            ? "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-400"
-                                            : "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400",
+                                            ? "bg-rose-500/10 text-rose-500 dark:text-rose-400"
+                                            : "bg-teal-500/10 text-teal-600 dark:text-teal-400",
                                     )}
                                 >
                                     {statusTarget.isActive
@@ -2618,7 +3095,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                     type="button"
                                     aria-label={t.close}
                                     onClick={closeStatusModal}
-                                    className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 dark:hover:bg-slate-800"
+                                    className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-slate-600 dark:text-slate-300 transition hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-white"
                                 >
                                     <X size={18} />
                                 </button>
@@ -2637,7 +3114,7 @@ export default function ClinicsServicesPage({ initialLocale,
                                 <button
                                     type="button"
                                     onClick={closeStatusModal}
-                                    className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
+                                    className={`${outlineButton} h-11 px-6`}
                                 >
                                     {t.cancel}
                                 </button>
@@ -2646,10 +3123,10 @@ export default function ClinicsServicesPage({ initialLocale,
                                     type="button"
                                     onClick={handleToggleStatus}
                                     className={cn(
-                                        "inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-bold text-white transition",
+                                        "inline-flex h-11 items-center justify-center gap-2 rounded-lg px-6 text-sm font-semibold text-white transition focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950",
                                         statusTarget.isActive
-                                            ? "bg-rose-600 hover:bg-rose-700"
-                                            : "bg-emerald-600 hover:bg-emerald-700",
+                                            ? "bg-rose-600 hover:bg-rose-500 focus:ring-rose-500"
+                                            : "bg-teal-600 hover:bg-teal-500 focus:ring-teal-500",
                                     )}
                                 >
                                     {statusTarget.isActive ? (
@@ -2661,101 +3138,129 @@ export default function ClinicsServicesPage({ initialLocale,
                                     {statusTarget.isActive ? t.disable : t.enable}
                                 </button>
                             </div>
-                        </section>
-                    </div>
-                )
-            }
+                        </motion.section>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
-            {deleteTarget && (
-                <div
-                    className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
-                    onMouseDown={(event) => {
-                        if (event.target === event.currentTarget) closeDeleteModal();
-                    }}
-                >
-                    <section
-                        role="alertdialog"
-                        aria-modal="true"
-                        aria-labelledby="delete-dialog-title"
-                        aria-describedby="delete-dialog-description"
-                        className="my-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-950 sm:p-6"
+            <AnimatePresence>
+                {deleteTarget && (
+                    <motion.div
+                        key="delete-dialog-backdrop"
+                        {...backdropMotion}
+                        className={`${modalBackdropClass} z-[60]`}
+                        onMouseDown={(event) => {
+                            if (event.target === event.currentTarget) closeDeleteModal();
+                        }}
                     >
-                        <div className="flex items-start gap-3">
-                            <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-400">
-                                <Trash2 size={21} />
+                        <motion.section
+                            key="delete-dialog-content"
+                            {...panelMotion}
+                            role="alertdialog"
+                            aria-modal="true"
+                            aria-labelledby="delete-dialog-title"
+                            aria-describedby="delete-dialog-description"
+                            className={cn(
+                                modalPanelClass,
+                                "my-auto max-h-[92vh] w-full overflow-y-auto p-5 sm:p-6",
+                                deleteTarget.type === "clinic" ? "max-w-lg" : "max-w-md",
+                            )}
+                        >
+                            <div className="flex items-start gap-3">
+                                <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-rose-500/10 text-rose-500 dark:text-rose-400">
+                                    <Trash2 size={21} />
+                                </div>
+
+                                <div className="min-w-0 flex-1">
+                                    <h2
+                                        id="delete-dialog-title"
+                                        className="text-lg font-extrabold text-slate-900 dark:text-white"
+                                    >
+                                        {t.confirmDeleteTitle}
+                                    </h2>
+
+                                    <p
+                                        id="delete-dialog-description"
+                                        className="mt-2 break-words text-sm leading-7 text-slate-600 dark:text-slate-300"
+                                    >
+                                        {deleteTarget.type === "clinic"
+                                            ? t.confirmDeleteClinic
+                                            : t.confirmDeleteService}{" "}
+                                        <span className="font-bold text-slate-900 dark:text-white">
+                                            {deleteTarget.name}
+                                        </span>
+                                        ؟
+                                    </p>
+
+                                    <p className="mt-1 text-xs font-semibold text-rose-600 dark:text-rose-400">
+                                        {t.deleteWarning}
+                                    </p>
+
+                                    {deleteTarget.type === "service" && (
+                                        <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
+                                            {t.deleteServiceHint}
+                                        </p>
+                                    )}
+                                </div>
+
+                                <button
+                                    type="button"
+                                    aria-label={t.close}
+                                    onClick={closeDeleteModal}
+                                    className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-slate-600 dark:text-slate-300 transition hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-white"
+                                >
+                                    <X size={18} />
+                                </button>
                             </div>
 
-                            <div className="min-w-0 flex-1">
-                                <h2
-                                    id="delete-dialog-title"
-                                    className="text-lg font-extrabold text-slate-900 dark:text-white"
+                            {deleteTarget.type === "clinic" && (
+                                <div className="mt-5 space-y-3">
+                                    <div
+                                        role="alert"
+                                        className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-sm font-medium leading-6 text-rose-700 dark:border-rose-900/70 dark:bg-rose-950/30 dark:text-rose-300"
+                                    >
+                                        <TriangleAlert size={17} className="mt-0.5 shrink-0" />
+                                        <span>{t.clinicCascadeWarning}</span>
+                                    </div>
+
+                                    <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
+                                        {t.deleteClinicHint}
+                                    </p>
+                                </div>
+                            )}
+
+                            <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                                <button
+                                    type="button"
+                                    onClick={closeDeleteModal}
+                                    className={`${outlineButton} h-11 px-6`}
                                 >
-                                    {t.confirmDeleteTitle}
-                                </h2>
+                                    {t.cancel}
+                                </button>
 
-                                <p
-                                    id="delete-dialog-description"
-                                    className="mt-2 break-words text-sm leading-7 text-slate-600 dark:text-slate-300"
+                                <button
+                                    type="button"
+                                    autoFocus
+                                    onClick={handleConfirmDelete}
+                                    className={`${dangerButton} h-11`}
                                 >
+                                    <Trash2 size={16} />
                                     {deleteTarget.type === "clinic"
-                                        ? t.confirmDeleteClinic
-                                        : t.confirmDeleteService}{" "}
-                                    <span className="font-bold text-slate-900 dark:text-white">
-                                        {deleteTarget.name}
-                                    </span>
-                                    ؟
-                                </p>
-
-                                <p className="mt-1 text-xs font-semibold text-rose-600 dark:text-rose-400">
-                                    {t.deleteWarning}
-                                </p>
-
-                                <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-                                    {deleteTarget.type === "clinic"
-                                        ? t.deleteClinicHint
-                                        : t.deleteServiceHint}
-                                </p>
+                                        ? t.deleteEverything
+                                        : t.delete}
+                                </button>
                             </div>
-
-                            <button
-                                type="button"
-                                aria-label={t.close}
-                                onClick={closeDeleteModal}
-                                className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 transition hover:bg-slate-100 dark:hover:bg-slate-800"
-                            >
-                                <X size={18} />
-                            </button>
-                        </div>
-
-                        <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-                            <button
-                                type="button"
-                                onClick={closeDeleteModal}
-                                className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-900"
-                            >
-                                {t.cancel}
-                            </button>
-
-                            <button
-                                type="button"
-                                autoFocus
-                                onClick={handleConfirmDelete}
-                                className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-rose-600 px-5 text-sm font-bold text-white transition hover:bg-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-950"
-                            >
-                                <Trash2 size={16} />
-                                {t.delete}
-                            </button>
-                        </div>
-                    </section>
-                </div>
-            )}
+                        </motion.section>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {toast && (
                 <div
                     role="status"
                     aria-live="polite"
                     className={cn(
-                        "fixed bottom-6 z-[200] flex max-w-md items-start gap-3 rounded-xl border bg-white p-4 text-sm shadow-2xl shadow-black/30 dark:bg-slate-900",
+                        "fixed bottom-6 z-[200] flex max-w-md items-start gap-3 rounded-xl border bg-white p-4 text-sm shadow-2xl shadow-black/50 dark:bg-slate-900",
                         isRtl ? "left-6" : "right-6",
                         toast.kind === "success" ? "border-teal-600/40" : "border-rose-500/40",
                     )}
@@ -2782,16 +3287,10 @@ export default function ClinicsServicesPage({ initialLocale,
             )}
 
             <style jsx global>{`
-                .dashboard-card {
-                    border: 1px solid #e8edf3;
-                    border-radius: 16px;
-                    background: var(--dashboard-card, #ffffff);
-                    box-shadow: 0 1px 2px rgb(15 23 42 / 0.025);
-                }
-
-                .dark .dashboard-card {
-                    border-color: #1e293b;
-                    background: var(--card, #020617);
+                @keyframes mj-shimmer {
+                    100% {
+                        transform: translateX(100%);
+                    }
                 }
 
                 @media (prefers-reduced-motion: reduce) {
