@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import {
     BadgeCheck,
     BriefcaseMedical,
@@ -41,6 +42,10 @@ type NavigationGroup = {
 
 type AdminSidebarProps = {
     locale: Locale;
+    /**
+     * Optional fallback only. The active route is read from `usePathname()`
+     * on every render; this prop is used only if the pathname is unavailable.
+     */
     activeHref?: string;
     open: boolean;
     onClose: () => void;
@@ -110,13 +115,54 @@ function cn(...classes: Array<string | false | undefined>) {
     return classes.filter(Boolean).join(" ");
 }
 
+function normalizePath(path: string): string {
+    const withoutQuery = path.split(/[?#]/)[0] ?? "";
+    if (withoutQuery.length > 1 && withoutQuery.endsWith("/")) {
+        return withoutQuery.slice(0, -1);
+    }
+    return withoutQuery;
+}
+
+/**
+ * Returns the href of the navigation item that best matches the current path.
+ * Exact matches win; otherwise the longest href that matches on a path-segment
+ * boundary (e.g. /admin/clinical/services/new -> /admin/clinical/services).
+ * A leading locale segment (e.g. /ar/admin/...) is tolerated.
+ */
+function findActiveHref(
+    navigation: NavigationGroup[],
+    currentPath: string | undefined,
+): string | undefined {
+    if (!currentPath) return undefined;
+
+    const path = normalizePath(currentPath);
+    let best: string | undefined;
+
+    for (const group of navigation) {
+        for (const item of group.items) {
+            const href = normalizePath(item.href);
+            const matches =
+                path === href ||
+                path.startsWith(`${href}/`) ||
+                path.endsWith(href) ||
+                path.includes(`${href}/`);
+
+            if (matches && (best === undefined || href.length > best.length)) {
+                best = item.href;
+            }
+        }
+    }
+
+    return best;
+}
+
 export default function AdminSidebar({
     locale,
-    activeHref = routes.services,
+    activeHref,
     open,
     onClose,
 }: AdminSidebarProps) {
-    const [expandedGroup, setExpandedGroup] = useState("clinical");
+    const pathname = usePathname();
     const isRtl = locale === "ar";
     const t = labels[locale];
 
@@ -166,6 +212,24 @@ export default function AdminSidebar({
         },
     ];
 
+    // Recomputed on every render, so it always follows the live pathname.
+    const currentPath = pathname ?? activeHref;
+    const currentActiveHref = findActiveHref(navigation, currentPath);
+
+    const activeGroupId =
+        navigation.find((group) =>
+            group.items.some((item) => item.href === currentActiveHref),
+        )?.id ?? "";
+
+    // Initial state already points at the active route's group (no flash).
+    const [expandedGroup, setExpandedGroup] = useState<string>(activeGroupId);
+
+    // On EVERY route change (client-side navigation included), open the group
+    // that owns the new route. Manual toggles still work between navigations.
+    useEffect(() => {
+        setExpandedGroup(activeGroupId);
+    }, [currentPath, activeGroupId]);
+
     return (
         <>
             {open && (
@@ -192,7 +256,10 @@ export default function AdminSidebar({
                 <div className="flex h-[76px] items-center justify-between border-b border-slate-100 px-5 dark:border-slate-800">
                     <Link
                         href={routes.dashboard}
-                        onClick={onClose}
+                        onClick={() => {
+                            setExpandedGroup("overview");
+                            onClose();
+                        }}
                         aria-label={t.dashboard}
                         className="flex min-w-0 items-center"
                     >
@@ -219,9 +286,7 @@ export default function AdminSidebar({
                         {navigation.map((group) => {
                             const GroupIcon = group.icon;
                             const expanded = expandedGroup === group.id;
-                            const containsActive = group.items.some(
-                                (item) => item.href === activeHref,
-                            );
+                            const containsActive = group.id === activeGroupId;
 
                             return (
                                 <section key={group.id}>
@@ -262,13 +327,16 @@ export default function AdminSidebar({
                                         >
                                             {group.items.map((item) => {
                                                 const ItemIcon = item.icon;
-                                                const active = item.href === activeHref;
+                                                const active = item.href === currentActiveHref;
 
                                                 return (
                                                     <Link
                                                         key={item.href}
                                                         href={item.href}
-                                                        onClick={onClose}
+                                                        onClick={() => {
+                                                            setExpandedGroup(group.id);
+                                                            onClose();
+                                                        }}
                                                         aria-current={active ? "page" : undefined}
                                                         className={cn(
                                                             "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-xs leading-5 transition-colors",

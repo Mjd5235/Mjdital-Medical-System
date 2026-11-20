@@ -1,3 +1,4 @@
+// src/app/admin/dashboard/dashboard.tsx
 
 "use client";
 
@@ -14,7 +15,6 @@ import {
     FileText,
     HeartPulse,
     LayoutDashboard,
-    Search,
     Settings,
     ShieldCheck,
     Stethoscope,
@@ -31,19 +31,23 @@ import { Locale } from "@/lib/i18n/types";
 import AdminSidebar from "@/components/AdminPortalSidebar/Sidebar";
 import AdminHeader from "@/components/AdminPortalHeader/Header";
 
-type PaymentStatus = "paid" | "insured";
+type VisitBillingStatus =
+    | "paid_synced"
+    | "insured"
+    | "pending"
+    | "zatca_error";
 
 type DashboardClientProps = {
     initialLocale: Locale;
 };
 
-interface Appointment {
+interface RecentVisit {
     id: string;
     patient: string;
     doctor: string;
     clinic: string;
     time: string;
-    status: PaymentStatus;
+    status: VisitBillingStatus;
 }
 
 interface NavigationItem {
@@ -115,24 +119,28 @@ const translations = {
         cash: "نقدي",
         insuranceNphies: "تأمين / نفيس",
         paymentMethods: "إجمالي وسائل الدفع",
-        recentAppointments: "المواعيد الأخيرة",
-        appointmentsSubtitle: "متابعة مواعيد المرضى وحالة الدفع",
-        searchPlaceholder: "ابحث عن مريض أو طبيب...",
+        recentVisits: "أحدث الزيارات السريرية",
+        recentVisitsSubtitle: "آخر زيارات المرضى وحالة الفوترة ومزامنة ZATCA",
         patient: "المريض",
         doctor: "الطبيب",
         clinic: "العيادة",
         time: "الوقت",
-        paymentStatus: "حالة الدفع",
-        paid: "مدفوع",
-        insured: "مؤمن",
-        noAppointments: "لا توجد مواعيد تطابق البحث.",
-        showing: "عرض",
-        of: "من",
-        appointmentsCount: "مواعيد",
-        viewAll: "عرض جميع المواعيد",
+        billingZatca: "الفوترة وZATCA",
+        statusPaidSynced: "مدفوع ومتزامن",
+        statusInsured: "مؤمن",
+        statusPending: "قيد الانتظار",
+        statusZatcaError: "خطأ ZATCA",
+        noVisits: "لا توجد زيارات مسجلة بعد.",
+        showingLatest: (count: number) =>
+            count === 1
+                ? "عرض آخر زيارة"
+                : count === 2
+                    ? "عرض آخر زيارتين"
+                    : `عرض آخر ${count} زيارات`,
+        viewBillingLogs: "عرض سجلات الفوترة وZATCA",
         quickActions: "إجراءات سريعة",
         quickSubtitle: "الوصول المباشر إلى المهام الإدارية",
-        addProvider: "إضافة موظف / طبيب",
+        addProvider: "إضافة طبيب جديد",
         providerDescription: "إدارة الكادر الطبي",
         zatcaAction: "إعدادات الزكاة (ZATCA)",
         zatcaDescription: "الفوترة الإلكترونية",
@@ -201,24 +209,24 @@ const translations = {
         cash: "Cash",
         insuranceNphies: "Insurance / NPHIES",
         paymentMethods: "Payment methods",
-        recentAppointments: "Recent Appointments",
-        appointmentsSubtitle: "Patient appointments and payment status",
-        searchPlaceholder: "Search patients or doctors...",
+        recentVisits: "Recent Clinical Visits",
+        recentVisitsSubtitle: "Latest patient visits, billing status & ZATCA sync",
         patient: "Patient",
         doctor: "Doctor",
         clinic: "Clinic",
         time: "Time",
-        paymentStatus: "Payment Status",
-        paid: "Paid",
-        insured: "Insured",
-        noAppointments: "No appointments match your search.",
-        showing: "Showing",
-        of: "of",
-        appointmentsCount: "appointments",
-        viewAll: "View all appointments",
+        billingZatca: "Billing & ZATCA",
+        statusPaidSynced: "Paid & Synced",
+        statusInsured: "Insured",
+        statusPending: "Pending",
+        statusZatcaError: "ZATCA Error",
+        noVisits: "No clinical visits recorded yet.",
+        showingLatest: (count: number) =>
+            count === 1 ? "Showing latest visit" : `Showing latest ${count} visits`,
+        viewBillingLogs: "View Billing & ZATCA Logs",
         quickActions: "Quick Actions",
         quickSubtitle: "Shortcuts to common administrative tasks",
-        addProvider: "Add Employee / Doctor",
+        addProvider: "Add New Doctor",
         providerDescription: "Manage clinical staff",
         zatcaAction: "ZATCA Settings",
         zatcaDescription: "E-invoicing configuration",
@@ -245,6 +253,9 @@ const translations = {
     },
 } as const;
 
+// NOTE: the product brief refers to the ZATCA logs page as "/finance/zatca".
+// This app mounts every admin page under "/admin" (see sidebar + Quick Actions),
+// so the existing `routes.zatca` ("/admin/finance/zatca") is used for the footer link.
 const routes = {
     dashboard: "/admin/dashboard",
     providers: "/admin/clinical/providers",
@@ -310,12 +321,35 @@ function getNavigation(t: (typeof translations)[Locale]): NavigationGroup[] {
 
 const revenueValues = [10000, 8500, 11800, 10200, 12200, 14300, 17600];
 
-const appointmentData: Appointment[] = [
-    { id: "APT-001", patient: "", doctor: "", clinic: "", time: "09:00", status: "paid" },
-    { id: "APT-002", patient: "", doctor: "", clinic: "", time: "10:30", status: "insured" },
-    { id: "APT-003", patient: "", doctor: "", clinic: "", time: "11:15", status: "paid" },
-    { id: "APT-004", patient: "", doctor: "", clinic: "", time: "12:00", status: "insured" },
+// Mock data: one row per billing state so every badge is visible.
+const visitData: RecentVisit[] = [
+    { id: "VST-001", patient: "", doctor: "", clinic: "", time: "09:00", status: "paid_synced" },
+    { id: "VST-002", patient: "", doctor: "", clinic: "", time: "10:30", status: "insured" },
+    { id: "VST-003", patient: "", doctor: "", clinic: "", time: "11:15", status: "pending" },
+    { id: "VST-004", patient: "", doctor: "", clinic: "", time: "12:00", status: "zatca_error" },
 ];
+
+const billingStatusStyles: Record<
+    VisitBillingStatus,
+    { pill: string; dot: string }
+> = {
+    paid_synced: {
+        pill: "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400",
+        dot: "bg-emerald-500",
+    },
+    insured: {
+        pill: "bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-400",
+        dot: "bg-blue-500",
+    },
+    pending: {
+        pill: "bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400",
+        dot: "bg-amber-500",
+    },
+    zatca_error: {
+        pill: "bg-red-50 text-red-700 ring-1 ring-red-200 dark:bg-red-950/40 dark:text-red-400 dark:ring-red-900",
+        dot: "bg-red-500",
+    },
+};
 
 function cn(...classes: Array<string | false | undefined>) {
     return classes.filter(Boolean).join(" ");
@@ -598,7 +632,6 @@ export default function AdminDashboardClientView({ initialLocale,
 }: DashboardClientProps) {
 
     const [sidebarOpen, setSidebarOpen] = useState(false);
-    const [searchQuery, setSearchQuery] = useState("");
     const [locale, setLocale] = useState<Locale>(initialLocale);
 
     useEffect(() => {
@@ -668,25 +701,19 @@ export default function AdminDashboardClientView({ initialLocale,
         },
     ];
 
-    const appointments = appointmentData.map((appointment, index) => ({
-        ...appointment,
+    const recentVisits: RecentVisit[] = visitData.map((visit, index) => ({
+        ...visit,
         patient: t.patients[index],
         doctor: t.doctors[index],
         clinic: t.clinics[index],
     }));
 
-    const filteredAppointments = appointments.filter((appointment) => {
-        const query = searchQuery.trim().toLocaleLowerCase(
-            locale === "ar" ? "ar" : "en",
-        );
-
-        return (
-            !query ||
-            appointment.patient.toLocaleLowerCase(locale).includes(query) ||
-            appointment.doctor.toLocaleLowerCase(locale).includes(query) ||
-            appointment.clinic.toLocaleLowerCase(locale).includes(query)
-        );
-    });
+    const billingStatusLabels: Record<VisitBillingStatus, string> = {
+        paid_synced: t.statusPaidSynced,
+        insured: t.statusInsured,
+        pending: t.statusPending,
+        zatca_error: t.statusZatcaError,
+    };
 
     const quickActions = [
         {
@@ -829,35 +856,12 @@ export default function AdminDashboardClientView({ initialLocale,
                                 <div className="flex flex-col gap-3 border-b border-slate-100 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-5 dark:border-slate-800">
                                     <div>
                                         <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                                            {t.recentAppointments}
+                                            {t.recentVisits}
                                         </h2>
                                         <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                            {t.appointmentsSubtitle}
+                                            {t.recentVisitsSubtitle}
                                         </p>
                                     </div>
-
-                                    <label className="relative block w-full sm:max-w-[260px]">
-                                        <Search
-                                            aria-hidden="true"
-                                            size={16}
-                                            className={cn(
-                                                "pointer-events-none absolute top-1/2 -translate-y-1/2 text-slate-400",
-                                                isRtl ? "right-3" : "left-3",
-                                            )}
-                                        />
-                                        <input
-                                            type="search"
-                                            value={searchQuery}
-                                            onChange={(event) => setSearchQuery(event.target.value)}
-                                            placeholder={t.searchPlaceholder}
-                                            aria-label={t.searchPlaceholder}
-                                            className={cn(
-                                                "h-10 w-full rounded-xl border border-slate-200 bg-slate-50 py-2 text-sm outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10 dark:border-slate-700 dark:bg-slate-900 dark:text-white",
-                                                // Reserve space at the icon side in both directions.
-                                                isRtl ? "pr-10 pl-3 text-right" : "pl-10 pr-3 text-left",
-                                            )}
-                                        />
-                                    </label>
                                 </div>
 
                                 <div className="overflow-x-auto">
@@ -868,62 +872,65 @@ export default function AdminDashboardClientView({ initialLocale,
                                                 <th scope="col" className="px-4 py-3.5">{t.doctor}</th>
                                                 <th scope="col" className="px-4 py-3.5">{t.clinic}</th>
                                                 <th scope="col" className="px-4 py-3.5">{t.time}</th>
-                                                <th scope="col" className="px-5 py-3.5">{t.paymentStatus}</th>
+                                                <th scope="col" className="px-5 py-3.5">{t.billingZatca}</th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                                            {filteredAppointments.map((appointment) => (
-                                                <tr
-                                                    key={appointment.id}
-                                                    className="transition-colors hover:bg-slate-50/70 dark:hover:bg-slate-900/50"
-                                                >
-                                                    <td className="whitespace-nowrap px-5 py-4">
-                                                        <div className="flex items-center gap-2.5">
-                                                            <div className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-teal-50 text-xs font-bold text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
-                                                                {appointment.patient.charAt(0)}
+                                            {recentVisits.map((visit) => {
+                                                const statusStyle = billingStatusStyles[visit.status];
+
+                                                return (
+                                                    <tr
+                                                        key={visit.id}
+                                                        className="transition-colors hover:bg-slate-50/70 dark:hover:bg-slate-900/50"
+                                                    >
+                                                        <td className="whitespace-nowrap px-5 py-4">
+                                                            <div className="flex items-center gap-2.5">
+                                                                <div className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-teal-50 text-xs font-bold text-teal-700 dark:bg-teal-950/50 dark:text-teal-400">
+                                                                    {visit.patient.charAt(0)}
+                                                                </div>
+                                                                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                                                    {visit.patient}
+                                                                </span>
                                                             </div>
-                                                            <span className="font-semibold text-slate-800 dark:text-slate-200">
-                                                                {appointment.patient}
+                                                        </td>
+                                                        <td className="whitespace-nowrap px-4 py-4 text-xs text-slate-600 dark:text-slate-300">
+                                                            {visit.doctor}
+                                                        </td>
+                                                        <td className="whitespace-nowrap px-4 py-4 text-xs text-slate-600 dark:text-slate-300">
+                                                            {visit.clinic}
+                                                        </td>
+                                                        <td className="whitespace-nowrap px-4 py-4 text-xs text-slate-500 dark:text-slate-400">
+                                                            <span className="inline-flex items-center gap-1.5">
+                                                                <Clock3 size={13} />
+                                                                {visit.time}
                                                             </span>
-                                                        </div>
-                                                    </td>
-                                                    <td className="whitespace-nowrap px-4 py-4 text-xs text-slate-600 dark:text-slate-300">
-                                                        {appointment.doctor}
-                                                    </td>
-                                                    <td className="whitespace-nowrap px-4 py-4 text-xs text-slate-600 dark:text-slate-300">
-                                                        {appointment.clinic}
-                                                    </td>
-                                                    <td className="whitespace-nowrap px-4 py-4 text-xs text-slate-500 dark:text-slate-400">
-                                                        <span className="inline-flex items-center gap-1.5">
-                                                            <Clock3 size={13} />
-                                                            {appointment.time}
-                                                        </span>
-                                                    </td>
-                                                    <td className="whitespace-nowrap px-5 py-4">
-                                                        <span
-                                                            className={cn(
-                                                                "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-xs font-semibold",
-                                                                appointment.status === "paid"
-                                                                    ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400"
-                                                                    : "bg-cyan-50 text-cyan-700 dark:bg-cyan-950/40 dark:text-cyan-400",
-                                                            )}
-                                                        >
+                                                        </td>
+                                                        <td className="whitespace-nowrap px-5 py-4">
                                                             <span
                                                                 className={cn(
-                                                                    "h-1.5 w-1.5 rounded-full",
-                                                                    appointment.status === "paid" ? "bg-emerald-500" : "bg-cyan-500",
+                                                                    "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-xs font-semibold",
+                                                                    statusStyle.pill,
                                                                 )}
-                                                            />
-                                                            {appointment.status === "paid" ? t.paid : t.insured}
-                                                        </span>
-                                                    </td>
-                                                </tr>
-                                            ))}
+                                                            >
+                                                                <span
+                                                                    className={cn(
+                                                                        "h-1.5 w-1.5 rounded-full",
+                                                                        statusStyle.dot,
+                                                                        visit.status === "zatca_error" && "animate-pulse",
+                                                                    )}
+                                                                />
+                                                                {billingStatusLabels[visit.status]}
+                                                            </span>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
 
-                                            {filteredAppointments.length === 0 && (
+                                            {recentVisits.length === 0 && (
                                                 <tr>
                                                     <td colSpan={5} className="px-5 py-10 text-center text-sm text-slate-500">
-                                                        {t.noAppointments}
+                                                        {t.noVisits}
                                                     </td>
                                                 </tr>
                                             )}
@@ -933,13 +940,13 @@ export default function AdminDashboardClientView({ initialLocale,
 
                                 <div className="flex items-center justify-between gap-3 border-t border-slate-100 px-5 py-3.5 dark:border-slate-800">
                                     <span className="text-xs text-slate-500 dark:text-slate-400">
-                                        {t.showing} {filteredAppointments.length} {t.of} {appointments.length} {t.appointmentsCount}
+                                        {recentVisits.length > 0 ? t.showingLatest(recentVisits.length) : ""}
                                     </span>
                                     <Link
-                                        href={routes.schedules}
+                                        href={routes.zatca}
                                         className="inline-flex items-center gap-1.5 text-xs font-bold text-teal-700 hover:text-teal-800 dark:text-teal-400"
                                     >
-                                        {t.viewAll}
+                                        {t.viewBillingLogs}
                                         <ChevronLeft size={15} className={cn(!isRtl && "rotate-180")} />
                                     </Link>
                                 </div>
