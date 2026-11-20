@@ -8,6 +8,8 @@
 //    (weekly-timeline based).
 //  - `toggleShiftStatusAction(shiftId, nextActive?)` accepts the desired state so a repeated /
 //    stale request is idempotent instead of flipping the shift back.
+//  - `deleteShiftAction` is idempotent: a duplicate / stale delete for a shift that is already
+//    gone returns success (code "ALREADY_DELETED") instead of a false "not found" failure.
 //
 // REQUIRED SQL (only if you previously applied the CHECK constraints from the first schema):
 //   ALTER TABLE "shifts" DROP CONSTRAINT IF EXISTS "shifts_time_range_chk";
@@ -1091,6 +1093,17 @@ export async function duplicateShiftAction(
 }
 
 /**
+ * Delete is idempotent: if the shift no longer exists (e.g. a duplicate or
+ * stale request after the first one already removed it) the desired end state
+ * is already reached, so report success instead of a false failure.
+ */
+function alreadyDeleted(id: string): ShiftActionResult<DeleteShiftData> {
+    revalidatePath(SCHEDULES_PATH);
+
+    return { success: true, data: { id }, code: "ALREADY_DELETED" };
+}
+
+/**
  * Deletes a shift. Deletion is refused while upcoming, non-cancelled
  * appointments of the same doctor still fall inside the shift's window
  * (including the post-midnight part of overnight shifts).
@@ -1112,10 +1125,7 @@ export async function deleteShiftAction(
         const clinicIds = await getOrganizationClinicIds(session.organizationId);
 
         if (clinicIds.length === 0) {
-            return failure(
-                "The requested shift could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
+            return alreadyDeleted(id);
         }
 
         const shift = await prisma.shift.findFirst({
@@ -1137,10 +1147,7 @@ export async function deleteShiftAction(
         });
 
         if (!shift) {
-            return failure(
-                "The requested shift could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
+            return alreadyDeleted(id);
         }
 
         const affected = await countAffectedAppointments({
@@ -1170,16 +1177,21 @@ export async function deleteShiftAction(
         });
 
         if (deleted.count !== 1) {
-            return failure(
-                "The requested shift could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
+            return alreadyDeleted(id);
         }
 
         revalidatePath(SCHEDULES_PATH);
 
         return { success: true, data: { id: shift.id } };
     } catch (error) {
+        // A concurrent duplicate delete can surface as P2025: the shift is already gone.
+        if (
+            error instanceof Prisma.PrismaClientKnownRequestError &&
+            error.code === "P2025"
+        ) {
+            return alreadyDeleted(id);
+        }
+
         return databaseError("deleteShiftAction", error);
     }
 }

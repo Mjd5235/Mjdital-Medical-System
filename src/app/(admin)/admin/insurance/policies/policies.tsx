@@ -1,31 +1,5 @@
 "use client";
 
-/**
- * Policies & Tiers — /admin/insurance/policies/page.tsx
- *
- * Performance notes
- * -----------------
- * - Every mutation (create, duplicate-save, edit, toggle status, delete) changes the UI in the same
- *   frame and syncs with the server in the background. A failure restores the previous state and
- *   shows an error toast.
- * - New rows get their final UUID on the client (the server accepts it), so follow-up actions on a
- *   row that has not reached the server yet are queued in order instead of being blocked.
- * - Server calls touching the same row run strictly in order (per-row queue).
- * - Filtering and pagination are local (the table owns its data) so Reset Filters is instant.
- * - Modals fade/scale in with transition-all duration-200 ease-out; backdrop fades separately.
- *
- * Duplicate workflow
- * ------------------
- * "Duplicate" opens the policy modal pre-filled from the source policy, with:
- *   1. the name suffixed with "(Copy)" / "(نسخة)",
- *   2. an EMPTY policy number highlighted in red (required) — saving is blocked until the admin
- *      enters a new contract number,
- *   3. a per-payer uniqueness check (payer + policy number) both live in the modal and on the server.
- *
- * Note: the modal adds an optional "Contract Expiry" date field next to the policy number because the
- * table's "Contract Expiry" column needs a source of truth for NPHIES contract validity.
- */
-
 import {
     useCallback,
     useDeferredValue,
@@ -116,9 +90,9 @@ type FormErrors = Partial<
 >;
 
 const en = {
-    title: "Policies & Tiers",
-    breadcrumbRoot: "Policies & Tiers",
-    breadcrumbCurrent: "Insurance Policies",
+    title: "Contract Tiers & Co-payments",
+    breadcrumbRoot: "Insurance & Contracts",
+    breadcrumbCurrent: "Contract Tiers & Co-payments",
     subtitle: "Manage insurance plans, patient co-payments, and NPHIES-ready contract details.",
     add: "Create New Policy",
     search: "Search by plan name or policy number",
@@ -211,9 +185,9 @@ const en = {
 type Messages = typeof en;
 
 const ar: Messages = {
-    title: "الوثائق والفئات",
-    breadcrumbRoot: "الوثائق والفئات",
-    breadcrumbCurrent: "وثائق التأمين",
+    title: "فئات العقود ونسب التحمل",
+    breadcrumbRoot: "إدارة التأمين والعقود",
+    breadcrumbCurrent: "فئات العقود ونسب التحمل",
     subtitle: "إدارة خطط التأمين ومشاركة المريض في التكلفة وتفاصيل العقود الجاهزة للربط مع نفيس.",
     add: "إنشاء وثيقة جديدة",
     search: "ابحث باسم الخطة أو رقم الوثيقة",
@@ -2086,7 +2060,7 @@ export default function PoliciesTiersPage({ initialLocale,
                                 <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.breadcrumbRoot}</span>
                                     <span>/</span>
-                                    <span>{t.breadcrumbCurrent}</span>
+                                    <span className="font-medium text-teal-700 dark:text-teal-400">{t.breadcrumbCurrent}</span>
                                 </div>
 
                                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">

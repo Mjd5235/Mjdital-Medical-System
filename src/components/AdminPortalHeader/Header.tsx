@@ -162,9 +162,9 @@ export default function AdminHeader({
 
     return (
         <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/90 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-950/90">
-            <div className="flex min-h-[76px] items-center justify-between gap-3 px-4 py-3 sm:px-6 xl:px-8">
+            <div className="flex min-h-16 items-center justify-between gap-2 px-3 py-2.5 sm:min-h-[76px] sm:gap-3 sm:px-6 sm:py-3 xl:px-8">
                 {/* Greeting and mobile sidebar button */}
-                <div className="flex min-w-0 items-center gap-3">
+                <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
                     <button
                         type="button"
                         aria-label={t.menuOpen}
@@ -175,15 +175,18 @@ export default function AdminHeader({
                         <Menu size={21} />
                     </button>
 
-                    <div className="min-w-0" aria-busy={isLoading || undefined}>
+                    <div
+                        className="min-w-0 flex-1"
+                        aria-busy={isLoading || undefined}
+                    >
                         {isLoading ? (
                             <div
                                 role="status"
                                 className="animate-pulse space-y-2"
                             >
                                 <span className="sr-only">…</span>
-                                <div className="h-4 w-28 rounded bg-slate-200 sm:h-[18px] dark:bg-slate-800" />
-                                <div className="h-3 w-20 rounded bg-slate-200/70 dark:bg-slate-800/70" />
+                                <div className="h-4 w-20 rounded bg-slate-200 sm:h-[18px] sm:w-28 dark:bg-slate-800" />
+                                <div className="hidden h-3 w-20 rounded bg-slate-200/70 sm:block dark:bg-slate-800/70" />
                             </div>
                         ) : (
                             <>
@@ -191,7 +194,8 @@ export default function AdminHeader({
                                     {greetingText}
                                 </p>
 
-                                <p className="mt-0.5 min-h-4 truncate text-xs text-slate-500 dark:text-slate-400">
+                                {/* Secondary role line: hidden on small screens */}
+                                <p className="mt-0.5 hidden min-h-4 truncate text-xs text-slate-500 sm:block dark:text-slate-400">
                                     {roleText}
                                 </p>
                             </>
@@ -201,21 +205,25 @@ export default function AdminHeader({
 
                 {/* Header actions */}
                 <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
-                    <LanguageToggle
-                        locale={locale}
-                        variant="header"
-                    />
+                    <div className="shrink-0">
+                        <LanguageToggle
+                            locale={locale}
+                            variant="header"
+                        />
+                    </div>
 
-                    <ThemeToggle
-                        lightLabel={t.lightMode}
-                        darkLabel={t.darkMode}
-                        variant="header"
-                    />
+                    <div className="shrink-0">
+                        <ThemeToggle
+                            lightLabel={t.lightMode}
+                            darkLabel={t.darkMode}
+                            variant="header"
+                        />
+                    </div>
 
                     <button
                         type="button"
                         aria-label={t.notifications}
-                        className="relative grid h-10 w-10 place-items-center rounded-xl text-slate-600 transition hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                        className="relative grid h-10 w-10 shrink-0 place-items-center rounded-xl text-slate-600 transition hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
                     >
                         <Bell size={20} />
 
@@ -225,10 +233,10 @@ export default function AdminHeader({
                         />
                     </button>
 
-                    <div className="hidden h-8 w-px bg-slate-200 sm:block dark:bg-slate-700" />
+                    <div className="hidden h-8 w-px shrink-0 bg-slate-200 sm:block dark:bg-slate-700" />
 
-                    <div className="hidden h-10 w-10 place-items-center rounded-full bg-teal-50 text-teal-700 sm:grid dark:bg-teal-950/50 dark:text-teal-400">
-                        <Users size={20} />
+                    <div className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-teal-50 text-teal-700 sm:h-10 sm:w-10 dark:bg-teal-950/50 dark:text-teal-400">
+                        <Users size={18} className="sm:h-5 sm:w-5" />
                     </div>
                 </div>
             </div>

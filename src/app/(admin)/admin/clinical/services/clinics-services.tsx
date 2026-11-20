@@ -1,4 +1,3 @@
-// app/admin/clinical/services/page.tsx
 "use client";
 
 import {
@@ -140,7 +139,7 @@ const translations = {
         role: "مدير النظام",
         title: "العيادات والخدمات",
         subtitle: "إدارة العيادات والتخصصات والخدمات الطبية",
-        dashboard: "لوحة التحكم",
+        dashboard: "الهيكل الطبي ونفيس",
         clinicTab: "إدارة العيادات",
         serviceTab: "الخدمات والأسعار",
         clinicDescription: "إدارة العيادات والتخصصات الطبية",
@@ -245,7 +244,7 @@ const translations = {
         role: "System Administrator",
         title: "Clinics & Services",
         subtitle: "Manage clinics, specialties, and medical services",
-        dashboard: "Dashboard",
+        dashboard: "Clinical Setup & NPHIES",
         clinicTab: "Clinic Management",
         serviceTab: "Services & Pricing",
         clinicDescription: "Manage clinics and medical specialties",
@@ -2046,10 +2045,7 @@ export default function ClinicsServicesPage({ initialLocale,
                             <div>
                                 <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.dashboard}</span>
-                                    <ChevronLeft
-                                        size={13}
-                                        className={cn(!isRtl && "rotate-180")}
-                                    />
+                                    <span>/</span>
                                     <span className="font-medium text-teal-700 dark:text-teal-400">
                                         {t.title}
                                     </span>

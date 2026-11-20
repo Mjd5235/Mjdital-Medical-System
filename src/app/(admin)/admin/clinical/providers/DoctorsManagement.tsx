@@ -1,28 +1,5 @@
 "use client";
 
-/**
- * Performance notes
- * -----------------
- * - Every mutation (create, edit, delete, activate/deactivate) updates the UI in the same frame
- *   and syncs with the server in the background. A failure restores the previous state and shows
- *   an error toast.
- * - Server calls for the same row run in order (per-row queue), so rapid clicks never race.
- * - No router.refresh() and no blocking spinners. The only spinner left is the tiny one for
- *   "regenerate password", which has to wait for the server because the server creates the password.
- * - Optional server-side win: remove `revalidatePath(MANAGEMENT_PATH)` from the actions in
- *   ./actions.ts. This client component owns its data, and each revalidation makes every Server
- *   Action response heavier and slower because it re-renders the route.
- *
- * Unassigned doctors
- * ------------------
- * - Doctors without a clinic (clinicId === null) or without any service are never dropped from the
- *   table. In the single "Clinic & Service" column they get one muted "Unassigned" badge with
- *   "No clinic · No service" fallback text, and a compact "Assign" action in the Actions column that
- *   opens the edit modal pre-loaded with the doctor's data.
- * - The filter bar carries a compact "N Unassigned" count pill and an "Unassigned only" toggle button
- *   (no full-width warning banner).
- */
-
 import {
     useCallback,
     useDeferredValue,
@@ -196,7 +173,7 @@ const SPECIALTIES: ReadonlyArray<{ en: string; ar: string }> = [
 const messages = {
     en: {
         title: "Doctors & Practitioners",
-        breadcrumbRoot: "Admin",
+        breadcrumbRoot: "Clinical Setup & NPHIES",
         subtitle: "Manage clinical profiles, credentials and access",
         add: "Add New Doctor",
         search: "Search doctors, ID or license",
@@ -314,7 +291,7 @@ const messages = {
     },
     ar: {
         title: "الأطباء والممارسون الصحيون",
-        breadcrumbRoot: "الإدارة",
+        breadcrumbRoot: "الهيكل الطبي ونفيس",
         subtitle: "إدارة الملفات المهنية والتراخيص وصلاحيات الوصول",
         add: "إضافة طبيب جديد",
         search: "البحث بالاسم أو الهوية أو الترخيص",
@@ -2721,7 +2698,7 @@ export default function DoctorsManagementPage({
                                 <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.breadcrumbRoot}</span>
                                     <span>/</span>
-                                    <span>{t.title}</span>
+                                    <span className="text-teal-700 dark:text-teal-400">{t.title}</span>
                                 </div>
 
                                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">

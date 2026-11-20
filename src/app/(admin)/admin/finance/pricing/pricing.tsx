@@ -1,20 +1,5 @@
 "use client";
 
-/**
- * Pricing & Taxes — /admin/finance/pricing/page.tsx
- *
- * Performance notes
- * -----------------
- * - Every mutation (create, edit, toggle, delete) updates the table in the same frame and syncs with
- *   the server in the background. A failed request restores the previous state and shows an error toast.
- * - Server calls are serialised per service (queue), so rapid clicks never race. Contract prices that
- *   are still being created use a temporary id; queued follow-up actions resolve it to the real id.
- * - Server responses are merged field-by-field (never replacing a whole row), so they can never
- *   overwrite newer optimistic changes made while the request was in flight.
- * - All filtering, searching and paging run client-side on in-memory data: zero network latency.
- * - No router.refresh() and no blocking spinners.
- */
-
 import {
     memo,
     useCallback,
@@ -100,8 +85,8 @@ const useIsoLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : use
 /* -------------------------------------------------------------------------- */
 
 const en = {
-    breadcrumbRoot: "Pricing & Taxes",
-    breadcrumbCurrent: "Service Pricing",
+    breadcrumbRoot: "Finance & ZATCA",
+    breadcrumbCurrent: "Service Pricing & Taxes",
     title: "Pricing & Taxes",
     subtitle: "Manage cash and insurance service price lists and configure VAT for medical services.",
     add: "Add Price List / Custom Price",
@@ -179,8 +164,8 @@ const en = {
 type Messages = typeof en;
 
 const ar: Messages = {
-    breadcrumbRoot: "الأسعار والضرائب",
-    breadcrumbCurrent: "أسعار الخدمات",
+    breadcrumbRoot: "النظام المالي والزكاة",
+    breadcrumbCurrent: "أسعار الخدمات والضرائب",
     title: "الأسعار والضرائب",
     subtitle: "إدارة قوائم أسعار الخدمات النقدية والتأمينية وضبط ضريبة القيمة المضافة للخدمات الطبية.",
     add: "إضافة قائمة أسعار / سعر مخصص",
@@ -2112,7 +2097,7 @@ export default function PricingTaxesPage({ initialLocale,
                                 >
                                     <span>{t.breadcrumbRoot}</span>
                                     <span aria-hidden="true">/</span>
-                                    <span className="text-slate-700 dark:text-slate-200">{t.breadcrumbCurrent}</span>
+                                    <span className="font-medium text-teal-700 dark:text-teal-400">{t.breadcrumbCurrent}</span>
                                 </nav>
 
                                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">

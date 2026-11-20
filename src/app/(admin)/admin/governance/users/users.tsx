@@ -1,36 +1,5 @@
 "use client";
 
-/**
- * Users & Roles — page
- * --------------------
- * Same architecture as the Doctors Management page:
- * - The list is loaded once (all pages of 100 are fetched in a loop) and then searched, filtered and
- *   paginated on the client. `useDeferredValue` keeps typing smooth.
- * - A ref-backed local store (`usersRef` + `updateUsers`) is updated synchronously, so every action
- *   is reflected in the UI in the same frame (0 ms) and rapid clicks always see the latest rows.
- * - TRUE optimistic updates for Create, Edit, Disable / Re-activate and Delete:
- *     1. the row is changed locally and the modal closes instantly,
- *     2. the server call runs in the background through a per-row queue (strict ordering),
- *     3. on success the optimistic row is swapped for the confirmed one (no visual jump),
- *     4. on failure the change is rolled back, a silent resync runs and an error toast is shown.
- * - Duplicate email / mobile are pre-checked against the local list so the field error still appears
- *   inline without waiting for the network.
- * - Lifecycle (mirrors the server `deriveStatus`):
- *     Pending  = !isActive && mustChangePassword && no activatedAt   (awaiting first login)
- *     Active   = isActive
- *     Disabled = !isActive in every other case (manually disabled; stamped with activatedAt)
- * - Mobile input: "+966" is a fixed affix; the user types 05XXXXXXXX only (hard limit of 10 digits,
- *   forced "05" prefix, digits only, paste is sanitised).
- *
- * Hierarchical RBAC (UI mirror of the server rules in actions.ts — the server is the authority):
- * - `viewerIsSuperAdmin` comes from the server (re-read from the database on every fetch).
- * - Super Admin rows get a glowing teal/indigo "Super Admin" pill.
- * - A regular Admin sees Admin / Super Admin rows with a locked, disabled action button (tooltip),
- *   no Edit / Disable / Re-activate / Delete / Regenerate controls, and the "Admin" option of the
- *   role dropdown is locked in the create / edit dialog.
- * - Optimistic mutations are guarded too, so a forbidden action never even flickers in the table.
- */
-
 import {
     useCallback,
     useDeferredValue,
@@ -137,8 +106,8 @@ const baseInput =
 
 const messages = {
     en: {
-        breadcrumbRoot: "Staff & Permissions",
-        title: "Users & Roles",
+        breadcrumbRoot: "Governance & Security",
+        title: "Users & Permissions",
         subtitle: "Manage administrative staff and reception accounts, and control system access.",
         add: "Add New User",
         search: "Search name, email, or phone number",
@@ -239,8 +208,8 @@ const messages = {
         deleteConfirm: "Delete Account",
     },
     ar: {
-        breadcrumbRoot: "الموظفون والصلاحيات",
-        title: "المستخدمون والأدوار",
+        breadcrumbRoot: "الحوكمة والأمان",
+        title: "إدارة المستخدمين والصلاحيات",
         subtitle: "إدارة حسابات الموظفين الإداريين والاستقبال والتحكم في الوصول إلى النظام.",
         add: "إضافة مستخدم جديد",
         search: "ابحث بالاسم أو البريد أو رقم الجوال",
@@ -2273,7 +2242,7 @@ export default function UsersRolesPage({ initialLocale }: UsersRolesPageProps) {
                                 <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.breadcrumbRoot}</span>
                                     <span>/</span>
-                                    <span>{t.title}</span>
+                                    <span className="font-medium text-teal-700 dark:text-teal-400">{t.title}</span>
                                 </div>
 
                                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">

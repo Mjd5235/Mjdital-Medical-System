@@ -1,30 +1,5 @@
 "use client";
 
-/**
- * ZATCA Integration — /admin/finance/zatca
- *
- * Performance notes
- * -----------------
- * - Environment switching, filter changes and Reset Filters update the UI in the same frame; the
- *   server is synced in the background (serialised queue). A failure restores the previous state
- *   and shows an error toast.
- * - The transmission log is cached per environment. Changing the period filters the cached rows
- *   locally (0ms) and refreshes silently in the background. Skeleton rows are shown only when
- *   nothing has ever been loaded for the selected environment.
- * - "Generate & Certify CSID" gives instant feedback (inputs lock, the certificate card switches to a
- *   "Certifying…" state, no blocking spinner). The certificate is only shown as active once ZATCA
- *   has really issued it, because the CSID is created by ZATCA and cannot be faked optimistically.
- * - No router.refresh(): this client component owns its data.
- *
- * OTP input
- * ---------
- * - Root cause of the "type every digit twice" bug: after a digit was typed, focus moved to the next
- *   box synchronously, but that box's onFocus handler compared against the STALE `value` prop (React
- *   had not re-rendered yet) and bounced focus back to the previous box. The component now keeps a
- *   synchronous `valueRef`, never selects text on focus, and handles digits on keydown (with an
- *   onChange fallback for mobile keyboards), so a single keystroke fills the box and advances.
- */
-
 import {
     useCallback,
     useEffect,
@@ -142,7 +117,7 @@ const EMPTY_CREDENTIALS: Record<Env, ZatcaCredentialView | null> = {
 /* -------------------------------------------------------------------------- */
 
 const en = {
-    breadcrumbRoot: "Settings",
+    breadcrumbRoot: "Finance & ZATCA",
     title: "ZATCA Integration",
     subtitle: "Manage Phase 2 e-invoicing certificates and monitor EGS device connectivity.",
     connected: "Connected & Certified",
@@ -253,8 +228,8 @@ const en = {
 type Messages = typeof en;
 
 const ar: Messages = {
-    breadcrumbRoot: "الإعدادات",
-    title: "ربط هيئة الزكاة (ZATCA)",
+    breadcrumbRoot: "النظام المالي والزكاة",
+    title: "إعدادات ربط الزكاة",
     subtitle: "إدارة شهادات الفوترة الإلكترونية (المرحلة الثانية) ومتابعة اتصال أجهزة EGS.",
     connected: "متصل ومعتمد",
     notConnected: "غير متصل",
@@ -1902,7 +1877,7 @@ export default function ZatcaIntegrationPage({ initialLocale }: ZatcaIntegration
                                 <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.breadcrumbRoot}</span>
                                     <span>/</span>
-                                    <span>{t.title}</span>
+                                    <span className="font-medium text-teal-700 dark:text-teal-400">{t.title}</span>
                                 </div>
 
                                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">

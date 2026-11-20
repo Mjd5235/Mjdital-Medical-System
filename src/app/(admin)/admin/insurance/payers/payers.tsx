@@ -1,20 +1,5 @@
 "use client";
 
-/**
- * Performance & motion notes
- * --------------------------
- * - Every mutation (create, edit, toggle status, delete) updates the UI in the same frame and
- *   syncs with the server in the background. Per-row queues keep server calls in order.
- *   On failure the previous state is restored, an error toast appears, and (for create/edit)
- *   the form reopens with the user's input and any server field errors, so nothing is lost.
- * - No router.refresh() and no blocking spinners.
- * - Modals, the delete dialog, dropdown menus, rows and toasts animate in and out using
- *   Tailwind transitions only (no extra dependencies) and respect `prefers-reduced-motion`.
- * - Optional server-side win: remove `revalidatePath(MANAGEMENT_PATH)` from ./actions.ts.
- *   This page owns its data, and each revalidation makes every Server Action response
- *   heavier and slower.
- */
-
 import {
     useCallback,
     useDeferredValue,
@@ -110,8 +95,8 @@ type ToastItem = Notice & { id: number; leaving: boolean };
 
 const messages = {
     en: {
-        breadcrumbRoot: "Payers",
-        title: "Insurance Payers",
+        breadcrumbRoot: "Insurance & Contracts",
+        title: "Insurance Providers",
         subtitle:
             "Configure and manage insurance providers, NPHIES identifiers, and official tax records.",
         add: "Add New Payer",
@@ -184,7 +169,7 @@ const messages = {
         deleting: "Deleting…",
     },
     ar: {
-        breadcrumbRoot: "شركات التأمين",
+        breadcrumbRoot: "إدارة التأمين والعقود",
         title: "شركات التأمين",
         subtitle:
             "إعداد وإدارة شركات التأمين ومعرّفات نفيس والسجلات الضريبية الرسمية.",
@@ -1983,7 +1968,7 @@ export default function InsurancePayersPage({ initialLocale,
                                 <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.breadcrumbRoot}</span>
                                     <span>/</span>
-                                    <span>{t.title}</span>
+                                    <span className="font-medium text-teal-700 dark:text-teal-400">{t.title}</span>
                                 </div>
 
                                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">

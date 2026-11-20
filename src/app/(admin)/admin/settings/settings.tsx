@@ -1,18 +1,5 @@
 "use client";
 
-/**
- * Performance notes
- * -----------------
- * - "Save All Changes" updates the UI in the same frame (baseline replaced, success toast shown)
- *   and syncs with the server in the background. A failure restores the last server-confirmed
- *   baseline, keeps the user's edits, and shows an error toast.
- * - Saves run through a single queue, so rapid clicks never race and `version` stays in order.
- * - Logo / favicon pick: the local preview shows instantly; the upload runs in the background and
- *   a save waits for any pending upload before it sends the final URL.
- * - No router.refresh(), no blocking spinners. Ctrl/Cmd+S saves. Leaving with unsaved or
- *   in-flight changes asks for confirmation.
- */
-
 import {
     useCallback,
     useEffect,
@@ -78,7 +65,7 @@ type AssetKind = "logo" | "favicon";
 /* ------------------------------ messages ------------------------------ */
 
 const en = {
-    breadcrumbRoot: "Settings",
+    breadcrumbRoot: "Governance & Security",
     title: "Center Settings",
     subtitle: "Manage your brand identity, legal information, and official medical facility identifiers.",
     save: "Save All Changes",
@@ -175,7 +162,7 @@ const en = {
 type Messages = typeof en;
 
 const ar: Messages = {
-    breadcrumbRoot: "الإعدادات",
+    breadcrumbRoot: "الحوكمة والأمان",
     title: "إعدادات المركز",
     subtitle: "إدارة هوية علامتك التجارية والمعلومات القانونية والمعرّفات الرسمية للمنشأة الطبية.",
     save: "حفظ جميع التغييرات",
@@ -1383,7 +1370,7 @@ export default function CenterSettingsPage({ initialLocale,
                                 <div className="mb-3 flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
                                     <span>{t.breadcrumbRoot}</span>
                                     <span>/</span>
-                                    <span>{t.title}</span>
+                                    <span className="font-medium text-teal-700 dark:text-teal-400">{t.title}</span>
                                 </div>
 
                                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-4xl">

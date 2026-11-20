@@ -1,4 +1,3 @@
-// app/admin/clinical/schedules/page.tsx
 "use client";
 
 import {
@@ -34,6 +33,7 @@ import {
     Play,
     Plus,
     RefreshCw,
+    RotateCcw,
     Trash2,
     UserRound,
     X,
@@ -79,7 +79,7 @@ const EMPTY_DATA: ShiftsPageData = {
 /* -------------------------------------------------------------------------- */
 
 const en = {
-    breadcrumbRoot: "Schedules",
+    breadcrumbRoot: "Clinical Setup & NPHIES",
     title: "Schedules & Shifts",
     subtitle: "Manage doctor rosters, shift templates, and clinic availability.",
     createShift: "Create New Shift",
@@ -92,6 +92,7 @@ const en = {
     allClinics: "All Clinics",
     daysOfWeek: "Days of Week",
     allDays: "All days",
+    resetFilters: "Reset Filters",
     thisWeek: "This Week",
     prevWeek: "Previous week",
     nextWeek: "Next week",
@@ -189,7 +190,7 @@ type SchedulesShiftsProps = {
 type Messages = { [K in keyof typeof en]: string };
 
 const ar: Messages = {
-    breadcrumbRoot: "الجداول",
+    breadcrumbRoot: "الهيكل الطبي ونفيس",
     title: "جداول الدوام والشفتات",
     subtitle: "إدارة جداول الأطباء وقوالب الشفتات وتوفر العيادات.",
     createShift: "إنشاء شفت جديد",
@@ -202,6 +203,7 @@ const ar: Messages = {
     allClinics: "جميع العيادات",
     daysOfWeek: "أيام الأسبوع",
     allDays: "كل الأيام",
+    resetFilters: "إعادة تعيين الفلاتر",
     thisWeek: "هذا الأسبوع",
     prevWeek: "الأسبوع السابق",
     nextWeek: "الأسبوع التالي",
@@ -2104,7 +2106,16 @@ export default function SchedulesShiftsPage({ initialLocale,
 
     const [modal, setModal] = useState<ModalState>(null);
     const [deleteTarget, setDeleteTarget] = useState<ShiftRow | null>(null);
+    const [isDeleting, setIsDeleting] = useState(false);
     const [notice, setNotice] = useState<Notice | null>(null);
+
+    /**
+     * Synchronous double-click guard for deletion. State updates are async, so
+     * a second click fired before React re-renders would still see the old
+     * `deleteTarget` and queue a duplicate request. Refs update immediately.
+     */
+    const confirmLockRef = useRef(false);
+    const deletingIdsRef = useRef(new Set<string>());
 
     /**
      * Background sync bookkeeping. Nothing here ever blocks the UI:
@@ -2511,15 +2522,28 @@ export default function SchedulesShiftsPage({ initialLocale,
         });
     };
 
-    /** Delete: the row disappears at 0ms; it is restored (with a toast) only if the server refuses. */
+    /**
+     * Delete: the row disappears at 0ms; it is restored (with a toast) only if the server refuses.
+     * Idempotent: rapid repeated clicks fire exactly one request per shift, and a
+     * "not found" reply (already deleted) is treated as success, never as a rollback.
+     */
     const confirmDelete = () => {
+        if (confirmLockRef.current) return;
         if (!deleteTarget) return;
 
         const target = deleteTarget;
 
+        if (deletingIdsRef.current.has(target.id)) return;
+
+        confirmLockRef.current = true;
+        deletingIdsRef.current.add(target.id);
+        setIsDeleting(true);
         setDeleteTarget(null);
 
-        if (isTempId(target.id)) return;
+        if (isTempId(target.id)) {
+            deletingIdsRef.current.delete(target.id);
+            return;
+        }
 
         removeShift(target.id);
         notify("success", t.deleted);
@@ -2528,15 +2552,24 @@ export default function SchedulesShiftsPage({ initialLocale,
             try {
                 const result = await deleteShiftAction(target.id);
 
-                if (!result.success) {
+                // Already gone on the server (duplicate / stale attempt) = the goal is met.
+                if (!result.success && result.code !== "RECORD_NOT_FOUND") {
                     restoreShift(target);
                     notify("error", result.error ?? t.failed);
                 }
             } catch {
                 restoreShift(target);
                 notify("error", t.failed);
+            } finally {
+                deletingIdsRef.current.delete(target.id);
             }
         });
+    };
+
+    const cancelDelete = () => {
+        if (confirmLockRef.current) return;
+
+        setDeleteTarget(null);
     };
 
     const handlers: RowHandlers = {
@@ -2549,7 +2582,10 @@ export default function SchedulesShiftsPage({ initialLocale,
         onDuplicate: handleDuplicate,
         onDelete: (shift) => {
             if (isTempId(shift.id)) return;
+            if (deletingIdsRef.current.has(shift.id)) return;
 
+            confirmLockRef.current = false;
+            setIsDeleting(false);
             setDeleteTarget(shift);
         },
     };
@@ -2560,6 +2596,25 @@ export default function SchedulesShiftsPage({ initialLocale,
     const NextWeekIcon = isRtl ? ChevronLeft : ChevronRight;
     const showDayControls = tab === "planner";
     const isEmpty = !loading && !loadError && listRows.length === 0;
+
+    /* ----------------------------- reset filters ------------------------------ */
+
+    // The day filter's default matches what the page shows on load / on switching view:
+    // today in list view, all days in calendar view.
+    const defaultDay: number | null = view === "calendar" ? null : today ? today.getDay() : null;
+
+    const hasActiveFilters =
+        doctorFilter !== "ALL" ||
+        clinicFilter !== "ALL" ||
+        (showDayControls && (selectedDay !== defaultDay || weekOffset !== 0));
+
+    const resetFilters = () => {
+        setDoctorFilter("ALL");
+        setClinicFilter("ALL");
+        setSelectedDay(defaultDay);
+        setWeekOffset(0);
+        setPage(1);
+    };
 
     return (
         <div
@@ -2584,7 +2639,7 @@ export default function SchedulesShiftsPage({ initialLocale,
                             <div className="min-w-0">
                                 <div className="mb-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
                                     <span>{t.breadcrumbRoot}</span>
-                                    <ChevronLeft size={13} className={cn(!isRtl && "rotate-180")} />
+                                    <span>/</span>
                                     <span className="font-medium text-teal-700 dark:text-teal-400">{t.title}</span>
                                 </div>
                                 <h1 className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white sm:text-3xl">
@@ -2637,8 +2692,8 @@ export default function SchedulesShiftsPage({ initialLocale,
                             className={cn(
                                 "grid gap-3",
                                 showDayControls
-                                    ? "sm:grid-cols-2 xl:grid-cols-[1fr_1fr_1fr_auto_auto]"
-                                    : "sm:grid-cols-2",
+                                    ? "sm:grid-cols-2 xl:grid-cols-[1fr_1fr_1fr_auto_auto_auto]"
+                                    : "sm:grid-cols-[1fr_1fr_auto]",
                             )}
                         >
                             <SelectBox
@@ -2748,6 +2803,25 @@ export default function SchedulesShiftsPage({ initialLocale,
                                     </div>
                                 </>
                             )}
+
+                            <button
+                                type="button"
+                                onClick={resetFilters}
+                                disabled={!hasActiveFilters}
+                                aria-label={t.resetFilters}
+                                title={t.resetFilters}
+                                className={cn(
+                                    outlineButton,
+                                    "w-full whitespace-nowrap px-4 sm:col-span-2 xl:col-span-1 xl:w-auto",
+                                    hasActiveFilters
+                                        ? "border-teal-600/50 text-teal-700 dark:border-teal-500/50 dark:text-teal-400"
+                                        : "disabled:hover:border-slate-300 disabled:hover:text-slate-700 dark:disabled:hover:border-slate-700 dark:disabled:hover:text-slate-200",
+                                    !showDayControls && "sm:col-span-1",
+                                )}
+                            >
+                                <RotateCcw className="h-4 w-4" />
+                                {t.resetFilters}
+                            </button>
                         </section>
 
                         {/* Day chips */}
@@ -2910,7 +2984,7 @@ export default function SchedulesShiftsPage({ initialLocale,
                         transition={{ duration: 0.18, ease: "easeOut" }}
                         className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/50 p-4 -sm dark:bg-slate-950/80"
                         onMouseDown={(event) => {
-                            if (event.target === event.currentTarget) setDeleteTarget(null);
+                            if (event.target === event.currentTarget) cancelDelete();
                         }}
                     >
                         <motion.section
@@ -2943,7 +3017,8 @@ export default function SchedulesShiftsPage({ initialLocale,
                             <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
                                 <button
                                     type="button"
-                                    onClick={() => setDeleteTarget(null)}
+                                    onClick={cancelDelete}
+                                    disabled={isDeleting}
                                     className={cn(outlineButton, "px-6")}
                                 >
                                     {t.cancel}
@@ -2951,7 +3026,9 @@ export default function SchedulesShiftsPage({ initialLocale,
                                 <button
                                     type="button"
                                     onClick={confirmDelete}
-                                    className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-950"
+                                    disabled={isDeleting}
+                                    aria-busy={isDeleting}
+                                    className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-rose-600 px-6 text-sm font-semibold text-white transition hover:bg-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2 focus:ring-offset-white disabled:cursor-not-allowed disabled:opacity-60 dark:focus:ring-offset-slate-950"
                                 >
                                     <Trash2 className="h-4 w-4" />
                                     {t.deleteConfirm}

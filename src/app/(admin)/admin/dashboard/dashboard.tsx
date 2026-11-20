@@ -1,5 +1,3 @@
-// src/app/admin/dashboard/dashboard.tsx
-
 "use client";
 
 import { useState, useEffect } from "react";
@@ -189,7 +187,7 @@ const translations = {
         logout: "Sign out",
         title: "Admin Dashboard",
         subtitle: "A comprehensive overview of center performance and operations.",
-        home: "Home",
+        home: "Overview",
         weeklySummary: "Weekly performance",
         revenue: "Today's Revenue",
         appointments: "Today's Appointments",
@@ -764,10 +762,7 @@ export default function AdminDashboardClientView({ initialLocale,
                             <div>
                                 <div className="mb-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
                                     <span>{t.home}</span>
-                                    <ChevronLeft
-                                        size={13}
-                                        className={cn(!isRtl && "rotate-180")}
-                                    />
+                                    <span>/</span>
                                     <span className="font-medium text-teal-700 dark:text-teal-400">
                                         {t.dashboard}
                                     </span>
