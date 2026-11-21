@@ -5,20 +5,6 @@ import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/db/prisma";
 import { requirePortalSession } from "@/lib/auth/guard";
 
-/**
- * Location: app/(admin)/admin/insurance/payers/actions.ts
- * (same folder as page.tsx — adjust only the folder, not the imports below).
- *
- * Tenant isolation rules used by every action in this file:
- *  1. The organization always comes from the authenticated portal session,
- *     never from client input.
- *  2. Every query is filtered by `organizationId` AND by `clinicId IN (clinics of
- *     that organization)` so the tenant middleware is always satisfied.
- *  3. Records are re-read with the same scope before being mutated.
- *
- * Required migration for the new columns:
- *   npx prisma migrate dev --name add_insurance_payer_nphies_tax_fields
- */
 
 const MANAGEMENT_PATH = "/admin/insurance/payers";
 const DEFAULT_PAGE_SIZE = 4;
@@ -91,7 +77,7 @@ export interface UpdatePayerInput extends PayerFormInput {
 
 const payerSelect = {
     id: true,
-    clinicId: true,
+    // MODIFIED: removed `clinicId: true` (InsuranceProvider no longer has clinicId)
     nameAr: true,
     nameEn: true,
     nphiesPayerId: true,
@@ -172,8 +158,6 @@ async function authorize() {
     }
 }
 
-type PortalSession = NonNullable<Awaited<ReturnType<typeof authorize>>>;
-
 function unauthorized<T>(): PayerActionResult<T> {
     return failure(
         "Your session has expired. Sign in and try again.",
@@ -188,47 +172,8 @@ function notFound<T>(): PayerActionResult<T> {
     );
 }
 
-async function getOrganizationClinicIds(
-    organizationId: string,
-): Promise<string[]> {
-    const clinics = await prisma.clinic.findMany({
-        where: { organizationId },
-        select: { id: true },
-    });
-
-    return clinics.map((clinic) => clinic.id);
-}
-
-/**
- * InsuranceProvider rows are stored against a clinic of the organization
- * (required by the schema), while uniqueness is enforced per organization.
- * New payers are attached to the session clinic when available, otherwise to
- * the organization's first active clinic.
- */
-async function resolveWriteClinicId(
-    session: PortalSession,
-): Promise<string | null> {
-    const clinics = await prisma.clinic.findMany({
-        where: { organizationId: session.organizationId },
-        select: { id: true, isActive: true },
-        orderBy: [{ isActive: "desc" }, { createdAt: "asc" }],
-    });
-
-    if (clinics.length === 0) return null;
-
-    const sessionClinicId = (session as unknown as { clinicId?: string })
-        .clinicId;
-
-    const preferred = clinics.find(
-        (clinic) => clinic.id === sessionClinicId && clinic.isActive,
-    );
-
-    if (preferred) return preferred.id;
-
-    const firstActive = clinics.find((clinic) => clinic.isActive);
-
-    return (firstActive ?? clinics[0]).id;
-}
+// MODIFIED: removed `getOrganizationClinicIds` and `resolveWriteClinicId`
+// (and the now-unused `PortalSession` type). Payers are organization-wide.
 
 function parsePayerInput(
     input: unknown,
@@ -308,16 +253,15 @@ function parsePayerInput(
     };
 }
 
+// MODIFIED: signature no longer takes `clinicIds`; scoped by organizationId only.
 async function findConflicts(
     organizationId: string,
-    clinicIds: string[],
     value: ParsedPayer,
     excludeId?: string,
 ): Promise<PayerFieldErrors> {
     const rows = await prisma.insuranceProvider.findMany({
         where: {
             organizationId,
-            clinicId: { in: clinicIds },
             ...(excludeId ? { id: { not: excludeId } } : {}),
             OR: [
                 { nameEn: { equals: value.nameEn, mode: "insensitive" } },
@@ -436,26 +380,9 @@ export async function getPayersAction(
                 ? input.status
                 : "ALL";
 
-        const clinicIds = await getOrganizationClinicIds(
-            session.organizationId,
-        );
-
-        if (clinicIds.length === 0) {
-            return {
-                success: true,
-                data: {
-                    payers: [],
-                    total: 0,
-                    page: 1,
-                    pageSize,
-                    totalPages: 0,
-                },
-            };
-        }
-
+        // MODIFIED: removed the clinic lookup and the `clinicId: { in }` filter.
         const where: Prisma.InsuranceProviderWhereInput = {
             organizationId: session.organizationId,
-            clinicId: { in: clinicIds },
             ...(status === "ACTIVE" ? { isActive: true } : {}),
             ...(status === "INACTIVE" ? { isActive: false } : {}),
             ...(search
@@ -533,22 +460,9 @@ export async function createPayerAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(
-            session.organizationId,
-        );
-
-        const clinicId = await resolveWriteClinicId(session);
-
-        if (!clinicId || clinicIds.length === 0) {
-            return failure(
-                "Create at least one clinic before adding insurance payers.",
-                "NO_CLINIC_AVAILABLE",
-            );
-        }
-
+        // MODIFIED: no clinic is required any more to create a payer.
         const conflicts = await findConflicts(
             session.organizationId,
-            clinicIds,
             parsed.value,
         );
 
@@ -563,7 +477,7 @@ export async function createPayerAction(
         const created = await prisma.insuranceProvider.create({
             data: {
                 organizationId: session.organizationId,
-                clinicId,
+                // MODIFIED: removed `clinicId`
                 nameAr: parsed.value.nameAr,
                 nameEn: parsed.value.nameEn,
                 nphiesPayerId: parsed.value.nphiesPayerId,
@@ -610,26 +524,19 @@ export async function updatePayerAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(
-            session.organizationId,
-        );
-
-        if (clinicIds.length === 0) return notFound();
-
+        // MODIFIED: organization-only scope (no clinic ids).
         const existing = await prisma.insuranceProvider.findFirst({
             where: {
                 id: payerId,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
             },
-            select: { id: true, clinicId: true },
+            select: { id: true },
         });
 
         if (!existing) return notFound();
 
         const conflicts = await findConflicts(
             session.organizationId,
-            clinicIds,
             parsed.value,
             existing.id,
         );
@@ -646,7 +553,6 @@ export async function updatePayerAction(
             where: {
                 id: existing.id,
                 organizationId: session.organizationId,
-                clinicId: existing.clinicId,
             },
             data: {
                 nameAr: parsed.value.nameAr,
@@ -691,19 +597,13 @@ export async function setPayerActiveStatusAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(
-            session.organizationId,
-        );
-
-        if (clinicIds.length === 0) return notFound();
-
+        // MODIFIED: organization-only scope (no clinic ids).
         const existing = await prisma.insuranceProvider.findFirst({
             where: {
                 id,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
             },
-            select: { id: true, clinicId: true },
+            select: { id: true },
         });
 
         if (!existing) return notFound();
@@ -712,7 +612,6 @@ export async function setPayerActiveStatusAction(
             where: {
                 id: existing.id,
                 organizationId: session.organizationId,
-                clinicId: existing.clinicId,
             },
             data: { isActive },
             select: payerSelect,
@@ -744,21 +643,19 @@ export async function deletePayerAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(
-            session.organizationId,
-        );
-
-        if (clinicIds.length === 0) return notFound();
-
         const result = await prisma.$transaction(
             async (tx) => {
+                // FIX: patient count comes from the relation `_count` (no direct
+                // Patient query, so the clinicId tenant guard is not triggered).
                 const payer = await tx.insuranceProvider.findFirst({
                     where: {
                         id,
                         organizationId: session.organizationId,
-                        clinicId: { in: clinicIds },
                     },
-                    select: { id: true, clinicId: true },
+                    select: {
+                        id: true,
+                        _count: { select: { patients: true } },
+                    },
                 });
 
                 if (!payer) {
@@ -767,13 +664,7 @@ export async function deletePayerAction(
 
                 // Patients reference payers with ON DELETE SET NULL, which would
                 // silently strip their insurance. Block deletion instead.
-                const patientCount = await tx.patient.count({
-                    where: {
-                        organizationId: session.organizationId,
-                        clinicId: { in: clinicIds },
-                        insuranceProviderId: payer.id,
-                    },
-                });
+                const patientCount = payer._count.patients;
 
                 if (patientCount > 0) {
                     return {
@@ -786,7 +677,6 @@ export async function deletePayerAction(
                     where: {
                         id: payer.id,
                         organizationId: session.organizationId,
-                        clinicId: payer.clinicId,
                     },
                 });
 

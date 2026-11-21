@@ -1,5 +1,20 @@
 "use client";
 
+// ============================================================================
+// DoctorsManagement.tsx
+//
+// MODIFIED (stale clinics/services fix):
+//  - Props: only `initialLocale` (page.tsx no longer passes data).
+//  - Doctors + clinic/service options are fetched on mount with useEffect via
+//    getDoctorsPageDataAction (one round trip). The effect re-runs whenever the
+//    component is shown again, so newly added / deleted clinics and services
+//    (and doctors that became unassigned) always appear without a browser reload.
+//  - Server actions are never cached, so no revalidatePath is required in the
+//    Clinics & Services actions.ts for this page, and Doctors actions.ts is
+//    unchanged.
+// Everything else (UI, unassignment logic, AR/EN) is untouched.
+// ============================================================================
+
 import {
     useCallback,
     useDeferredValue,
@@ -70,16 +85,9 @@ const MAX_TOASTS = 3;
 const OPTIONS_STALE_MS = 60_000;
 const TEMP_ID_PREFIX = "tmp-";
 
+// MODIFIED: the page only receives the locale; all data is fetched client-side.
 type DoctorsManagementProps = {
     initialLocale: Locale;
-    /** Server-fetched rows (page.tsx) so the first paint already has data. */
-    initialDoctors: DoctorRow[];
-    /** Server-fetched clinics/services for filters and the form. */
-    initialOptions: DoctorFormOptions;
-    /** Set when the server-side load failed; the UI shows the retry state. */
-    initialError: string | null;
-    /** True only for the Suspense fallback: render the frame with skeleton rows. */
-    initialLoading?: boolean;
 };
 
 type DoctorListItem = Omit<DoctorRow, "services"> & {
@@ -695,7 +703,14 @@ function buildOptimisticRow(
     };
 }
 
-async function fetchAllDoctors(): Promise<{ rows: DoctorRow[] } | { error: string | null }> {
+// MODIFIED: one server round trip now returns BOTH the doctors and the fresh
+// clinic/service options (previously only the doctors were read here and the
+// options came from page.tsx props, which could be stale after navigation).
+type PageDataResult =
+    | { rows: DoctorRow[]; options: DoctorFormOptions }
+    | { error: string | null };
+
+async function fetchPageData(): Promise<PageDataResult> {
     // Single server round trip (one action, one joined query) instead of N paged actions.
     const result = await getDoctorsPageDataAction();
 
@@ -703,7 +718,7 @@ async function fetchAllDoctors(): Promise<{ rows: DoctorRow[] } | { error: strin
         return { error: result.error ?? null };
     }
 
-    return { rows: result.data.doctors };
+    return { rows: result.data.doctors, options: result.data.options };
 }
 
 function Field({
@@ -2070,22 +2085,16 @@ function DoctorFormModal({
     );
 }
 
-export default function DoctorsManagementPage({
-    initialLocale,
-    initialDoctors,
-    initialOptions,
-    initialError,
-    initialLoading = false,
-}: DoctorsManagementProps) {
+// MODIFIED: signature now takes only `initialLocale`.
+export default function DoctorsManagementPage({ initialLocale }: DoctorsManagementProps) {
     const [locale, setLocale] = useState<Locale>(initialLocale);
     const [sidebarOpen, setSidebarOpen] = useState(false);
-    const [doctors, setDoctors] = useState<DoctorRow[]>(initialDoctors);
-    const [options, setOptions] = useState<DoctorFormOptions>(initialOptions);
-    const [loading, setLoading] = useState(initialLoading);
-    const [optionsLoading, setOptionsLoading] = useState(initialLoading);
-    const [loadError, setLoadError] = useState(
-        initialError ? (initialError === "LOAD_FAILED" ? messages[initialLocale].loadFailed : initialError) : "",
-    );
+    // MODIFIED: no server-provided data. Start empty + loading; useEffect below fetches it.
+    const [doctors, setDoctors] = useState<DoctorRow[]>([]);
+    const [options, setOptions] = useState<DoctorFormOptions>(EMPTY_OPTIONS);
+    const [loading, setLoading] = useState(true);
+    const [optionsLoading, setOptionsLoading] = useState(true);
+    const [loadError, setLoadError] = useState("");
     const [optionsError, setOptionsError] = useState("");
     const [query, setQuery] = useState("");
     const [clinicFilter, setClinicFilter] = useState("ALL");
@@ -2102,11 +2111,11 @@ export default function DoctorsManagementPage({
 
     // Always-fresh mirrors so background tasks never read stale closures.
     const tRef = useRef<Messages>(t);
-    const doctorsRef = useRef<DoctorRow[]>(initialDoctors);
-    const optionsRef = useRef<DoctorFormOptions>(initialOptions);
-    // Options arrive with the server render; when that failed, the first modal open fetches them.
-    const optionsLoadedRef = useRef(!initialError && !initialLoading);
-    const optionsFetchedAtRef = useRef(initialError || initialLoading ? 0 : Date.now());
+    // MODIFIED: refs start empty; the mount effect fills them with fresh server data.
+    const doctorsRef = useRef<DoctorRow[]>([]);
+    const optionsRef = useRef<DoctorFormOptions>(EMPTY_OPTIONS);
+    const optionsLoadedRef = useRef(false);
+    const optionsFetchedAtRef = useRef(0);
     const optionsInflightRef = useRef(false);
     const doctorsInflightRef = useRef(false);
     const queueRef = useRef(new Map<string, Promise<void>>());
@@ -2179,52 +2188,70 @@ export default function DoctorsManagementPage({
 
     /* ----------------------------- loaders --------------------------- */
 
+    // MODIFIED: stores freshly fetched clinics/services (same bookkeeping loadOptions does).
+    const applyOptions = useCallback((next: DoctorFormOptions) => {
+        optionsRef.current = next;
+        optionsLoadedRef.current = true;
+        optionsFetchedAtRef.current = Date.now();
+        setOptions(next);
+        setOptionsError("");
+    }, []);
+
+    // MODIFIED: loads doctors AND clinic/service options in one server call.
+    // Used by the mount effect (always fresh data on every visit) and the retry button.
     const loadDoctors = useCallback(async () => {
         if (doctorsInflightRef.current) return;
 
         doctorsInflightRef.current = true;
 
+        // Show skeleton rows only when there is nothing to show yet; otherwise refresh silently.
         const blocking = doctorsRef.current.length === 0;
 
         if (blocking) setLoading(true);
         setLoadError("");
 
         try {
-            const result = await fetchAllDoctors();
+            const result = await fetchPageData();
 
             if ("rows" in result) {
                 updateDoctors((current) => [
                     ...current.filter((item) => isTempId(item.id)),
                     ...result.rows,
                 ]);
-            } else {
+                applyOptions(result.options);
+            } else if (blocking) {
                 setLoadError(result.error ?? tRef.current.loadFailed);
                 updateDoctors(() => []);
             }
         } catch {
-            setLoadError(tRef.current.loadFailed);
-            updateDoctors(() => []);
+            if (blocking) {
+                setLoadError(tRef.current.loadFailed);
+                updateDoctors(() => []);
+            }
         } finally {
             doctorsInflightRef.current = false;
             setLoading(false);
+            // If options could not be loaded here, the first modal open fetches them (loadOptions).
+            setOptionsLoading(false);
         }
-    }, [updateDoctors]);
+    }, [applyOptions, updateDoctors]);
 
     // Silent reconciliation with the server, used only after a conflicting rollback.
     const resyncDoctors = useCallback(async () => {
         try {
-            const result = await fetchAllDoctors();
+            const result = await fetchPageData();
 
             if ("rows" in result) {
                 updateDoctors((current) => [
                     ...current.filter((item) => isTempId(item.id)),
                     ...result.rows,
                 ]);
+                applyOptions(result.options);
             }
         } catch {
             // Keep the current local state if the background sync fails.
         }
-    }, [updateDoctors]);
+    }, [applyOptions, updateDoctors]);
 
     // `background` refreshes never show loaders and are skipped while the cache is fresh.
     const loadOptions = useCallback(
@@ -2288,8 +2315,12 @@ export default function DoctorsManagementPage({
         [],
     );
 
-    // No mount-time fetch: page.tsx already delivered doctors + options with the HTML.
-    // loadDoctors() is only used by the retry button; loadOptions(true) by the modals.
+    // MODIFIED: fetch on mount. This effect runs every time the page is shown
+    // (fresh navigation, or a preserved route becoming visible again), so
+    // clinics, services and the doctors' unassigned state are never stale.
+    useEffect(() => {
+        void loadDoctors();
+    }, [loadDoctors]);
 
     /* --------------------- optimistic settle / rollback -------------- */
 
@@ -3118,4 +3149,4 @@ export default function DoctorsManagementPage({
             </div>
         </div>
     );
-}
+}   

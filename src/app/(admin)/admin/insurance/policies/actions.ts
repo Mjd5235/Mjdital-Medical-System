@@ -1,26 +1,5 @@
 "use server";
 
-/**
- * Policies & Tiers — server actions
- * ---------------------------------
- * - Every query is scoped by `organizationId` AND by the clinics that belong to the caller's
- *   organization (tenant isolation, same pattern as the doctors module).
- * - The client may supply the UUID of a new row (`id`). That is what lets the UI stay 100%
- *   optimistic: the temporary row already carries its final id, so follow-up actions on it
- *   (edit / toggle / delete) can be queued without waiting for the server.
- * - `policyNumber` is mandatory, normalised to upper case and validated, because NPHIES uses it as
- *   the official contract identifier.
- * - Uniqueness: a policy number must be unique PER PAYER (DB constraint: provider_id + policy_number).
- *   The server checks it first and answers with a friendly DUPLICATE_POLICY_NUMBER error; the DB
- *   constraint (P2002) remains the final safety net for races.
- * - Duplicating a policy is a UI workflow: the modal opens pre-filled with an empty policy number
- *   and the admin must type a new, unique number. It ends up in `createPolicyAction`.
- * - Activating an expired contract is rejected.
- * - Mutations are written to `audit_logs` (best effort, never blocks the response).
- * - No `revalidatePath` on purpose: the client component owns its data and revalidation would make
- *   every Server Action response heavier and slower.
- */
-
 import { AuditActionType, PolicyCopayType, Prisma } from "@prisma/client";
 import { headers } from "next/headers";
 import { prisma } from "@/lib/db/prisma";
@@ -42,7 +21,7 @@ export interface PolicyActionResult<T> {
 
 export interface PolicyProviderOption {
     id: string;
-    clinicId: string;
+    // MODIFIED: removed `clinicId`
     nameEn: string;
     nameAr: string;
     logoUrl: string | null;
@@ -51,7 +30,7 @@ export interface PolicyProviderOption {
 
 export interface PolicyRow {
     id: string;
-    clinicId: string;
+    // MODIFIED: removed `clinicId`
     providerId: string;
     providerNameEn: string;
     providerNameAr: string;
@@ -146,6 +125,13 @@ function unauthorized<T>(): PolicyActionResult<T> {
     );
 }
 
+function recordNotFound<T>(): PolicyActionResult<T> {
+    return invalid(
+        "The requested record could not be found. Refresh and try again.",
+        "RECORD_NOT_FOUND",
+    );
+}
+
 function databaseError<T>(
     action: string,
     error: unknown,
@@ -162,10 +148,7 @@ function databaseError<T>(
                     "INVALID_RELATION",
                 );
             case "P2025":
-                return invalid(
-                    "The requested record could not be found. Refresh and try again.",
-                    "RECORD_NOT_FOUND",
-                );
+                return recordNotFound();
         }
     }
 
@@ -190,16 +173,7 @@ function actorIdOf(session: PortalSession): string | null {
     return typeof id === "string" && validUuid(id) ? id : null;
 }
 
-async function getOrganizationClinicIds(
-    organizationId: string,
-): Promise<string[]> {
-    const clinics = await prisma.clinic.findMany({
-        where: { organizationId },
-        select: { id: true },
-    });
-
-    return clinics.map((clinic) => clinic.id);
-}
+// MODIFIED: removed `getOrganizationClinicIds` (policies are organization-wide).
 
 /** Today's calendar date in Riyadh as YYYY-MM-DD (contracts expire on a calendar date). */
 function todayInRiyadh(): string {
@@ -266,7 +240,7 @@ function parseDateOnly(
 function mapPolicy(policy: PolicyWithProvider): PolicyRow {
     return {
         id: policy.id,
-        clinicId: policy.clinicId,
+        // MODIFIED: removed `clinicId: policy.clinicId`
         providerId: policy.providerId,
         providerNameEn: policy.provider.nameEn,
         providerNameAr: policy.provider.nameAr,
@@ -427,20 +401,14 @@ function parsePolicyInput(
     };
 }
 
-async function findProvider(
-    organizationId: string,
-    clinicIds: string[],
-    providerId: string,
-) {
-    if (clinicIds.length === 0) return null;
-
+// MODIFIED: signature no longer takes `clinicIds`; the payer is resolved by organization only.
+async function findProvider(organizationId: string, providerId: string) {
     return prisma.insuranceProvider.findFirst({
         where: {
             id: providerId,
             organizationId,
-            clinicId: { in: clinicIds },
         },
-        select: { id: true, clinicId: true, isActive: true },
+        select: { id: true, isActive: true },
     });
 }
 
@@ -465,10 +433,10 @@ async function policyNumberTaken(
 }
 
 /** Best-effort audit trail; a logging failure must never fail the user's action. */
+// MODIFIED: removed the `clinicId` argument — audit rows for policies are organization-level.
 async function writeAudit(
     session: PortalSession,
     args: {
-        clinicId: string;
         actionType: AuditActionType;
         recordId: string;
         metadata: Prisma.InputJsonValue;
@@ -495,7 +463,6 @@ async function writeAudit(
         await prisma.auditLog.create({
             data: {
                 organizationId: session.organizationId,
-                clinicId: args.clinicId,
                 userId,
                 actionType: args.actionType,
                 targetTable: "insurance_policies",
@@ -522,21 +489,14 @@ export async function getPoliciesAction(): Promise<
     if (!session) return unauthorized();
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
-
-        if (clinicIds.length === 0) {
-            return { success: true, data: { policies: [], providers: [] } };
-        }
-
+        // MODIFIED: no clinic lookup / `clinicId: { in }` filters — organization scope only.
         const [providers, policies] = await Promise.all([
             prisma.insuranceProvider.findMany({
                 where: {
                     organizationId: session.organizationId,
-                    clinicId: { in: clinicIds },
                 },
                 select: {
                     id: true,
-                    clinicId: true,
                     nameEn: true,
                     nameAr: true,
                     logoUrl: true,
@@ -547,7 +507,6 @@ export async function getPoliciesAction(): Promise<
             prisma.insurancePolicy.findMany({
                 where: {
                     organizationId: session.organizationId,
-                    clinicId: { in: clinicIds },
                 },
                 include: policyInclude,
                 orderBy: [{ createdAt: "desc" }, { id: "asc" }],
@@ -596,10 +555,8 @@ export async function createPolicyAction(
     const data = parsed.data;
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
         const provider = await findProvider(
             session.organizationId,
-            clinicIds,
             data.providerId,
         );
 
@@ -628,7 +585,7 @@ export async function createPolicyAction(
             data: {
                 ...(requestedId ? { id: requestedId } : {}),
                 organizationId: session.organizationId,
-                clinicId: provider.clinicId,
+                // MODIFIED: removed `clinicId: provider.clinicId`
                 providerId: provider.id,
                 nameEn: data.nameEn,
                 nameAr: data.nameAr ?? null,
@@ -643,7 +600,6 @@ export async function createPolicyAction(
         });
 
         void writeAudit(session, {
-            clinicId: created.clinicId,
             actionType: AuditActionType.CREATE,
             recordId: created.id,
             metadata: {
@@ -684,34 +640,19 @@ export async function updatePolicyAction(
     const data = parsed.data;
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
-
-        if (clinicIds.length === 0) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
+        // MODIFIED: organization-only scope (no clinic ids).
         const existing = await prisma.insurancePolicy.findFirst({
             where: {
                 id: policyId,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
             },
-            select: { id: true, clinicId: true, providerId: true },
+            select: { id: true, providerId: true },
         });
 
-        if (!existing) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
+        if (!existing) return recordNotFound();
 
         const provider = await findProvider(
             session.organizationId,
-            clinicIds,
             data.providerId,
         );
 
@@ -743,7 +684,7 @@ export async function updatePolicyAction(
                 organizationId: session.organizationId,
             },
             data: {
-                clinicId: provider.clinicId,
+                // MODIFIED: removed `clinicId: provider.clinicId`
                 providerId: provider.id,
                 nameEn: data.nameEn,
                 ...(data.nameAr !== undefined ? { nameAr: data.nameAr } : {}),
@@ -758,7 +699,6 @@ export async function updatePolicyAction(
         });
 
         void writeAudit(session, {
-            clinicId: updated.clinicId,
             actionType: AuditActionType.UPDATE,
             recordId: updated.id,
             metadata: {
@@ -798,30 +738,16 @@ export async function setPolicyActiveStatusAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
-
-        if (clinicIds.length === 0) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
+        // MODIFIED: organization-only scope (no clinic ids).
         const existing = await prisma.insurancePolicy.findFirst({
             where: {
                 id,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
             },
-            select: { id: true, clinicId: true, expiryDate: true },
+            select: { id: true, expiryDate: true },
         });
 
-        if (!existing) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
+        if (!existing) return recordNotFound();
 
         if (isActive && isExpiredDate(existing.expiryDate)) {
             return invalid(
@@ -840,7 +766,6 @@ export async function setPolicyActiveStatusAction(
         });
 
         void writeAudit(session, {
-            clinicId: updated.clinicId,
             actionType: AuditActionType.UPDATE,
             recordId: updated.id,
             metadata: {
@@ -874,40 +799,23 @@ export async function deletePolicyAction(
     }
 
     try {
-        const clinicIds = await getOrganizationClinicIds(session.organizationId);
-
-        if (clinicIds.length === 0) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
+        // FIX: linked patients are counted through the relation `_count`
+        // (no direct Patient query, so the clinicId tenant guard is not triggered).
         const existing = await prisma.insurancePolicy.findFirst({
             where: {
                 id,
                 organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
             },
-            select: { id: true, clinicId: true, policyNumber: true },
-        });
-
-        if (!existing) {
-            return invalid(
-                "The requested record could not be found. Refresh and try again.",
-                "RECORD_NOT_FOUND",
-            );
-        }
-
-        const linkedPatients = await prisma.patient.count({
-            where: {
-                organizationId: session.organizationId,
-                clinicId: { in: clinicIds },
-                insurancePolicyId: existing.id,
+            select: {
+                id: true,
+                policyNumber: true,
+                _count: { select: { patients: true } },
             },
         });
 
-        if (linkedPatients > 0) {
+        if (!existing) return recordNotFound();
+
+        if (existing._count.patients > 0) {
             return invalid(
                 "This policy is assigned to patients. Deactivate it instead of deleting it.",
                 "POLICY_IN_USE",
@@ -922,7 +830,6 @@ export async function deletePolicyAction(
         });
 
         void writeAudit(session, {
-            clinicId: existing.clinicId,
             actionType: AuditActionType.DELETE,
             recordId: existing.id,
             metadata: { policyNumber: existing.policyNumber },

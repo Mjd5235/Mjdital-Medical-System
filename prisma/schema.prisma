@@ -330,16 +330,15 @@ model Clinic {
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
 
-  doctors            Doctor[]
-  patients           Patient[]
-  appointments       Appointment[]
-  auditLogs          AuditLog[]
-  invoices           Invoice[]
-  insuranceProviders InsuranceProvider[]
-  insurancePolicies  InsurancePolicy[]
-  services           Service[]
-  servicePrices      ServicePrice[]
-  shifts             Shift[]
+  doctors      Doctor[]
+  patients     Patient[]
+  appointments Appointment[]
+  auditLogs    AuditLog[]
+  invoices     Invoice[]
+  // MODIFIED: removed `insuranceProviders` and `insurancePolicies` back-relations (payers/policies are organization-wide now).
+  services      Service[]
+  servicePrices ServicePrice[]
+  shifts        Shift[]
 
   @@index([organizationId, isActive, nameEn])
   @@map("clinics")
@@ -380,6 +379,7 @@ model Service {
 /// - vatCategory / vatRate: لقطة الضريبة وقت الحفظ (المصدر: الخادم فقط).
 /// - priceInclVat: السعر شامل الضريبة (يُحسب في الخادم بتقريب HALF_UP لخانتين).
 /// - (serviceId, policyId) فريد: سعر واحد لكل خدمة داخل كل وثيقة.
+/// - clinicId: عيادة الخدمة (لقطة من الخدمة) — الوثيقة نفسها على مستوى المؤسسة وليست مرتبطة بعيادة.
 /// الفواتير الصادرة تحتفظ بمبالغها الخاصة، لذا حذف السعر لا يغيّر الفواتير السابقة.
 model ServicePrice {
   id             String      @id @default(uuid()) @db.Uuid
@@ -633,7 +633,6 @@ model AuditLog {
 model InsuranceProvider {
   id             String   @id @default(uuid()) @db.Uuid
   organizationId String   @map("organization_id") @db.Uuid
-  clinicId       String   @map("clinic_id") @db.Uuid
   nameAr         String   @map("name_ar")
   nameEn         String   @map("name_en")
   /// Official payer identifier registered on the NPHIES platform.
@@ -647,7 +646,6 @@ model InsuranceProvider {
   updatedAt      DateTime @updatedAt @map("updated_at")
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
-  clinic       Clinic       @relation(fields: [clinicId], references: [id], onDelete: Restrict)
 
   patients Patient[]
   policies InsurancePolicy[]
@@ -656,20 +654,12 @@ model InsuranceProvider {
   @@unique([organizationId, nphiesPayerId])
   @@unique([organizationId, taxNumber])
   @@index([organizationId])
-  @@index([organizationId, clinicId])
   @@map("insurance_providers")
 }
 
-/// وثيقة / فئة تأمينية (Plan / Tier) مرتبطة بشركة تأمين، مع قواعد مشاركة المريض.
-/// - policyNumber: رقم الوثيقة / العقد الرسمي المطلوب للتكامل مع منصة NPHIES (فريد داخل المؤسسة).
-/// - copayType = PERCENTAGE: copayValue نسبة (0..100) و maxPatientShare سقف اختياري بالريال.
-/// - copayType = FIXED_AMOUNT: copayValue مبلغ ثابت بالريال و maxPatientShare = null.
-/// - expiryDate: تاريخ انتهاء العقد (تاريخ فقط بدون وقت).
-/// - servicePrices: أسعار الخدمات المتعاقد عليها ضمن هذه الوثيقة.
 model InsurancePolicy {
   id              String          @id @default(uuid()) @db.Uuid
   organizationId  String          @map("organization_id") @db.Uuid
-  clinicId        String          @map("clinic_id") @db.Uuid
   providerId      String          @map("provider_id") @db.Uuid
   nameEn          String          @map("name_en")
   nameAr          String?         @map("name_ar")
@@ -683,7 +673,6 @@ model InsurancePolicy {
   updatedAt       DateTime        @updatedAt @map("updated_at")
 
   organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
-  clinic       Clinic            @relation(fields: [clinicId], references: [id], onDelete: Restrict)
   provider     InsuranceProvider @relation(fields: [providerId], references: [id], onDelete: Restrict)
 
   patients      Patient[]
@@ -691,7 +680,7 @@ model InsurancePolicy {
 
   @@unique([providerId, policyNumber])
   @@index([organizationId])
-  @@index([organizationId, clinicId])
+  // MODIFIED: removed @@index([organizationId, clinicId])
   @@index([organizationId, providerId])
   @@index([organizationId, policyNumber])
   @@index([organizationId, isActive])

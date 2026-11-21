@@ -5,8 +5,10 @@
  * --------------------------------
  * Tenant isolation
  *   - Every query is scoped by `session.organizationId` (and `clinicId` where the model has it).
- *   - Contract prices can only reference a service and a policy that belong to the SAME clinic and
- *     organization as the session, and the policy/payer must still be active and not expired.
+ *   - Insurance payers & policies are ORGANIZATION-WIDE (no clinic binding): any active, non-expired
+ *     policy of the session organization can be priced for ANY service in ANY clinic.
+ *   - Contract prices can only reference a service and a policy that belong to the SAME organization
+ *     as the session, and the policy/payer must still be active and not expired.
  *
  * ZATCA / medical-tax compliance
  *   - The VAT rate is NEVER accepted from the client. The client only sends a category
@@ -45,9 +47,9 @@ export interface PricingClinicOption {
     nameAr: string;
 }
 
+// MODIFIED: removed `clinicId` — policies are organization-wide.
 export interface PricingPolicyOption {
     id: string;
-    clinicId: string;
     providerId: string;
     providerNameEn: string;
     providerNameAr: string;
@@ -367,8 +369,9 @@ function failure<T>(action: string, error: unknown): PricingActionResult<T> {
                     "SERVICE_NOT_AVAILABLE",
                 );
             case "POLICY_NOT_AVAILABLE":
+                // MODIFIED: removed "belongs to another clinic" — policies are organization-wide.
                 return invalid(
-                    "The selected contract is inactive, expired, or belongs to another clinic.",
+                    "The selected contract is inactive, expired, or no longer available.",
                     "POLICY_NOT_AVAILABLE",
                 );
             case "DUPLICATE_PRICE":
@@ -444,6 +447,7 @@ export async function getPricingDataAction(): Promise<PricingActionResult<Pricin
                 select: { id: true, nameEn: true, nameAr: true },
                 orderBy: { nameEn: "asc" },
             }),
+            // MODIFIED: organization-wide policies — no clinicId filter / select.
             prisma.insurancePolicy.findMany({
                 where: {
                     organizationId,
@@ -453,7 +457,6 @@ export async function getPricingDataAction(): Promise<PricingActionResult<Pricin
                 },
                 select: {
                     id: true,
-                    clinicId: true,
                     providerId: true,
                     nameEn: true,
                     nameAr: true,
@@ -472,7 +475,6 @@ export async function getPricingDataAction(): Promise<PricingActionResult<Pricin
                 clinics,
                 policies: policies.map((policy) => ({
                     id: policy.id,
-                    clinicId: policy.clinicId,
                     providerId: policy.providerId,
                     providerNameEn: policy.provider.nameEn,
                     providerNameAr: policy.provider.nameAr,
@@ -582,11 +584,11 @@ export async function createServicePriceAction(
                     throw new Error("POLICY_NOT_AVAILABLE");
                 }
 
+                // MODIFIED: policy lookup is organization-wide — removed `clinicId: service.clinicId`.
                 const policy = await tx.insurancePolicy.findFirst({
                     where: {
                         id: policyId,
                         organizationId,
-                        clinicId: service.clinicId,
                         isActive: true,
                         provider: { is: { organizationId, isActive: true } },
                         OR: [{ expiryDate: null }, { expiryDate: { gte: riyadhToday() } }],
@@ -607,6 +609,7 @@ export async function createServicePriceAction(
                     throw new Error("DUPLICATE_PRICE");
                 }
 
+                // ServicePrice keeps the SERVICE's clinicId (snapshot); the policy itself has no clinic.
                 const created = await tx.servicePrice.create({
                     data: {
                         organizationId,

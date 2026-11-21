@@ -391,7 +391,7 @@ function buildRow(
 
     return {
         id,
-        clinicId: provider.clinicId,
+        // MODIFIED: removed `clinicId: provider.clinicId` (policies are organization-wide)
         providerId: provider.id,
         providerNameEn: provider.nameEn,
         providerNameAr: provider.nameAr,
@@ -1367,7 +1367,6 @@ function PolicyModal({
                                 error={errors.expiryDate}
                             >
                                 <span className="relative block">
-                                    <CalendarDays className="pointer-events-none absolute end-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
                                     <input
                                         id={`${baseId}-expiry`}
                                         type="date"

@@ -138,7 +138,8 @@ const en = {
     insurance: "Insurance Contract",
     payerContract: "Insurance Payer & Contract",
     selectContract: "Select a payer & contract",
-    noContractsForService: "No available contracts for this service's clinic",
+    // MODIFIED: contracts are organization-wide, so the message is no longer clinic-specific.
+    noContractsForService: "No available contracts for this service",
     priceExVat: "Price Excluding VAT",
     vatRate: "VAT Rate",
     vatStandard: "15% Standard VAT",
@@ -217,7 +218,8 @@ const ar: Messages = {
     insurance: "عقد تأمين",
     payerContract: "شركة التأمين والعقد",
     selectContract: "اختر شركة التأمين والعقد",
-    noContractsForService: "لا توجد عقود متاحة لعيادة هذه الخدمة",
+    // MODIFIED: contracts are organization-wide, so the message is no longer clinic-specific.
+    noContractsForService: "لا توجد عقود متاحة لهذه الخدمة",
     priceExVat: "السعر قبل الضريبة",
     vatRate: "نسبة الضريبة",
     vatStandard: "15% ضريبة قياسية",
@@ -800,14 +802,15 @@ function PricingModal({
         [services, locale],
     );
 
+    // MODIFIED: payers/policies are organization-wide — no clinic filtering; only hide
+    // policies this service already has a price for (when creating).
     const contractOptions = useMemo<SelectOption[]>(() => {
         if (!service) return [];
 
         return policies
             .filter(
                 (policy) =>
-                    policy.clinicId === service.clinicId &&
-                    (isEdit || !service.contracts.some((contract) => contract.policyId === policy.id)),
+                    isEdit || !service.contracts.some((contract) => contract.policyId === policy.id),
             )
             .map((policy) => ({ value: policy.id, label: policyLabel(policy, locale) }));
     }, [policies, service, isEdit, locale]);
@@ -974,7 +977,7 @@ function PricingModal({
                                         }}
                                         placeholder="0.00"
                                         aria-invalid={submitted && !!errors.price}
-                                        className={`${baseInput} pe-16 text-start ${submitted && errors.price ? "border-rose-500" : ""
+                                        className={`${baseInput} ${isRtl ? "ps-16" : "pe-16"} text-start ${submitted && errors.price ? "border-rose-500" : ""
                                             }`}
                                     />
                                     <span className="pointer-events-none absolute end-0 top-0 flex h-full w-14 items-center justify-center border-s border-slate-200 text-sm font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
