@@ -596,8 +596,8 @@ export async function deleteClinicAction(
                 await tx.patient.count({ where: { organizationId, clinicId } }),
                 await tx.appointment.count({ where: { organizationId, clinicId } }),
                 await tx.invoice.count({ where: { organizationId, clinicId } }),
-                await tx.insuranceProvider.count({ where: { organizationId, clinicId } }),
-                await tx.insurancePolicy.count({ where: { organizationId, clinicId } }),
+                await tx.insuranceProvider.count({ where: { organizationId } }),
+                await tx.insurancePolicy.count({ where: { organizationId } }),
             ];
 
             const blockers: string[] = [];
