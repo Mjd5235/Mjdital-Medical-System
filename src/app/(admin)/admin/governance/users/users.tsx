@@ -1508,7 +1508,7 @@ function UserFormDialog({
                                         autoComplete="new-password"
                                         maxLength={128}
                                         aria-invalid={Boolean(errors.temporaryPassword)}
-                                        className={`${baseInput} font-mono ${isRtl ? "ps-44 pe-10 text-end" : "ps-10 pe-44"}`}
+                                        className={`${baseInput} font-mono ps-10 pe-44 text-start`}
                                     />
                                     <div
                                         className={`absolute top-1/2 flex -translate-y-1/2 items-center gap-0.5 ${isRtl ? "start-1.5" : "end-1.5"}`}
