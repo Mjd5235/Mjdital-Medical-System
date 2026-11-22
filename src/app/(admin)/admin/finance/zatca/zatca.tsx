@@ -223,6 +223,8 @@ const en = {
     csidSuccess: "CSID certified successfully by ZATCA.",
     csidFailed: "CSID generation failed. Please try again.",
     otpRequired: "Enter the 6-digit OTP first.",
+    technicalDetails: "Technical details",
+    copyDetails: "Copy details",
 };
 
 type Messages = typeof en;
@@ -334,6 +336,8 @@ const ar: Messages = {
     csidSuccess: "تم اعتماد CSID بنجاح من هيئة الزكاة.",
     csidFailed: "فشل إنشاء CSID. حاول مرة أخرى.",
     otpRequired: "أدخل رمز OTP المكوّن من 6 أرقام أولاً.",
+    technicalDetails: "تفاصيل تقنية",
+    copyDetails: "نسخ التفاصيل",
 };
 
 const messages: Record<Locale, Messages> = { en, ar };
@@ -400,6 +404,36 @@ function formatTime(iso: string, locale: Locale): string {
 
 function formatDateTime(iso: string, locale: Locale): string {
     return `${formatDate(iso, locale)} · ${formatTime(iso, locale)}`;
+}
+
+/**
+ * Server messages arrive as "English \u2014 Arabic", optionally followed by a diagnostics line
+ * ("[HTTP 400 /path] {json}"). The user sees only the half for the current page language; the
+ * diagnostics are returned separately so the UI can tuck them into a collapsible section.
+ */
+function splitError(message: string, locale: Locale): { text: string; details: string } {
+    const [main, ...rest] = message.split("\n");
+    const index = main.lastIndexOf(" \u2014 ");
+    const text =
+        index === -1 ? main : locale === "ar" ? main.slice(index + 3) : main.slice(0, index);
+
+    return { text, details: prettyDetails(rest.join("\n").trim()) };
+}
+
+function prettyDetails(raw: string): string {
+    const start = raw.indexOf("{");
+
+    if (start === -1) return raw;
+
+    try {
+        return `${raw.slice(0, start).trim()}\n${JSON.stringify(JSON.parse(raw.slice(start)), null, 2)}`;
+    } catch {
+        return raw;
+    }
+}
+
+function localizeError(message: string, locale: Locale): string {
+    return splitError(message, locale).text;
 }
 
 function mergeRows(
@@ -1850,6 +1884,9 @@ export default function ZatcaIntegrationPage({ initialLocale }: ZatcaIntegration
         { label: t.postal, value: profile.postalCode },
     ];
 
+    const otpParts = otpError ? splitError(otpError, locale) : null;
+    const otpDetails = otpParts?.details ?? "";
+
     const generateDisabled =
         isCertifying || booting || otp.length !== OTP_LENGTH || !profile.complete;
 
@@ -1899,7 +1936,7 @@ export default function ZatcaIntegrationPage({ initialLocale }: ZatcaIntegration
                             >
                                 <span className="flex items-center gap-2">
                                     <CircleAlert className="h-5 w-5 shrink-0" />
-                                    {bootError}
+                                    {localizeError(bootError, locale)}
                                 </span>
                                 <button
                                     type="button"
@@ -2035,8 +2072,29 @@ export default function ZatcaIntegrationPage({ initialLocale }: ZatcaIntegration
                                         }`}
                                     role={otpError ? "alert" : undefined}
                                 >
-                                    {otpError || t.otpHelp}
+                                    {otpParts ? otpParts.text : t.otpHelp}
                                 </p>
+                                {otpDetails ? (
+                                    <details className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-300">
+                                        <summary className="cursor-pointer select-none font-semibold">
+                                            {t.technicalDetails}
+                                        </summary>
+                                        <pre
+                                            dir="ltr"
+                                            className="mt-2 whitespace-pre-wrap break-all text-start font-mono"
+                                        >
+                                            {otpDetails}
+                                        </pre>
+                                        <button
+                                            type="button"
+                                            onClick={() => void copyText(otpDetails)}
+                                            className="mt-2 inline-flex items-center gap-1.5 font-semibold text-teal-600 hover:underline dark:text-teal-400"
+                                        >
+                                            <Copy className="h-3.5 w-3.5" />
+                                            {t.copyDetails}
+                                        </button>
+                                    </details>
+                                ) : null}
 
                                 <button
                                     type="button"
@@ -2149,7 +2207,7 @@ export default function ZatcaIntegrationPage({ initialLocale }: ZatcaIntegration
                                                 <td colSpan={columns.length} className="px-6 py-14 text-center">
                                                     <CircleAlert className="mx-auto h-8 w-8 text-rose-500" />
                                                     <p className="mt-3 text-sm font-medium text-slate-700 dark:text-slate-200">
-                                                        {logError}
+                                                        {localizeError(logError, locale)}
                                                     </p>
                                                     <button
                                                         type="button"
@@ -2365,7 +2423,7 @@ export default function ZatcaIntegrationPage({ initialLocale }: ZatcaIntegration
                         )}
 
                         <p className="min-w-0 flex-1 break-words text-slate-900 dark:text-slate-100">
-                            {toast.message}
+                            {localizeError(toast.message, locale)}
                         </p>
 
                         <button
