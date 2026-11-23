@@ -146,6 +146,36 @@ enum ZatcaResponseStatus {
   @@map("zatca_response_status")
 }
 
+/// نوع معاملة منصة نفيس (NPHIES).
+/// - ELIGIBILITY: التحقق من أهلية التغطية التأمينية (الاستقبال).
+/// - PRE_AUTHORIZATION: طلب الموافقة المسبقة (بوابة الطبيب).
+/// - CLAIM: تقديم المطالبة بعد الزيارة.
+/// - E_PRESCRIPTION: الوصفة الإلكترونية / مطالبة الصيدلية.
+/// - POLL: متابعة حالة الطلبات المعلّقة (Task / Status Check).
+enum NphiesTransactionType {
+  ELIGIBILITY
+  PRE_AUTHORIZATION
+  CLAIM
+  E_PRESCRIPTION
+  POLL
+
+  @@map("nphies_transaction_type")
+}
+
+/// حالة معاملة نفيس كما تُسجَّل في سجل التدقيق (مطابقة لـ ClaimResponse.outcome).
+/// - COMPLETE: اكتملت المعالجة (موافقة / نتيجة نهائية).
+/// - QUEUED: قيد المراجعة لدى شركة التأمين (تحتاج Poll).
+/// - PARTIAL: موافقة جزئية (بعض البنود مرفوضة).
+/// - ERROR: رفض أو خطأ في الرسالة / النقل.
+enum NphiesTransactionStatus {
+  COMPLETE
+  QUEUED
+  PARTIAL
+  ERROR
+
+  @@map("nphies_transaction_status")
+}
+
 /// المؤسسة الرئيسية والمستأجر (Tenant) في النظام.
 
 model Organization {
@@ -165,6 +195,7 @@ model Organization {
   zatcaConfig        ZatcaConfig?
   zatcaCredentials   ZatcaCredential[]
   zatcaTransmissions ZatcaTransmission[]
+  nphiesTransactions NphiesTransaction[]
   users              User[]
   clinics            Clinic[]
   doctors            Doctor[]
@@ -308,6 +339,38 @@ model ZatcaTransmission {
   @@index([organizationId, invoiceUuid])
   @@index([invoiceId])
   @@map("zatca_transmissions")
+}
+
+/// سجل تدقيق معاملات منصة نفيس (NPHIES) — HL7 FHIR R4.
+/// - transactionType: نوع المعاملة (أهلية / موافقة مسبقة / مطالبة / وصفة إلكترونية / متابعة).
+/// - referenceNumber: الرقم المرجعي للطلب لدى مجديتال (مثال: PRA-20261123-A1B2C3D4).
+///   معاملات POLL تحمل الرقم المرجعي للطلب الأصلي ليمكن تتبّع السلسلة كاملة.
+/// - patientNationalId: رقم الهوية الوطنية / الإقامة كما أُرسل (قد يكون غير صالح عند اختبار التحقق).
+/// - requestPayload: { portalRequest, fhirBundle } — الطلب المبسّط وحزمة FHIR المرسلة.
+/// - responsePayload: { portalResult, error, fhirBundle } — النتيجة المطبّعة وحزمة FHIR المستلمة.
+/// - mode: SIMULATOR | PRODUCTION وقت التنفيذ.
+/// - latencyMs: زمن الاستجابة الكلي بالميلي ثانية.
+/// سجل إلحاقي (Append-only) باستثناء تحديث status للطلبات المعلّقة بعد Poll ناجح.
+model NphiesTransaction {
+  id                String                  @id @default(uuid()) @db.Uuid
+  organizationId    String                  @map("organization_id") @db.Uuid
+  transactionType   NphiesTransactionType   @map("transaction_type")
+  referenceNumber   String                  @map("reference_number") @db.VarChar(64)
+  patientNationalId String                  @map("patient_national_id") @db.VarChar(20)
+  requestPayload    Json                    @map("request_payload")
+  responsePayload   Json                    @map("response_payload")
+  status            NphiesTransactionStatus
+  mode              String                  @default("SIMULATOR") @db.VarChar(12)
+  latencyMs         Int                     @map("latency_ms")
+  createdAt         DateTime                @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, referenceNumber])
+  @@index([organizationId, patientNationalId, createdAt])
+  @@index([organizationId, transactionType, status])
+  @@map("nphies_transactions")
 }
 
 

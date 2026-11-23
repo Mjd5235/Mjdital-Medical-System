@@ -1,5 +1,10 @@
-import { PortalDashboardPage } from "@/components/portal/dashboard-page";
+import { getLocale } from "@/lib/i18n/get-locale";
+import FrontDeskToday from "./FrontDeskToday";
 
-export default function ReceptionDashboardPage() {
-  return <PortalDashboardPage portal="reception" />;
+export const instant = false;
+
+export default async function ReceptionFrontDeskPage() {
+    const locale = await getLocale();
+
+    return <FrontDeskToday initialLocale={locale} />;
 }
