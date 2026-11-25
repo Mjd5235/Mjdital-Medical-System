@@ -33,6 +33,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { DoctorProfessionalRank, IdentityType } from "@prisma/client";
 import {
     Activity,
+    Banknote,
     BriefcaseMedical,
     Building2,
     Check,
@@ -84,6 +85,8 @@ const TOAST_MS = 8000;
 const MAX_TOASTS = 3;
 const OPTIONS_STALE_MS = 60_000;
 const TEMP_ID_PREFIX = "tmp-";
+/** Upper bound (SAR) accepted for a doctor's consultation fee (mirrors the server). */
+const MAX_CONSULTATION_FEE = 1_000_000;
 
 // MODIFIED: the page only receives the locale; all data is fetched client-side.
 type DoctorsManagementProps = {
@@ -125,7 +128,8 @@ type FormErrors = Partial<
         | "specialty"
         | "clinicId"
         | "serviceIds"
-        | "commissionRate",
+        | "commissionRate"
+        | "consultationFee",
         string
     >
 >;
@@ -193,6 +197,8 @@ const messages = {
         license: "SCFHS License No.",
         clinicService: "Clinic & Service",
         commission: "Commission Rate",
+        consultationFee: "Consultation Fee",
+        sar: "SAR",
         status: "Account Status",
         actions: "Actions",
         active: "Active",
@@ -243,6 +249,8 @@ const messages = {
         noClinics: "No active clinics available.",
         commissionInput: "Doctor Commission (%)",
         commissionPlaceholder: "e.g. 12",
+        consultationFeeInput: "Consultation Fee (SAR)",
+        consultationFeePlaceholder: "e.g. 250",
         save: "Save Doctor",
         saveEdit: "Save Changes",
         saving: "Creating doctor…",
@@ -278,6 +286,8 @@ const messages = {
         invalidClinic: "Select an active clinic.",
         invalidServices: "Select at least one service from the selected clinic.",
         invalidCommission: "Enter a commission between 0 and 100 with at most two decimal places.",
+        invalidConsultationFee:
+            "Enter a consultation fee between 0 and 1,000,000 SAR with at most two decimal places.",
         failed: "The operation could not be completed. Please try again.",
         success: "Doctor created successfully. Share the temporary password with the doctor securely.",
         updated: "Practitioner updated successfully.",
@@ -311,6 +321,8 @@ const messages = {
         license: "رقم ترخيص الهيئة",
         clinicService: "العيادة والخدمة",
         commission: "نسبة العمولة",
+        consultationFee: "سعر الكشفية",
+        sar: "ر.س",
         status: "حالة الحساب",
         actions: "الإجراءات",
         active: "نشط",
@@ -361,6 +373,8 @@ const messages = {
         noClinics: "لا توجد عيادات نشطة.",
         commissionInput: "عمولة الطبيب (%)",
         commissionPlaceholder: "مثال: 12",
+        consultationFeeInput: "سعر الكشفية (ر.س)",
+        consultationFeePlaceholder: "مثال: 250",
         save: "حفظ الطبيب",
         saveEdit: "حفظ التعديلات",
         saving: "جارٍ إنشاء الطبيب…",
@@ -394,6 +408,8 @@ const messages = {
         invalidClinic: "اختر عيادة نشطة.",
         invalidServices: "اختر خدمة واحدة على الأقل من العيادة المحددة.",
         invalidCommission: "أدخل عمولة بين 0 و100 وبحد أقصى منزلتين عشريتين.",
+        invalidConsultationFee:
+            "أدخل سعر كشفية بين 0 و1,000,000 ريال وبحد أقصى منزلتين عشريتين.",
         failed: "تعذر إكمال العملية. يرجى المحاولة مرة أخرى.",
         success: "تم إنشاء الطبيب بنجاح. شارك كلمة المرور المؤقتة مع الطبيب بطريقة آمنة.",
         updated: "تم تحديث بيانات الممارس بنجاح.",
@@ -526,6 +542,18 @@ function initials(name: string): string {
 
 function maskIdentity(value: string): string {
     return value.length > 4 ? `${value.slice(0, 2)}•••••${value.slice(-4)}` : value;
+}
+
+/** Formats a consultation fee string (e.g. "250.00") as "1,250.00" with Latin digits. */
+function formatConsultationFee(value: string): string {
+    const amount = Number(value);
+
+    if (!Number.isFinite(amount)) return value;
+
+    return amount.toLocaleString("en-US", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+    });
 }
 
 /** Page buttons with ellipses, e.g. 1 2 3 4 5 … 12 (matches the reference design). */
@@ -695,6 +723,7 @@ function buildOptimisticRow(
         clinicName: clinic?.nameEn ?? fallbackClinic?.clinicName ?? "",
         clinicNameAr: clinic?.nameAr ?? fallbackClinic?.clinicNameAr ?? "",
         commissionRate: String(input.commissionRate),
+        consultationFee: Number(input.consultationFee).toFixed(2),
         isActive,
         mustChangePassword,
         accountStatus: deriveAccountStatus(isActive, true, mustChangePassword),
@@ -1165,7 +1194,7 @@ function SkeletonRows() {
                             </div>
                         </div>
                     </td>
-                    {[96, 112, 160, 48, 96].map((width, cell) => (
+                    {[96, 112, 160, 48, 72, 96].map((width, cell) => (
                         <td key={cell} className="px-4 py-5 align-middle">
                             <div
                                 className="h-4 rounded bg-slate-200 dark:bg-slate-800"
@@ -1408,6 +1437,8 @@ function validateForm(
     const specialty = String(data.get("specialty") ?? "").trim();
     const commissionText = String(data.get("commissionRate") ?? "").trim();
     const commissionRate = Number(commissionText);
+    const consultationFeeText = String(data.get("consultationFee") ?? "").trim();
+    const consultationFee = Number(consultationFeeText);
     const { clinicId, temporaryPassword, isEdit } = extras;
 
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -1484,6 +1515,16 @@ function validateForm(
         errors.commissionRate = t.invalidCommission;
     }
 
+    if (
+        consultationFeeText === "" ||
+        !Number.isFinite(consultationFee) ||
+        consultationFee < 0 ||
+        consultationFee > MAX_CONSULTATION_FEE ||
+        !/^\d{1,7}(?:\.\d{1,2})?$/.test(consultationFeeText)
+    ) {
+        errors.consultationFee = t.invalidConsultationFee;
+    }
+
     if (Object.keys(errors).length > 0) {
         return { errors };
     }
@@ -1502,6 +1543,7 @@ function validateForm(
             clinicId,
             serviceIds,
             commissionRate,
+            consultationFee,
             temporaryPassword,
         },
     };
@@ -2040,6 +2082,31 @@ function DoctorFormModal({
                                             className={`${baseInput} h-12 ${ltrInputPadding}`}
                                             aria-invalid={Boolean(errors.commissionRate)}
                                             onChange={() => clearError("commissionRate")}
+                                        />
+                                    </span>
+                                </Field>
+
+                                <Field
+                                    id="doctor-consultation-fee"
+                                    label={t.consultationFeeInput}
+                                    error={errors.consultationFee}
+                                >
+                                    <span className="relative block">
+                                        <Banknote className="pointer-events-none absolute start-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-500 dark:text-slate-400" />
+                                        <input
+                                            id="doctor-consultation-fee"
+                                            name="consultationFee"
+                                            defaultValue={doctor?.consultationFee ?? ""}
+                                            placeholder={t.consultationFeePlaceholder}
+                                            type="number"
+                                            inputMode="decimal"
+                                            min="0"
+                                            max={MAX_CONSULTATION_FEE}
+                                            step="0.01"
+                                            dir="ltr"
+                                            className={`${baseInput} h-12 ${ltrInputPadding}`}
+                                            aria-invalid={Boolean(errors.consultationFee)}
+                                            onChange={() => clearError("consultationFee")}
                                         />
                                     </span>
                                 </Field>
@@ -2828,7 +2895,7 @@ export default function DoctorsManagementPage({ initialLocale }: DoctorsManageme
                             ) : (
                                 <>
                                     <div className="overflow-x-auto">
-                                        <table className="w-full min-w-[1000px] border-collapse text-start">
+                                        <table className="w-full min-w-[1120px] border-collapse text-start">
                                             <caption className="sr-only">
                                                 {loading ? t.loading : t.title}
                                             </caption>
@@ -2839,6 +2906,7 @@ export default function DoctorsManagementPage({ initialLocale }: DoctorsManageme
                                                     <th className="px-4 py-5 text-start align-middle">{t.license}</th>
                                                     <th className="px-4 py-5 text-start align-middle">{t.clinicService}</th>
                                                     <th className="px-4 py-5 text-start align-middle">{t.commission}</th>
+                                                    <th className="px-4 py-5 text-start align-middle">{t.consultationFee}</th>
                                                     <th className="px-4 py-5 text-start align-middle">{t.status}</th>
                                                     <th className="w-40 px-4 py-5 text-end align-middle">{t.actions}</th>
                                                 </tr>
@@ -2853,7 +2921,7 @@ export default function DoctorsManagementPage({ initialLocale }: DoctorsManageme
                                                 ) : visibleDoctors.length === 0 ? (
                                                     <tr>
                                                         <td
-                                                            colSpan={7}
+                                                            colSpan={8}
                                                             className="h-56 text-center align-middle text-sm text-slate-500 dark:text-slate-400"
                                                         >
                                                             <div className="flex flex-col items-center gap-3">
@@ -2937,6 +3005,15 @@ export default function DoctorsManagementPage({ initialLocale }: DoctorsManageme
 
                                                                 <td className="px-4 py-5 align-middle text-base text-slate-900 dark:text-slate-100">
                                                                     <span dir="ltr">{doctor.commissionRate}%</span>
+                                                                </td>
+
+                                                                <td className="px-4 py-5 align-middle text-base text-slate-900 dark:text-slate-100">
+                                                                    <span dir="ltr" className="whitespace-nowrap">
+                                                                        {formatConsultationFee(doctor.consultationFee)}{" "}
+                                                                        <span className="text-sm text-slate-500 dark:text-slate-400">
+                                                                            {t.sar}
+                                                                        </span>
+                                                                    </span>
                                                                 </td>
 
                                                                 <td className="px-4 py-5 align-middle">
@@ -3149,4 +3226,4 @@ export default function DoctorsManagementPage({ initialLocale }: DoctorsManageme
             </div>
         </div>
     );
-}   
+}

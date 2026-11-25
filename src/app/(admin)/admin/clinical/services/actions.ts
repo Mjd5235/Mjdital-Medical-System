@@ -6,6 +6,8 @@
 //    (never the doctor).
 //  - Shift.doctor uses onDelete: Cascade from the DOCTOR side only (deleting a doctor removes its shifts,
 //    never the other way around).
+//  - InsuranceProvider and InsurancePolicy are ORGANIZATION-WIDE (they have no clinicId), so they are
+//    completely independent of clinics. A center may have 0 clinics while providers/policies still exist.
 //
 // TENANT GUARD NOTE (src/lib/db/prisma.ts): every top-level query on a clinic-scoped model
 // (Doctor, Service, Shift, ...) must filter by clinicId. To respect that, doctors are unassigned from
@@ -13,16 +15,18 @@
 // query itself filters by clinicId). This only removes join rows; doctor rows are never touched or deleted.
 //
 // CLINIC DELETION (safe mode):
-//  - deleteClinicAction(id) removes ONLY the clinic, its services (service prices go with them,
-//    by cascade) and the doctor shifts of the clinic, inside ONE transaction.
+//  - deleteClinicAction(id) removes ONLY the clinic, its services (with their service prices)
+//    and the doctor shifts of the clinic, inside ONE transaction.
 //  - Doctors and their user accounts are NEVER deleted: doctors are unassigned from the
 //    clinic's services (join rows removed) and detached from the clinic (Doctor.clinicId = null),
 //    so they can be re-linked from the doctors page.
-//  - Sensitive records are NEVER deleted. If the clinic still owns patients, appointments,
-//    invoices or insurance providers/policies, the deletion is refused with a clear message
-//    (the admin can deactivate the clinic instead).
-//  - audit_logs.clinic_id must be nullable with onDelete: SetNull in schema.prisma (migration
-//    required) so audit history is preserved when a clinic is deleted.
+//  - Clinical/financial records that genuinely belong to the clinic (patients, appointments, invoices)
+//    are NEVER deleted. If the clinic still owns any of them, the deletion is refused with a clear
+//    message (the admin can deactivate the clinic instead).
+//  - Insurance providers and insurance policies are organization-wide and are NOT a blocker and are
+//    NOT touched when a clinic is deleted.
+//  - audit_logs.clinic_id is nullable with onDelete: SetNull in schema.prisma so audit history is
+//    preserved when a clinic is deleted.
 //
 // SERVICE DELETION (safe mode):
 //  - deleteServiceAction(id) removes ONLY the service, its service prices (by cascade) and the shifts
@@ -560,11 +564,16 @@ export async function toggleClinicStatusAction(
 }
 
 /**
- * Deletes a clinic together with its services and the doctor shifts that belong to it,
- * atomically. Doctors are NEVER deleted: they are unassigned from the clinic's services and
- * detached from the clinic (clinicId = null). Sensitive records (patients, appointments,
- * invoices, insurance data) are never deleted: if any exist, nothing is deleted and the
- * reason is returned.
+ * Deletes a clinic together with its services (and their prices) and the doctor shifts that
+ * belong to it, atomically. Doctors are NEVER deleted: they are unassigned from the clinic's
+ * services and detached from the clinic (clinicId = null).
+ *
+ * Insurance providers and insurance policies are organization-wide (not linked to any clinic),
+ * so they never block the deletion and are never touched. A center can legitimately have zero
+ * clinics while its payers/policies still exist.
+ *
+ * Clinical/financial records that belong to the clinic (patients, appointments, invoices) are
+ * never deleted: if any exist, nothing is deleted and the reason is returned.
  */
 export async function deleteClinicAction(
     id: string,
@@ -589,23 +598,21 @@ export async function deleteClinicAction(
 
             const clinicId = existing.id;
 
-            // ---- 1) Refuse when sensitive records exist (all filters include clinicId) ----
+            // ---- 1) Refuse only when records that truly belong to THIS clinic exist ----
+            //         (all filters include clinicId; insurance providers/policies are
+            //         organization-wide and intentionally NOT checked here)
             deletionStage = "safety-checks";
 
-            const [patients, appointments, invoices, providers, policies] = [
-                await tx.patient.count({ where: { organizationId, clinicId } }),
-                await tx.appointment.count({ where: { organizationId, clinicId } }),
-                await tx.invoice.count({ where: { organizationId, clinicId } }),
-                await tx.insuranceProvider.count({ where: { organizationId } }),
-                await tx.insurancePolicy.count({ where: { organizationId } }),
-            ];
+            const [patients, appointments, invoices] = await Promise.all([
+                tx.patient.count({ where: { organizationId, clinicId } }),
+                tx.appointment.count({ where: { organizationId, clinicId } }),
+                tx.invoice.count({ where: { organizationId, clinicId } }),
+            ]);
 
             const blockers: string[] = [];
             if (invoices > 0) blockers.push(`invoices (${invoices})`);
             if (appointments > 0) blockers.push(`appointments (${appointments})`);
             if (patients > 0) blockers.push(`patients (${patients})`);
-            if (providers > 0) blockers.push(`insurance providers (${providers})`);
-            if (policies > 0) blockers.push(`insurance policies (${policies})`);
 
             if (blockers.length > 0) {
                 throw new ClinicDeletionBlockedError(blockers.join(", "));
@@ -638,13 +645,20 @@ export async function deleteClinicAction(
                 where: { organizationId, clinicId },
             });
 
-            // ---- 4) Services (service prices are removed by onDelete: Cascade) ----
+            // ---- 4) Service prices of this clinic's services (contract prices only; the
+            //         insurance providers/policies themselves are never touched) ----
+            deletionStage = "service-prices";
+            await tx.servicePrice.deleteMany({
+                where: { organizationId, clinicId },
+            });
+
+            // ---- 5) Services ----
             deletionStage = "services";
             await tx.service.deleteMany({
                 where: { organizationId, clinicId },
             });
 
-            // ---- 5) Doctors are NEVER deleted. They are only detached from the clinic
+            // ---- 6) Doctors are NEVER deleted. They are only detached from the clinic
             //         (Doctor.clinicId is nullable, onDelete: SetNull) so they can be linked
             //         again to another clinic/service from the doctors management page.
             //         Their rows in `doctors` and their `users` accounts stay untouched. ----
@@ -654,7 +668,7 @@ export async function deleteClinicAction(
                 data: { clinicId: null },
             });
 
-            // ---- 6) The clinic. audit_logs.clinic_id becomes NULL (onDelete: SetNull). ----
+            // ---- 7) The clinic. audit_logs.clinic_id becomes NULL (onDelete: SetNull). ----
             deletionStage = "clinic";
             const result = await tx.clinic.deleteMany({
                 where: { id: clinicId, organizationId },

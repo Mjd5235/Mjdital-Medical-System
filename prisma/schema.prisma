@@ -520,6 +520,9 @@ model User {
 
 
 /// الملف المهني للطبيب، ويمكن ربطه بحساب مستخدم اختياري.
+/// - consultationFee: سعر الكشفية بالريال السعودي (قبل الضريبة) — Decimal(12, 2) مطابق لباقي الحقول المالية.
+///   القيمة الافتراضية 0 تحافظ على سلامة السجلات القديمة. عند الحجز/الفوترة تُؤخذ لقطة (Snapshot)
+///   من هذه القيمة داخل الموعد/الفاتورة، فلا يغيّر تعديل السعر لاحقاً الفواتير السابقة.
 
 model Doctor {
   id                 String                @id @default(uuid()) @db.Uuid
@@ -535,6 +538,7 @@ model Doctor {
   professionalRank   DoctorProfessionalRank @map("professional_rank")
   scfhsLicenseNumber String                @map("scfhs_license_number")
   commissionRate     Decimal               @default(0) @map("commission_rate") @db.Decimal(5, 2)
+  consultationFee    Decimal               @default(0) @map("consultation_fee") @db.Decimal(12, 2)
   presence           DoctorPresence        @default(AVAILABLE)
   isActive           Boolean               @default(true) @map("is_active")
   createdAt          DateTime              @default(now()) @map("created_at")

@@ -38,7 +38,7 @@ type ReceptionSidebarProps = {
 };
 
 const routes = {
-    dashboard: "/reception",
+    dashboard: "/reception/dashboard",
     appointments: "/reception/appointments",
     patients: "/reception/patients",
     billing: "/reception/billing",

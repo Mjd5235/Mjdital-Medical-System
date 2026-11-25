@@ -7,6 +7,17 @@
 //   <ReceptionSidebar locale activeHref open onClose />
 //   <ReceptionHeader  locale onMenuOpen />
 //
+// Appointment lifecycle on this page:
+//   1. Booking   - "+ Quick Appointment" books a SCHEDULED visit (no payment).
+//   2. Check-In  - the Check-In button (and every Walk-in) opens the Check-In & Payment
+//                  Settlement modal: doctor fee -> NPHIES / contract coverage -> ZATCA VAT.
+//                  Closing the modal without paying leaves the visit SCHEDULED.
+//   3. Settle    - "Confirm Payment & Issue ZATCA" runs one atomic server transaction
+//                  (invoice + pending NPHIES claim + SCHEDULED -> WAITING).
+//   4. Waiting   - the visit appears in the live queue / doctor's queue; the modal closes, the
+//                  queue and KPIs refresh and a toast offers to print the receipt.
+//   Cancel / No-show use a brand-matched confirmation modal (no native confirm()).
+//
 // Appointment entry points (two separate flows):
 //   * Sidebar "Appointments" button  -> navigates to /reception/appointments
 //     (or /reception/appointments?new=true). That link lives in ReceptionSidebar and is not
@@ -64,7 +75,6 @@ import type { Locale } from "@/lib/i18n/types";
 import ReceptionSidebar from "@/components/ReceptionSidebar/Sidebar";
 import ReceptionHeader from "@/components/ReceptionHeader/Header";
 import {
-    checkInAppointmentAction,
     getFrontDeskSnapshotAction,
     updateAppointmentStatusAction,
     verifyAppointmentNphiesAction,
@@ -72,8 +82,11 @@ import {
     type FrontDeskSnapshot,
     type NphiesFeedItem,
     type QueueItem,
+    type SettlementReceipt,
 } from "./actions";
 import {
+    CheckInPaymentModal,
+    ConfirmActionModal,
     EligibilityModal,
     QuickAppointmentModal,
     SelectBox,
@@ -90,6 +103,7 @@ import {
     formatTime,
     messages,
     outlineButton,
+    printReceipt,
     relativeTime,
     shortRef,
     tealButton,
@@ -101,14 +115,18 @@ const FRONT_DESK_HREF = "/reception";
 const POLL_MS = 15_000;
 const REALTIME_SAFETY_TICKS = 4;
 const TOAST_MS = 6000;
+const TOAST_ACTION_MS = 14_000;
 const MAX_TOASTS = 3;
 const CLINIC_ALL = "ALL";
 
 type QueueTab = "ALL" | "SCHEDULED" | "WAITING" | "IN_CLINIC" | "COMPLETED";
 type LiveMode = "connecting" | "realtime" | "polling";
 type ToastKind = "success" | "error" | "info";
-type ToastItem = { id: number; kind: ToastKind; message: string };
+type ToastAction = { label: string; onClick: () => void };
+type ToastItem = { id: number; kind: ToastKind; message: string; action?: ToastAction };
 type ModalName = "quick" | "walkin" | "eligibility" | null;
+type ConfirmableStatus = "CANCELLED" | "NO_SHOW";
+type ConfirmTarget = { item: QueueItem; next: ConfirmableStatus };
 type PrimaryAction =
     | "CHECK_IN"
     | "VERIFY"
@@ -156,7 +174,9 @@ function primaryActionOf(item: QueueItem): PrimaryAction {
             return item.invoiceId ? "VIEW_INVOICE" : "CREATE_INVOICE";
         case "SCHEDULED":
         case "CONFIRMED":
-            return needsVerify ? "VERIFY" : "CHECK_IN";
+            // The Check-In & Payment Settlement verifies coverage itself, so Check-In is always
+            // the primary action for a visit that is waiting to be settled.
+            return "CHECK_IN";
         case "WAITING":
             return needsVerify ? "VERIFY" : "CHECKED_IN";
         default:
@@ -388,6 +408,30 @@ function StatusPill({ status, t }: { status: AppointmentStatus; t: Messages }) {
             {t.statusLabels[status]}
         </span>
     );
+}
+
+/** Payment sub-label under the status pill: unpaid until check-in settles the visit. */
+function PaymentHint({ item, t }: { item: QueueItem; t: Messages }) {
+    if (item.status === "SCHEDULED" || item.status === "CONFIRMED") {
+        if (item.paid) return null;
+
+        return (
+            <p className="mt-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                {t.payPending}
+            </p>
+        );
+    }
+
+    if (item.status === "WAITING" && item.paid) {
+        return (
+            <p className="mt-1.5 inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                {t.paidBadge}
+            </p>
+        );
+    }
+
+    return null;
 }
 
 function CoverageCell({
@@ -624,6 +668,10 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
     const [clinicFilter, setClinicFilter] = useState(CLINIC_ALL);
     const [page, setPage] = useState(1);
     const [modal, setModal] = useState<ModalName>(null);
+    const [settleId, setSettleId] = useState<string | null>(null);
+    const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null);
+    const [confirmBusy, setConfirmBusy] = useState(false);
+    const [confirmError, setConfirmError] = useState("");
     const [busyId, setBusyId] = useState<string | null>(null);
     const [toasts, setToasts] = useState<ToastItem[]>([]);
     const [nowMs, setNowMs] = useState(() => Date.now());
@@ -669,11 +717,14 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
     }, []);
 
     const pushToast = useCallback(
-        (kind: ToastKind, message: string) => {
+        (kind: ToastKind, message: string, action?: ToastAction) => {
             const id = ++toastIdRef.current;
 
-            setToasts((current) => [...current.slice(-(MAX_TOASTS - 1)), { id, kind, message }]);
-            window.setTimeout(() => dismissToast(id), TOAST_MS);
+            setToasts((current) => [
+                ...current.slice(-(MAX_TOASTS - 1)),
+                { id, kind, message, ...(action ? { action } : {}) },
+            ]);
+            window.setTimeout(() => dismissToast(id), action ? TOAST_ACTION_MS : TOAST_MS);
         },
         [dismissToast],
     );
@@ -828,26 +879,56 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
 
     /* ------------------------------ mutations --------------------------- */
 
+    /** Runs a status change and reports the outcome (no toast / refresh side effects). */
+    async function applyStatus(
+        item: QueueItem,
+        next: AppointmentStatus,
+    ): Promise<{ ok: boolean; error?: string }> {
+        try {
+            const result = await updateAppointmentStatusAction({
+                appointmentId: item.id,
+                status: next,
+            });
+
+            if (!result.success) {
+                return {
+                    ok: false,
+                    error: actionErrorMessage(tRef.current, result.code, result.error),
+                };
+            }
+
+            return { ok: true };
+        } catch {
+            return { ok: false, error: tRef.current.failed };
+        }
+    }
+
     async function changeStatus(item: QueueItem, next: AppointmentStatus) {
         setBusyId(item.id);
 
         try {
-            const result =
-                next === "WAITING"
-                    ? await checkInAppointmentAction(item.id)
-                    : await updateAppointmentStatusAction({ appointmentId: item.id, status: next });
+            const outcome = await applyStatus(item, next);
 
-            if (!result.success) {
-                pushToast("error", actionErrorMessage(tRef.current, result.code, result.error));
-            } else {
-                pushToast("success", statusToast(next, tRef.current));
-            }
-        } catch {
-            pushToast("error", tRef.current.failed);
+            if (outcome.ok) pushToast("success", statusToast(next, tRef.current));
+            else pushToast("error", outcome.error ?? tRef.current.failed);
         } finally {
             setBusyId(null);
             await refresh();
         }
+    }
+
+    /**
+     * Check-In never flips the status directly: it opens the Check-In & Payment Settlement. The
+     * only exception is a visit that already carries an invoice (e.g. billed from the billing
+     * page), which the server allows to move to Waiting.
+     */
+    function startCheckIn(item: QueueItem) {
+        if (item.paid) {
+            void changeStatus(item, "WAITING");
+            return;
+        }
+
+        setSettleId(item.id);
     }
 
     /** "Verify NPHIES" row action: runs through nphies.checkEligibility (NPHIES_MODE adapter). */
@@ -889,14 +970,49 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
         }
     }
 
+    /** Cancel / No-show open the brand-matched confirmation modal; other moves run directly. */
     function confirmThenChange(item: QueueItem, next: AppointmentStatus) {
-        const needsConfirm = next === "CANCELLED" || next === "NO_SHOW";
+        if (next === "CANCELLED" || next === "NO_SHOW") {
+            setConfirmError("");
+            setConfirmTarget({ item, next });
+            return;
+        }
 
-        if (needsConfirm && !window.confirm(next === "CANCELLED" ? t.confirmCancel : t.confirmNoShow)) {
+        if (next === "WAITING") {
+            startCheckIn(item);
             return;
         }
 
         void changeStatus(item, next);
+    }
+
+    async function runConfirmed() {
+        if (!confirmTarget || confirmBusy) return;
+
+        const { item, next } = confirmTarget;
+
+        setConfirmBusy(true);
+        setConfirmError("");
+
+        const outcome = await applyStatus(item, next);
+
+        setConfirmBusy(false);
+
+        if (outcome.ok) {
+            setConfirmTarget(null);
+            pushToast("success", statusToast(next, tRef.current));
+        } else {
+            setConfirmError(outcome.error ?? tRef.current.failed);
+        }
+
+        await refresh();
+    }
+
+    function closeConfirm() {
+        if (confirmBusy) return;
+
+        setConfirmTarget(null);
+        setConfirmError("");
     }
 
     function menuItemsFor(item: QueueItem, primary: PrimaryAction): MenuItem[] {
@@ -944,6 +1060,44 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
         [pushToast, refresh],
     );
 
+    /** A walk-in is created Scheduled/unpaid; the settlement modal opens straight away. */
+    const handleWalkInCreated = useCallback(
+        (appointmentId: string) => {
+            setModal(null);
+            setSettleId(appointmentId);
+            pushToast("info", tRef.current.toastWalkInCreated);
+            void refresh();
+        },
+        [pushToast, refresh],
+    );
+
+    const closeSettlement = useCallback(() => {
+        // The visit stays Scheduled (unpaid); just make sure the queue shows it.
+        setSettleId(null);
+        void refresh();
+    }, [refresh]);
+
+    const timezone = snapshot?.timezone ?? "Asia/Riyadh";
+
+    const handleSettled = useCallback(
+        (receipt: SettlementReceipt) => {
+            const current = tRef.current;
+            const name = locale === "ar" ? receipt.patientNameAr : receipt.patientNameEn;
+
+            setSettleId(null);
+            pushToast("success", fill(current.ckToastPaid, { name }), {
+                label: current.ckPrint,
+                onClick: () => {
+                    if (!printReceipt(receipt, tRef.current, locale, timezone)) {
+                        pushToast("error", tRef.current.ckPopupBlocked);
+                    }
+                },
+            });
+            void refresh();
+        },
+        [locale, pushToast, refresh, timezone],
+    );
+
     const handleRegisterFromModal = useCallback(() => {
         setModal(null);
         goRegisterPatient();
@@ -955,6 +1109,7 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
     const showSkeleton = loading && !snapshot;
     const ChevronIcon = isRtl ? ChevronLeft : ChevronRight;
     const PrevIcon = isRtl ? ChevronRight : ChevronLeft;
+    const showEmptyState = !showSkeleton && visible.length === 0;
 
     const liveLabel =
         liveMode === "realtime"
@@ -970,6 +1125,27 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
         { key: "IN_CLINIC", label: t.tabInClinic },
         { key: "COMPLETED", label: t.tabCompleted },
     ];
+
+    const confirmRows = confirmTarget
+        ? [
+            {
+                label: t.cfPatient,
+                value: isRtl ? confirmTarget.item.patientNameAr : confirmTarget.item.patientNameEn,
+            },
+            {
+                label: t.cfDoctor,
+                value: displayDoctor(
+                    isRtl ? confirmTarget.item.doctorNameAr : confirmTarget.item.doctorNameEn,
+                    locale,
+                ),
+            },
+            {
+                label: t.cfTime,
+                value: formatTime(confirmTarget.item.scheduledAt, timezone, locale),
+            },
+            { label: t.cfStatus, value: t.statusLabels[confirmTarget.item.status] },
+        ]
+        : [];
 
     return (
         <div
@@ -1115,9 +1291,10 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                             )}
                         </section>
 
-                        <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
+                        {/* items-start: the queue card height follows its own rows, never the NPHIES feed column. */}
+                        <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
                             {/* Live queue */}
-                            <section className={`${cardSurface} min-w-0 overflow-hidden`}>
+                            <section className={`${cardSurface} min-w-0 self-start overflow-hidden`}>
                                 <div className="space-y-4 px-6 pt-6">
                                     <div className="flex flex-wrap items-center justify-between gap-3">
                                         <h2 className="text-xl font-bold text-slate-900 dark:text-white">
@@ -1197,7 +1374,7 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                                 </div>
 
                                 {loadError ? (
-                                    <div className="flex min-h-64 flex-col items-center justify-center gap-4 p-8 text-center">
+                                    <div className="flex flex-col items-center justify-center gap-4 px-8 py-12 text-center">
                                         <CircleAlert className="h-8 w-8 text-teal-500" />
                                         <p className="text-sm">{loadError}</p>
                                         <button
@@ -1214,226 +1391,216 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                                     </div>
                                 ) : (
                                     <>
-                                        <div className="overflow-x-auto">
-                                            <table className="w-full min-w-[980px] border-collapse text-start">
-                                                <caption className="sr-only">{t.queueTitle}</caption>
-                                                <thead>
-                                                    <tr className="bg-slate-50 text-sm font-semibold text-slate-600 dark:bg-slate-900 dark:text-slate-300">
-                                                        <th className="px-6 py-4 text-start">{t.colTime}</th>
-                                                        <th className="px-4 py-4 text-start">{t.colPatient}</th>
-                                                        <th className="px-4 py-4 text-start">{t.colDoctor}</th>
-                                                        <th className="px-4 py-4 text-start">{t.colCoverage}</th>
-                                                        <th className="px-4 py-4 text-start">{t.colStatus}</th>
-                                                        <th className="px-4 py-4 text-end">{t.colActions}</th>
-                                                    </tr>
-                                                </thead>
-
-                                                <tbody
-                                                    aria-busy={showSkeleton}
-                                                    className="divide-y divide-slate-200 dark:divide-slate-800"
-                                                >
-                                                    {showSkeleton ? (
-                                                        Array.from({ length: PAGE_SIZE }, (_, index) => (
-                                                            <RowSkeleton key={index} />
-                                                        ))
-                                                    ) : visible.length === 0 ? (
-                                                        <tr>
-                                                            <td
-                                                                colSpan={6}
-                                                                className="h-56 text-center align-middle text-sm text-slate-500 dark:text-slate-400"
-                                                            >
-                                                                <div className="flex flex-col items-center gap-3">
-                                                                    <span>
-                                                                        {queue.length === 0 ? t.emptyToday : t.empty}
-                                                                    </span>
-                                                                    {filtersActive && (
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={resetFilters}
-                                                                            className="font-semibold text-teal-600 underline dark:text-teal-400"
-                                                                        >
-                                                                            {t.resetFilters}
-                                                                        </button>
-                                                                    )}
-                                                                </div>
-                                                            </td>
+                                        {showEmptyState ? (
+                                            /* Compact empty state: the card is only as tall as its content. */
+                                            <div className="flex flex-col items-center gap-3 px-6 py-10 text-center text-sm text-slate-500 dark:text-slate-400">
+                                                <CalendarDays className="h-8 w-8 text-slate-400 dark:text-slate-500" strokeWidth={1.5} />
+                                                <span>{queue.length === 0 ? t.emptyToday : t.empty}</span>
+                                                {filtersActive && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={resetFilters}
+                                                        className="font-semibold text-teal-600 underline dark:text-teal-400"
+                                                    >
+                                                        {t.resetFilters}
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <div className="overflow-x-auto">
+                                                <table className="w-full min-w-[980px] border-collapse text-start">
+                                                    <caption className="sr-only">{t.queueTitle}</caption>
+                                                    <thead>
+                                                        <tr className="bg-slate-50 text-sm font-semibold text-slate-600 dark:bg-slate-900 dark:text-slate-300">
+                                                            <th className="px-6 py-4 text-start">{t.colTime}</th>
+                                                            <th className="px-4 py-4 text-start">{t.colPatient}</th>
+                                                            <th className="px-4 py-4 text-start">{t.colDoctor}</th>
+                                                            <th className="px-4 py-4 text-start">{t.colCoverage}</th>
+                                                            <th className="px-4 py-4 text-start">{t.colStatus}</th>
+                                                            <th className="px-4 py-4 text-end">{t.colActions}</th>
                                                         </tr>
-                                                    ) : (
-                                                        visible.map((item) => {
-                                                            const primary = primaryActionOf(item);
-                                                            const busy = busyId === item.id;
-                                                            const menuItems = menuItemsFor(item, primary);
-                                                            const clinicName = isRtl
-                                                                ? item.clinicNameAr
-                                                                : item.clinicNameEn;
+                                                    </thead>
 
-                                                            return (
-                                                                <tr
-                                                                    key={item.id}
-                                                                    className="transition hover:bg-slate-50 dark:hover:bg-slate-800/30"
-                                                                >
-                                                                    <td className="px-6 py-4 align-middle">
-                                                                        <p className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                                                                            <span dir="ltr">
-                                                                                {formatTime(
-                                                                                    item.scheduledAt,
-                                                                                    snapshot?.timezone ?? "Asia/Riyadh",
+                                                    <tbody
+                                                        aria-busy={showSkeleton}
+                                                        className="divide-y divide-slate-200 dark:divide-slate-800"
+                                                    >
+                                                        {showSkeleton
+                                                            ? Array.from({ length: PAGE_SIZE }, (_, index) => (
+                                                                <RowSkeleton key={index} />
+                                                            ))
+                                                            : visible.map((item) => {
+                                                                const primary = primaryActionOf(item);
+                                                                const busy = busyId === item.id;
+                                                                const menuItems = menuItemsFor(item, primary);
+                                                                const clinicName = isRtl
+                                                                    ? item.clinicNameAr
+                                                                    : item.clinicNameEn;
+
+                                                                return (
+                                                                    <tr
+                                                                        key={item.id}
+                                                                        className="transition hover:bg-slate-50 dark:hover:bg-slate-800/30"
+                                                                    >
+                                                                        <td className="px-6 py-4 align-middle">
+                                                                            <p className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                                                                                <span dir="ltr">
+                                                                                    {formatTime(item.scheduledAt, timezone, locale)}
+                                                                                </span>
+                                                                            </p>
+                                                                            <p
+                                                                                dir="ltr"
+                                                                                className={`mt-1 text-sm text-slate-500 dark:text-slate-400 ${isRtl ? "text-end" : ""
+                                                                                    }`}
+                                                                            >
+                                                                                {item.token}
+                                                                            </p>
+                                                                        </td>
+
+                                                                        <td className="px-4 py-4 align-middle">
+                                                                            <p className="max-w-52 truncate text-base font-bold text-slate-900 dark:text-white">
+                                                                                {isRtl ? item.patientNameAr : item.patientNameEn}
+                                                                            </p>
+                                                                            <p
+                                                                                dir="ltr"
+                                                                                className={`mt-1 text-sm text-slate-500 dark:text-slate-400 ${isRtl ? "text-end" : ""
+                                                                                    }`}
+                                                                            >
+                                                                                {item.nationalIdMasked}
+                                                                            </p>
+                                                                        </td>
+
+                                                                        <td className="px-4 py-4 align-middle">
+                                                                            <p className="max-w-52 truncate text-base font-semibold text-slate-900 dark:text-slate-100">
+                                                                                {displayDoctor(
+                                                                                    isRtl ? item.doctorNameAr : item.doctorNameEn,
                                                                                     locale,
                                                                                 )}
-                                                                            </span>
-                                                                        </p>
-                                                                        <p
-                                                                            dir="ltr"
-                                                                            className={`mt-1 text-sm text-slate-500 dark:text-slate-400 ${isRtl ? "text-end" : ""
-                                                                                }`}
-                                                                        >
-                                                                            {item.token}
-                                                                        </p>
-                                                                    </td>
+                                                                            </p>
+                                                                            <p className="mt-1 max-w-52 truncate text-sm text-slate-500 dark:text-slate-400">
+                                                                                • {clinicName}
+                                                                            </p>
+                                                                        </td>
 
-                                                                    <td className="px-4 py-4 align-middle">
-                                                                        <p className="max-w-52 truncate text-base font-bold text-slate-900 dark:text-white">
-                                                                            {isRtl ? item.patientNameAr : item.patientNameEn}
-                                                                        </p>
-                                                                        <p
-                                                                            dir="ltr"
-                                                                            className={`mt-1 text-sm text-slate-500 dark:text-slate-400 ${isRtl ? "text-end" : ""
-                                                                                }`}
-                                                                        >
-                                                                            {item.nationalIdMasked}
-                                                                        </p>
-                                                                    </td>
+                                                                        <td className="px-4 py-4 align-middle">
+                                                                            <CoverageCell item={item} locale={locale} t={t} />
+                                                                        </td>
 
-                                                                    <td className="px-4 py-4 align-middle">
-                                                                        <p className="max-w-52 truncate text-base font-semibold text-slate-900 dark:text-slate-100">
-                                                                            {displayDoctor(
-                                                                                isRtl ? item.doctorNameAr : item.doctorNameEn,
-                                                                                locale,
-                                                                            )}
-                                                                        </p>
-                                                                        <p className="mt-1 max-w-52 truncate text-sm text-slate-500 dark:text-slate-400">
-                                                                            • {clinicName}
-                                                                        </p>
-                                                                    </td>
+                                                                        <td className="px-4 py-4 align-middle">
+                                                                            <StatusPill status={item.status} t={t} />
+                                                                            <PaymentHint item={item} t={t} />
+                                                                        </td>
 
-                                                                    <td className="px-4 py-4 align-middle">
-                                                                        <CoverageCell item={item} locale={locale} t={t} />
-                                                                    </td>
+                                                                        <td className="px-4 py-4 align-middle">
+                                                                            <div className="flex items-center justify-end gap-1">
+                                                                                {busy ? (
+                                                                                    <LoaderCircle className="h-5 w-5 animate-spin text-teal-500" />
+                                                                                ) : (
+                                                                                    <>
+                                                                                        {primary === "CHECK_IN" && (
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                onClick={() => startCheckIn(item)}
+                                                                                                className="inline-flex h-10 items-center rounded-lg bg-teal-600 px-4 text-sm font-semibold text-white transition hover:bg-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500"
+                                                                                            >
+                                                                                                {t.checkIn}
+                                                                                            </button>
+                                                                                        )}
 
-                                                                    <td className="px-4 py-4 align-middle">
-                                                                        <StatusPill status={item.status} t={t} />
-                                                                    </td>
+                                                                                        {primary === "VERIFY" && (
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                onClick={() => void verifyRow(item)}
+                                                                                                className="inline-flex h-10 items-center whitespace-nowrap rounded-lg border border-teal-500 px-4 text-sm font-semibold text-teal-600 transition hover:bg-teal-600/10 focus:outline-none focus:ring-2 focus:ring-teal-500 dark:text-teal-400"
+                                                                                            >
+                                                                                                {t.verifyNphies}
+                                                                                            </button>
+                                                                                        )}
 
-                                                                    <td className="px-4 py-4 align-middle">
-                                                                        <div className="flex items-center justify-end gap-1">
-                                                                            {busy ? (
-                                                                                <LoaderCircle className="h-5 w-5 animate-spin text-teal-500" />
-                                                                            ) : (
-                                                                                <>
-                                                                                    {primary === "CHECK_IN" && (
-                                                                                        <button
-                                                                                            type="button"
-                                                                                            onClick={() =>
-                                                                                                void changeStatus(item, "WAITING")
-                                                                                            }
-                                                                                            className="inline-flex h-10 items-center rounded-lg bg-teal-600 px-4 text-sm font-semibold text-white transition hover:bg-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500"
-                                                                                        >
-                                                                                            {t.checkIn}
-                                                                                        </button>
-                                                                                    )}
+                                                                                        {primary === "CREATE_INVOICE" && (
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                onClick={() => goCreateInvoice(item)}
+                                                                                                className="inline-flex h-10 items-center whitespace-nowrap rounded-lg border border-teal-500 px-4 text-sm font-semibold text-teal-600 transition hover:bg-teal-600/10 focus:outline-none focus:ring-2 focus:ring-teal-500 dark:text-teal-400"
+                                                                                            >
+                                                                                                {t.createInvoice}
+                                                                                            </button>
+                                                                                        )}
 
-                                                                                    {primary === "VERIFY" && (
-                                                                                        <button
-                                                                                            type="button"
-                                                                                            onClick={() => void verifyRow(item)}
-                                                                                            className="inline-flex h-10 items-center whitespace-nowrap rounded-lg border border-teal-500 px-4 text-sm font-semibold text-teal-600 transition hover:bg-teal-600/10 focus:outline-none focus:ring-2 focus:ring-teal-500 dark:text-teal-400"
-                                                                                        >
-                                                                                            {t.verifyNphies}
-                                                                                        </button>
-                                                                                    )}
+                                                                                        {primary === "VIEW_INVOICE" && (
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                onClick={() => goViewInvoice(item)}
+                                                                                                className="inline-flex h-10 items-center whitespace-nowrap rounded-lg border border-sky-500 px-4 text-sm font-semibold text-sky-600 transition hover:bg-sky-500/10 focus:outline-none focus:ring-2 focus:ring-sky-500 dark:text-sky-400"
+                                                                                            >
+                                                                                                {t.viewInvoice}
+                                                                                            </button>
+                                                                                        )}
 
-                                                                                    {primary === "CREATE_INVOICE" && (
-                                                                                        <button
-                                                                                            type="button"
-                                                                                            onClick={() => goCreateInvoice(item)}
-                                                                                            className="inline-flex h-10 items-center whitespace-nowrap rounded-lg border border-teal-500 px-4 text-sm font-semibold text-teal-600 transition hover:bg-teal-600/10 focus:outline-none focus:ring-2 focus:ring-teal-500 dark:text-teal-400"
-                                                                                        >
-                                                                                            {t.createInvoice}
-                                                                                        </button>
-                                                                                    )}
+                                                                                        {primary === "CHECKED_IN" && (
+                                                                                            <span className="inline-flex h-10 items-center gap-1.5 px-3 text-sm font-medium text-emerald-600 dark:text-emerald-400">
+                                                                                                <CheckCircle2 className="h-4 w-4" />
+                                                                                                {t.checkedIn}
+                                                                                            </span>
+                                                                                        )}
 
-                                                                                    {primary === "VIEW_INVOICE" && (
-                                                                                        <button
-                                                                                            type="button"
-                                                                                            onClick={() => goViewInvoice(item)}
-                                                                                            className="inline-flex h-10 items-center whitespace-nowrap rounded-lg border border-sky-500 px-4 text-sm font-semibold text-sky-600 transition hover:bg-sky-500/10 focus:outline-none focus:ring-2 focus:ring-sky-500 dark:text-sky-400"
-                                                                                        >
-                                                                                            {t.viewInvoice}
-                                                                                        </button>
-                                                                                    )}
+                                                                                        <RowMenu
+                                                                                            items={menuItems}
+                                                                                            isRtl={isRtl}
+                                                                                            label={t.rowActions}
+                                                                                            disabled={busy}
+                                                                                        />
+                                                                                    </>
+                                                                                )}
+                                                                            </div>
+                                                                        </td>
+                                                                    </tr>
+                                                                );
+                                                            })}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        )}
 
-                                                                                    {primary === "CHECKED_IN" && (
-                                                                                        <span className="inline-flex h-10 items-center gap-1.5 px-3 text-sm font-medium text-emerald-600 dark:text-emerald-400">
-                                                                                            <CheckCircle2 className="h-4 w-4" />
-                                                                                            {t.checkedIn}
-                                                                                        </span>
-                                                                                    )}
+                                        {!showEmptyState && (
+                                            <div className="flex flex-col gap-4 border-t border-slate-200 px-6 py-4 dark:border-slate-800 sm:flex-row sm:items-center sm:justify-between">
+                                                <p className="text-sm text-slate-500 dark:text-slate-400">
+                                                    {t.showing}{" "}
+                                                    <strong className="text-slate-900 dark:text-slate-100">
+                                                        {showingFrom}–{showingTo}
+                                                    </strong>{" "}
+                                                    {t.of}{" "}
+                                                    <strong className="text-slate-900 dark:text-slate-100">
+                                                        {filtered.length}
+                                                    </strong>{" "}
+                                                    {t.visits}
+                                                </p>
 
-                                                                                    <RowMenu
-                                                                                        items={menuItems}
-                                                                                        isRtl={isRtl}
-                                                                                        label={t.rowActions}
-                                                                                        disabled={busy}
-                                                                                    />
-                                                                                </>
-                                                                            )}
-                                                                        </div>
-                                                                    </td>
-                                                                </tr>
-                                                            );
-                                                        })
-                                                    )}
-                                                </tbody>
-                                            </table>
-                                        </div>
-
-                                        <div className="flex flex-col gap-4 border-t border-slate-200 px-6 py-4 dark:border-slate-800 sm:flex-row sm:items-center sm:justify-between">
-                                            <p className="text-sm text-slate-500 dark:text-slate-400">
-                                                {t.showing}{" "}
-                                                <strong className="text-slate-900 dark:text-slate-100">
-                                                    {showingFrom}–{showingTo}
-                                                </strong>{" "}
-                                                {t.of}{" "}
-                                                <strong className="text-slate-900 dark:text-slate-100">
-                                                    {filtered.length}
-                                                </strong>{" "}
-                                                {t.visits}
-                                            </p>
-
-                                            <nav aria-label={t.queueTitle} className="flex items-center gap-2">
-                                                <button
-                                                    type="button"
-                                                    aria-label={t.previous}
-                                                    disabled={currentPage <= 1}
-                                                    onClick={() => setPage(Math.max(1, currentPage - 1))}
-                                                    className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition hover:border-teal-500 hover:text-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
-                                                >
-                                                    <PrevIcon className="h-4 w-4" />
-                                                </button>
-                                                <span className="min-w-16 text-center text-sm font-semibold text-slate-700 dark:text-slate-200">
-                                                    {currentPage} / {totalPages}
-                                                </span>
-                                                <button
-                                                    type="button"
-                                                    aria-label={t.next}
-                                                    disabled={currentPage >= totalPages}
-                                                    onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
-                                                    className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition hover:border-teal-500 hover:text-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
-                                                >
-                                                    <ChevronIcon className="h-4 w-4" />
-                                                </button>
-                                            </nav>
-                                        </div>
+                                                <nav aria-label={t.queueTitle} className="flex items-center gap-2">
+                                                    <button
+                                                        type="button"
+                                                        aria-label={t.previous}
+                                                        disabled={currentPage <= 1}
+                                                        onClick={() => setPage(Math.max(1, currentPage - 1))}
+                                                        className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition hover:border-teal-500 hover:text-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
+                                                    >
+                                                        <PrevIcon className="h-4 w-4" />
+                                                    </button>
+                                                    <span className="min-w-16 text-center text-sm font-semibold text-slate-700 dark:text-slate-200">
+                                                        {currentPage} / {totalPages}
+                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        aria-label={t.next}
+                                                        disabled={currentPage >= totalPages}
+                                                        onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+                                                        className="grid h-10 w-10 place-items-center rounded-lg border border-slate-200 text-slate-700 transition hover:border-teal-500 hover:text-teal-500 disabled:opacity-40 dark:border-slate-700 dark:text-slate-200"
+                                                    >
+                                                        <ChevronIcon className="h-4 w-4" />
+                                                    </button>
+                                                </nav>
+                                            </div>
+                                        )}
                                     </>
                                 )}
                             </section>
@@ -1549,7 +1716,7 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                         locale={locale}
                         t={t}
                         onClose={closeModal}
-                        onDone={handleModalDone}
+                        onCreated={handleWalkInCreated}
                         onRegisterPatient={handleRegisterFromModal}
                     />
                 )}
@@ -1562,6 +1729,39 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                         onClose={closeModal}
                         onChecked={() => void refresh()}
                         onRegisterPatient={handleRegisterFromModal}
+                    />
+                )}
+
+                {settleId && (
+                    <CheckInPaymentModal
+                        key={`check-in-payment-${settleId}`}
+                        locale={locale}
+                        t={t}
+                        timezone={timezone}
+                        appointmentId={settleId}
+                        onClose={closeSettlement}
+                        onSettled={handleSettled}
+                    />
+                )}
+
+                {confirmTarget && (
+                    <ConfirmActionModal
+                        key="confirm-action"
+                        locale={locale}
+                        t={t}
+                        tone={confirmTarget.next === "CANCELLED" ? "danger" : "warn"}
+                        title={confirmTarget.next === "CANCELLED" ? t.confirmCancel : t.confirmNoShow}
+                        description={
+                            confirmTarget.next === "CANCELLED" ? t.cfCancelBody : t.cfNoShowBody
+                        }
+                        rows={confirmRows}
+                        confirmLabel={
+                            confirmTarget.next === "CANCELLED" ? t.cfConfirmCancel : t.cfConfirmNoShow
+                        }
+                        loading={confirmBusy}
+                        error={confirmError}
+                        onConfirm={() => void runConfirmed()}
+                        onClose={closeConfirm}
                     />
                 )}
             </AnimatePresence>
@@ -1589,9 +1789,23 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                             <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-400" />
                         )}
 
-                        <p className="min-w-0 flex-1 break-words text-slate-900 dark:text-slate-100">
-                            {toast.message}
-                        </p>
+                        <div className="min-w-0 flex-1">
+                            <p className="break-words text-slate-900 dark:text-slate-100">
+                                {toast.message}
+                            </p>
+                            {toast.action && (
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        toast.action?.onClick();
+                                        dismissToast(toast.id);
+                                    }}
+                                    className="mt-2 inline-flex h-8 items-center rounded-lg border border-teal-500 px-3 text-xs font-semibold text-teal-600 transition hover:bg-teal-600/10 focus:outline-none focus:ring-2 focus:ring-teal-500 dark:text-teal-400"
+                                >
+                                    {toast.action.label}
+                                </button>
+                            )}
+                        </div>
 
                         <button
                             type="button"

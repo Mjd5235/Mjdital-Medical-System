@@ -20,6 +20,8 @@ const TOKEN_EXPIRY_HOURS = 24;
 const PAGE_SIZE = 10;
 /** Safety cap for the single-query "load everything" snapshot used by the client. */
 const ALL_DOCTORS_CAP = 1000;
+/** Upper bound (SAR) accepted for a doctor's consultation fee. */
+const MAX_CONSULTATION_FEE = 1_000_000;
 
 export interface DoctorActionResult<T> {
     success: boolean;
@@ -64,6 +66,11 @@ export interface DoctorRow {
     /** Empty string when the doctor has no clinic. */
     clinicNameAr: string;
     commissionRate: string;
+    /**
+     * Consultation fee in SAR (before VAT), always formatted with two decimals
+     * (e.g. "250.00"). Booking and billing snapshot this value from the doctor record.
+     */
+    consultationFee: string;
     isActive: boolean;
     mustChangePassword: boolean;
     accountStatus: "ACTIVE" | "INVITED" | "INACTIVE" | "NO_ACCOUNT";
@@ -118,6 +125,8 @@ export interface CreateDoctorInput {
     clinicId: string;
     serviceIds: string[];
     commissionRate: string | number;
+    /** Consultation fee in SAR (before VAT). 0 – 1,000,000 with up to two decimals. */
+    consultationFee: string | number;
     /** Optional. When empty the server generates a secure temporary password. */
     temporaryPassword?: string;
 }
@@ -249,6 +258,35 @@ function validCommissionRate(value: unknown): Prisma.Decimal | null {
     }
 }
 
+/**
+ * Validates a consultation fee (SAR, before VAT): a non-negative amount with at
+ * most two decimals, capped at MAX_CONSULTATION_FEE. Returns an exact Decimal
+ * (never a float) so the value stored matches `Decimal(12, 2)`.
+ */
+function validConsultationFee(value: unknown): Prisma.Decimal | null {
+    const normalized = String(value ?? "").trim();
+
+    if (!/^\d{1,7}(?:\.\d{1,2})?$/.test(normalized)) {
+        return null;
+    }
+
+    try {
+        const fee = new Prisma.Decimal(normalized);
+
+        if (
+            !fee.isFinite() ||
+            fee.isNegative() ||
+            fee.greaterThan(MAX_CONSULTATION_FEE)
+        ) {
+            return null;
+        }
+
+        return fee.toDecimalPlaces(2);
+    } catch {
+        return null;
+    }
+}
+
 function invalid<T>(
     error: string,
     code = "INVALID_INPUT",
@@ -350,6 +388,7 @@ function mapDoctor(doctor: DoctorWithRelations): DoctorRow {
         clinicName: doctor.clinic?.nameEn ?? "",
         clinicNameAr: doctor.clinic?.nameAr ?? "",
         commissionRate: doctor.commissionRate.toString(),
+        consultationFee: doctor.consultationFee.toFixed(2),
         isActive: doctor.isActive,
         mustChangePassword,
         accountStatus: !doctor.isActive
@@ -377,6 +416,7 @@ type ParsedDoctorInput = {
     rank: DoctorProfessionalRank;
     serviceIds: string[];
     commissionRate: Prisma.Decimal;
+    consultationFee: Prisma.Decimal;
     temporaryPassword: string;
 };
 
@@ -396,6 +436,7 @@ function parseDoctorInput(
         ? [...new Set(input.serviceIds.map(cleanText))]
         : [];
     const commissionRate = validCommissionRate(input?.commissionRate);
+    const consultationFee = validConsultationFee(input?.consultationFee);
     const temporaryPassword =
         typeof input?.temporaryPassword === "string" ? input.temporaryPassword : "";
 
@@ -459,6 +500,13 @@ function parseDoctorInput(
         );
     }
 
+    if (!consultationFee) {
+        return fail(
+            "Enter a consultation fee between 0 and 1,000,000 SAR, with up to two decimal places.",
+            "INVALID_CONSULTATION_FEE",
+        );
+    }
+
     return {
         ok: true,
         value: {
@@ -474,6 +522,7 @@ function parseDoctorInput(
             rank,
             serviceIds,
             commissionRate,
+            consultationFee,
             temporaryPassword,
         },
     };
@@ -650,6 +699,7 @@ type RawDoctorRow = {
     clinicNameEn: string | null;
     clinicNameAr: string | null;
     commissionRate: number | string;
+    consultationFee: number | string;
     isActive: boolean;
     createdAt: string;
     services: Array<{ id: string; nameEn: string; nameAr: string; code: string }>;
@@ -667,6 +717,15 @@ function toIsoString(value: string): string {
     const date = new Date(normalized);
 
     return Number.isNaN(date.getTime()) ? value : date.toISOString();
+}
+
+/** Formats the raw SQL numeric (JSON number or string) as an exact two-decimal SAR string. */
+function formatRawConsultationFee(value: number | string | null | undefined): string {
+    try {
+        return new Prisma.Decimal(value ?? 0).toFixed(2);
+    } catch {
+        return "0.00";
+    }
 }
 
 function mapRawDoctor(row: RawDoctorRow): DoctorRow {
@@ -691,6 +750,7 @@ function mapRawDoctor(row: RawDoctorRow): DoctorRow {
         clinicName: row.clinicNameEn ?? "",
         clinicNameAr: row.clinicNameAr ?? "",
         commissionRate: String(row.commissionRate),
+        consultationFee: formatRawConsultationFee(row.consultationFee),
         isActive: row.isActive,
         mustChangePassword,
         accountStatus: !row.isActive
@@ -761,6 +821,7 @@ async function loadSnapshotSingleQuery(organizationId: string): Promise<RawSnaps
                     'clinicNameEn', c.name_en,
                     'clinicNameAr', c.name_ar,
                     'commissionRate', d.commission_rate,
+                    'consultationFee', d.consultation_fee,
                     'isActive', d.is_active,
                     'createdAt', d.created_at,
                     'services', COALESCE((
@@ -1042,6 +1103,7 @@ export async function createDoctorAction(
                         professionalRank: v.rank,
                         scfhsLicenseNumber: v.license,
                         commissionRate: v.commissionRate,
+                        consultationFee: v.consultationFee,
                         isActive: true,
                         services: {
                             connect: availableServices.map((service) => ({
@@ -1244,6 +1306,7 @@ export async function updateDoctorAction(
                         professionalRank: v.rank,
                         scfhsLicenseNumber: v.license,
                         commissionRate: v.commissionRate,
+                        consultationFee: v.consultationFee,
                         services: {
                             set: availableServices.map((service) => ({
                                 id: service.id,

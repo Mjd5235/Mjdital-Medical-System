@@ -2,8 +2,9 @@
 
 // ============================================================================
 // app/(reception)/reception/dashboard/Modals.tsx
-// Quick Appointment, Walk-in and Instant NPHIES Eligibility modals, plus the shared
-// SelectBox dropdown (custom listbox: dark slate surface, teal-500 border, ✓ on selected).
+// Quick Appointment, Walk-in, Instant NPHIES Eligibility, Check-In & Payment Settlement and
+// brand-matched Confirmation modals, plus the shared SelectBox dropdown (custom listbox: dark
+// slate surface, teal-500 border, ✓ on selected).
 // ============================================================================
 
 import {
@@ -21,17 +22,23 @@ import {
 import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
 import {
+    Banknote,
     CalendarDays,
+    CalendarX2,
     Check,
     CheckCircle2,
     ChevronDown,
     CircleAlert,
+    CreditCard,
     LoaderCircle,
+    Receipt,
     Search,
     ShieldCheck,
     UserRound,
+    UserX,
     X,
 } from "lucide-react";
+import type { AppointmentStatus } from "@prisma/client";
 import type { Locale } from "@/lib/i18n/types";
 import {
     checkEligibilityByNationalIdAction,
@@ -39,10 +46,15 @@ import {
     createWalkInAction,
     getAvailableSlotsAction,
     getBookingOptionsAction,
+    getCheckInQuoteAction,
     searchPatientsAction,
+    settleCheckInPaymentAction,
     type BookingOptionsData,
+    type CheckInQuote,
     type EligibilityResultData,
     type PatientSearchRow,
+    type PaymentMethod,
+    type SettlementReceipt,
     type SlotOption,
 } from "./actions";
 import {
@@ -50,8 +62,10 @@ import {
     addDaysToDate,
     backdropMotion,
     baseInput,
+    dangerButton,
     displayDoctor,
     fill,
+    formatMoney,
     formatTime,
     outlineButton,
     panelMotion,
@@ -64,6 +78,7 @@ import {
     selectTriggerOpenClass,
     shortRef,
     tealButton,
+    warnButton,
     type Messages,
 } from "./FrontDeskShared";
 
@@ -78,6 +93,8 @@ function ModalShell({
     children,
     footer,
     closeLabel,
+    maxWidth = "max-w-xl",
+    busy = false,
 }: {
     title: string;
     titleId: string;
@@ -85,23 +102,26 @@ function ModalShell({
     children: ReactNode;
     footer: ReactNode;
     closeLabel: string;
+    maxWidth?: string;
+    /** While busy (a mutation is running) the modal cannot be dismissed. */
+    busy?: boolean;
 }) {
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape") onClose();
+            if (event.key === "Escape" && !busy) onClose();
         };
 
         document.addEventListener("keydown", onKeyDown);
 
         return () => document.removeEventListener("keydown", onKeyDown);
-    }, [onClose]);
+    }, [onClose, busy]);
 
     return (
         <motion.div
             {...backdropMotion}
             className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-900/40 p-3 dark:bg-slate-950/80 sm:p-6"
             onMouseDown={(event) => {
-                if (event.target === event.currentTarget) onClose();
+                if (event.target === event.currentTarget && !busy) onClose();
             }}
         >
             <motion.section
@@ -109,7 +129,7 @@ function ModalShell({
                 role="dialog"
                 aria-modal="true"
                 aria-labelledby={titleId}
-                className="my-auto w-full max-w-xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl shadow-black/60 dark:border-slate-700 dark:bg-slate-900"
+                className={`my-auto w-full ${maxWidth} overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl shadow-black/60 dark:border-slate-700 dark:bg-slate-900`}
             >
                 <div className="flex items-center justify-between gap-4 px-5 pb-3 pt-5 sm:px-7 sm:pt-6">
                     <h2
@@ -121,8 +141,9 @@ function ModalShell({
                     <button
                         type="button"
                         aria-label={closeLabel}
+                        disabled={busy}
                         onClick={onClose}
-                        className="rounded-lg p-2 text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white"
+                        className="rounded-lg p-2 text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white"
                     >
                         <X className="h-6 w-6" />
                     </button>
@@ -665,7 +686,7 @@ function PatientPicker({
 }
 
 /* ------------------------------------------------------------------ */
-/* Quick Appointment                                                  */
+/* Quick Appointment (Step 1: booking — zero payment)                 */
 /* ------------------------------------------------------------------ */
 
 export function QuickAppointmentModal({
@@ -815,7 +836,8 @@ export function QuickAppointmentModal({
                 return;
             }
 
-            // Booked in place: the dashboard closes the modal, toasts and refreshes the queue.
+            // Booked in place (status Scheduled, no payment): the dashboard closes the modal,
+            // toasts and refreshes the queue.
             onDone(t.toastBooked);
         } catch {
             setFormError(t.failed);
@@ -830,9 +852,10 @@ export function QuickAppointmentModal({
             titleId="quick-appointment-title"
             onClose={onClose}
             closeLabel={t.close}
+            busy={submitting}
             footer={
                 <>
-                    <button type="button" onClick={onClose} className={`${outlineButton} h-11 px-6`}>
+                    <button type="button" onClick={onClose} disabled={submitting} className={`${outlineButton} h-11 px-6`}>
                         {t.cancel}
                     </button>
                     <button
@@ -852,6 +875,8 @@ export function QuickAppointmentModal({
             }
         >
             <form id="quick-appointment-form" noValidate onSubmit={handleSubmit} className="space-y-5">
+                <p className="text-xs text-slate-500 dark:text-slate-400">{t.qaNoPaymentHint}</p>
+
                 <div>
                     <FieldLabel>{t.patientLabel}</FieldLabel>
                     <PatientPicker
@@ -1000,20 +1025,21 @@ export function QuickAppointmentModal({
 }
 
 /* ------------------------------------------------------------------ */
-/* Walk-in                                                            */
+/* Walk-in (creates a Scheduled visit, then opens the payment gate)   */
 /* ------------------------------------------------------------------ */
 
 export function WalkInModal({
     locale,
     t,
     onClose,
-    onDone,
+    onCreated,
     onRegisterPatient,
 }: {
     locale: Locale;
     t: Messages;
     onClose: () => void;
-    onDone: (message: string) => void;
+    /** Called with the new (still Scheduled, unpaid) visit; the dashboard opens the settlement. */
+    onCreated: (appointmentId: string) => void;
     onRegisterPatient: () => void;
 }) {
     const isRtl = locale === "ar";
@@ -1080,12 +1106,13 @@ export function WalkInModal({
         try {
             const result = await createWalkInAction({ patientId: patient.id, doctorId, reason });
 
-            if (!result.success) {
-                setFormError(result.error ?? t.failed);
+            if (!result.success || !result.data) {
+                setFormError(actionErrorMessage(t, result.code, result.error));
                 return;
             }
 
-            onDone(t.toastWalkIn);
+            // The visit is Scheduled and unpaid: hand over to the Check-In & Payment Settlement.
+            onCreated(result.data.id);
         } catch {
             setFormError(t.failed);
         } finally {
@@ -1099,9 +1126,10 @@ export function WalkInModal({
             titleId="walk-in-title"
             onClose={onClose}
             closeLabel={t.close}
+            busy={submitting}
             footer={
                 <>
-                    <button type="button" onClick={onClose} className={`${outlineButton} h-11 px-6`}>
+                    <button type="button" onClick={onClose} disabled={submitting} className={`${outlineButton} h-11 px-6`}>
                         {t.cancel}
                     </button>
                     <button
@@ -1375,3 +1403,504 @@ export function EligibilityModal({
         </ModalShell>
     );
 }
+
+/* ------------------------------------------------------------------ */
+/* Check-In & Payment Settlement (Steps 2-4)                          */
+/* ------------------------------------------------------------------ */
+
+function StepCard({
+    index,
+    title,
+    children,
+}: {
+    index: number;
+    title: string;
+    children: ReactNode;
+}) {
+    return (
+        <section className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-950/40">
+            <div className="mb-3 flex items-center gap-2.5">
+                <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-teal-600 text-xs font-bold text-white">
+                    {index}
+                </span>
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white">{title}</h3>
+            </div>
+            <div className="space-y-2 text-sm">{children}</div>
+        </section>
+    );
+}
+
+function AmountRow({
+    label,
+    value,
+    muted = false,
+    strong = false,
+}: {
+    label: ReactNode;
+    value: ReactNode;
+    muted?: boolean;
+    strong?: boolean;
+}) {
+    return (
+        <div className="flex items-center justify-between gap-3">
+            <dt
+                className={
+                    muted
+                        ? "text-slate-500 dark:text-slate-400"
+                        : "text-slate-700 dark:text-slate-200"
+                }
+            >
+                {label}
+            </dt>
+            <dd
+                dir="ltr"
+                className={`shrink-0 tabular-nums ${strong ? "font-extrabold text-slate-900 dark:text-white" : "font-semibold text-slate-900 dark:text-slate-100"
+                    }`}
+            >
+                {value}
+            </dd>
+        </div>
+    );
+}
+
+export function CheckInPaymentModal({
+    locale,
+    t,
+    timezone,
+    appointmentId,
+    onClose,
+    onSettled,
+}: {
+    locale: Locale;
+    t: Messages;
+    timezone: string;
+    appointmentId: string;
+    onClose: () => void;
+    /** Called once the invoice is issued and the visit is Waiting. */
+    onSettled: (receipt: SettlementReceipt) => void;
+}) {
+    const isRtl = locale === "ar";
+    const [quote, setQuote] = useState<CheckInQuote | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState("");
+    const [method, setMethod] = useState<PaymentMethod>("CASH");
+    const [submitting, setSubmitting] = useState(false);
+    const [formError, setFormError] = useState("");
+    const submittingRef = useRef(false);
+
+    const loadQuote = useCallback(async () => {
+        setLoading(true);
+        setLoadError("");
+
+        try {
+            // Fetches the doctor's fee, verifies insurance through @/lib/nphies + the center
+            // contract and calculates ZATCA VAT. The visit stays Scheduled.
+            const result = await getCheckInQuoteAction(appointmentId);
+
+            if (result.success && result.data) {
+                setQuote(result.data);
+            } else {
+                setQuote(null);
+                setLoadError(actionErrorMessage(t, result.code, result.error));
+            }
+        } catch {
+            setQuote(null);
+            setLoadError(t.failed);
+        } finally {
+            setLoading(false);
+        }
+    }, [appointmentId, t]);
+
+    useEffect(() => {
+        void loadQuote();
+    }, [loadQuote]);
+
+    async function handleConfirm() {
+        if (!quote || submittingRef.current) return;
+
+        submittingRef.current = true;
+        setSubmitting(true);
+        setFormError("");
+
+        try {
+            const result = await settleCheckInPaymentAction({
+                appointmentId,
+                paymentMethod: method,
+                expectedTotalDue: quote.totalDue,
+            });
+
+            if (!result.success || !result.data) {
+                setFormError(actionErrorMessage(t, result.code, result.error));
+
+                // The amount changed server-side: show the fresh calculation before retrying.
+                if (result.code === "PRICE_CHANGED") await loadQuote();
+
+                return;
+            }
+
+            onSettled(result.data);
+        } catch {
+            setFormError(t.failed);
+        } finally {
+            submittingRef.current = false;
+            setSubmitting(false);
+        }
+    }
+
+    const money = (value: number): ReactNode => (
+        <span dir="ltr">
+            {formatMoney(value, locale)} {t.ckCurrency}
+        </span>
+    );
+
+    const conversionText = quote?.conversionCode
+        ? quote.conversionCode === "NPHIES_ERROR"
+            ? ((isRtl ? quote.conversionMessageAr : quote.conversionMessageEn) ?? t.codes.NPHIES_ERROR)
+            : t.codes[quote.conversionCode]
+        : "";
+
+    const copayText = quote?.copay
+        ? [
+            quote.copay.type === "PERCENTAGE"
+                ? fill(t.elCopayPercent, { value: quote.copay.value })
+                : fill(t.elCopayFixed, { value: quote.copay.value }),
+            quote.copay.cap !== null ? fill(t.elCopayCap, { value: quote.copay.cap }) : "",
+        ]
+            .filter(Boolean)
+            .join(" · ")
+        : t.none;
+
+    const methods: Array<{ key: PaymentMethod; label: string; icon: typeof Banknote }> = [
+        { key: "CASH", label: t.ckCash, icon: Banknote },
+        { key: "MADA", label: t.ckMada, icon: CreditCard },
+    ];
+
+    return (
+        <ModalShell
+            title={t.ckTitle}
+            titleId="check-in-payment-title"
+            onClose={onClose}
+            closeLabel={t.close}
+            maxWidth="max-w-2xl"
+            busy={submitting}
+            footer={
+                <>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        disabled={submitting}
+                        className={`${outlineButton} h-11 px-6`}
+                    >
+                        {t.cancel}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => void handleConfirm()}
+                        disabled={submitting || loading || !quote}
+                        className={`${tealButton} h-11 px-6`}
+                    >
+                        {submitting ? (
+                            <LoaderCircle className="h-4 w-4 animate-spin" />
+                        ) : (
+                            <Receipt className="h-4 w-4" />
+                        )}
+                        {submitting ? t.ckConfirming : t.ckConfirm}
+                    </button>
+                </>
+            }
+        >
+            <p className="text-sm text-slate-600 dark:text-slate-300">{t.ckHint}</p>
+
+            {loading && (
+                <div aria-busy className="space-y-3">
+                    <p className="flex items-center gap-2 text-sm font-medium text-teal-600 dark:text-teal-400">
+                        <LoaderCircle className="h-4 w-4 animate-spin" />
+                        {t.ckLoading}
+                    </p>
+                    {Array.from({ length: 3 }, (_, index) => (
+                        <div
+                            key={index}
+                            className="h-20 animate-pulse rounded-xl bg-slate-200 dark:bg-slate-800"
+                        />
+                    ))}
+                </div>
+            )}
+
+            {!loading && loadError && (
+                <div className="space-y-3">
+                    <ErrorNote message={loadError} />
+                    <button
+                        type="button"
+                        onClick={() => void loadQuote()}
+                        className="text-sm font-semibold text-teal-600 underline dark:text-teal-400"
+                    >
+                        {t.retry}
+                    </button>
+                </div>
+            )}
+
+            {!loading && quote && (
+                <>
+                    {/* Patient & visit summary */}
+                    <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-teal-500/30 bg-teal-600/10 px-4 py-3">
+                        <div className="min-w-0">
+                            <p className="truncate text-base font-bold text-slate-900 dark:text-white">
+                                {isRtl ? quote.patientNameAr : quote.patientNameEn}
+                            </p>
+                            <p className="truncate text-xs text-slate-600 dark:text-slate-300">
+                                <span dir="ltr">{quote.fileNumber}</span> ·{" "}
+                                <span dir="ltr">{quote.nationalIdMasked}</span> ·{" "}
+                                {quote.isSaudi ? t.ckIdNational : t.ckIdIqama}
+                            </p>
+                        </div>
+                        <div className="min-w-0 text-end">
+                            <p className="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                {displayDoctor(isRtl ? quote.doctorNameAr : quote.doctorNameEn, locale)}
+                            </p>
+                            <p className="truncate text-xs text-slate-600 dark:text-slate-300">
+                                {isRtl ? quote.clinicNameAr : quote.clinicNameEn} ·{" "}
+                                <span dir="ltr">{formatTime(quote.scheduledAt, timezone, locale)}</span>
+                            </p>
+                        </div>
+                    </div>
+
+                    {/* Step 1 — consultation fee */}
+                    <StepCard index={1} title={t.ckStepFee}>
+                        <dl>
+                            <AmountRow label={t.ckConsultationFee} value={money(quote.consultationFee)} strong />
+                        </dl>
+                    </StepCard>
+
+                    {/* Step 2 — insurance & NPHIES coverage */}
+                    <StepCard index={2} title={t.ckStepCoverage}>
+                        {quote.insuranceConverted && (
+                            <div
+                                role="alert"
+                                className="flex items-start gap-3 rounded-lg border-2 border-amber-500/60 bg-amber-500/10 p-3.5 text-amber-800 dark:text-amber-300"
+                            >
+                                <CircleAlert className="mt-0.5 h-5 w-5 shrink-0" />
+                                <div className="min-w-0 space-y-1">
+                                    <p className="text-sm font-extrabold">{t.ckConverted}</p>
+                                    {conversionText && (
+                                        <p className="text-xs font-medium opacity-90">{conversionText}</p>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {quote.billingMode === "CASH" && !quote.insuranceConverted && (
+                            <p className="font-medium text-slate-700 dark:text-slate-200">{t.ckCashPatient}</p>
+                        )}
+
+                        {quote.billingMode === "INSURED" && (
+                            <>
+                                <p className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+                                    <ShieldCheck className="h-3.5 w-3.5" />
+                                    {t.ckInsuredEligible}
+                                </p>
+                                <dl className="space-y-1.5">
+                                    <AmountRow
+                                        muted
+                                        label={t.ckPayer}
+                                        value={
+                                            <span dir="auto">
+                                                {(isRtl ? quote.payerNameAr : quote.payerNameEn) ?? t.none}
+                                            </span>
+                                        }
+                                    />
+                                    <AmountRow muted label={t.elPolicy} value={<span dir="auto">{quote.policyName ?? t.none}</span>} />
+                                    <AmountRow muted label={t.elCopay} value={<span dir="auto">{copayText}</span>} />
+                                    {quote.nphiesReference && (
+                                        <AmountRow
+                                            muted
+                                            label={t.ckNphiesRef}
+                                            value={shortRef(quote.nphiesReference)}
+                                        />
+                                    )}
+                                    <AmountRow label={t.ckInsuranceShare} value={money(quote.insuranceShare)} />
+                                    <AmountRow label={t.ckPatientShare} value={money(quote.patientShare)} />
+                                </dl>
+                            </>
+                        )}
+                    </StepCard>
+
+                    {/* Step 3 — ZATCA VAT */}
+                    <StepCard index={3} title={t.ckStepVat}>
+                        <p className="font-medium text-slate-700 dark:text-slate-200">
+                            {quote.isSaudi ? t.ckVatExempt : t.ckVatApplied}
+                        </p>
+                        <dl>
+                            <AmountRow
+                                muted
+                                label={fill(t.ckVatLine, { rate: quote.vatRate })}
+                                value={money(quote.vatAmount)}
+                            />
+                        </dl>
+                    </StepCard>
+
+                    {/* Step 4 — amount due + payment method */}
+                    <section
+                        aria-label={t.ckStepPay}
+                        className="rounded-2xl border border-emerald-500/40 bg-gradient-to-br from-emerald-500/15 via-teal-500/10 to-transparent p-5"
+                    >
+                        <p className="text-sm font-bold text-emerald-700 dark:text-emerald-300">
+                            {t.ckAmountDue}
+                        </p>
+                        <p
+                            dir="ltr"
+                            className={`mt-1 text-4xl font-extrabold tracking-tight text-emerald-600 dark:text-emerald-400 ${isRtl ? "text-end" : ""
+                                }`}
+                        >
+                            {formatMoney(quote.totalDue, locale)}{" "}
+                            <span className="text-xl font-bold">{t.ckCurrency}</span>
+                        </p>
+
+                        <dl className="mt-4 space-y-1.5 border-t border-emerald-500/20 pt-3">
+                            <AmountRow muted label={t.ckConsultationFee} value={money(quote.consultationFee)} />
+                            <AmountRow muted label={t.ckInsuranceShare} value={money(quote.insuranceShare)} />
+                            <AmountRow muted label={t.ckPatientShare} value={money(quote.patientShare)} />
+                            <AmountRow
+                                muted
+                                label={fill(t.ckVatLine, { rate: quote.vatRate })}
+                                value={money(quote.vatAmount)}
+                            />
+                            <AmountRow strong label={t.ckTotal} value={money(quote.totalDue)} />
+                        </dl>
+
+                        {quote.totalDue === 0 && (
+                            <p className="mt-3 text-xs font-medium text-emerald-700 dark:text-emerald-300">
+                                {t.ckNoPaymentDue}
+                            </p>
+                        )}
+                    </section>
+
+                    <fieldset>
+                        <legend className="mb-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                            {t.ckPayMethod}
+                        </legend>
+                        <div className="grid grid-cols-2 gap-3">
+                            {methods.map((entry) => {
+                                const active = method === entry.key;
+                                const MethodIcon = entry.icon;
+
+                                return (
+                                    <button
+                                        key={entry.key}
+                                        type="button"
+                                        role="radio"
+                                        aria-checked={active}
+                                        disabled={submitting}
+                                        onClick={() => setMethod(entry.key)}
+                                        className={`flex h-14 items-center justify-center gap-2.5 rounded-xl border-2 text-sm font-bold transition-colors duration-150 disabled:opacity-50 ${active
+                                            ? "border-teal-500 bg-teal-600/10 text-teal-700 dark:text-teal-300"
+                                            : "border-slate-200 text-slate-700 hover:border-teal-500/60 dark:border-slate-700 dark:text-slate-200"
+                                            }`}
+                                    >
+                                        <MethodIcon className="h-5 w-5" />
+                                        {entry.label}
+                                        {active && <Check className="h-4 w-4 text-teal-500" aria-hidden />}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </fieldset>
+
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{t.ckStaysScheduled}</p>
+                </>
+            )}
+
+            <ErrorNote message={formError} />
+        </ModalShell>
+    );
+}
+
+/* ------------------------------------------------------------------ */
+/* Confirmation modal (cancel appointment / mark no-show)             */
+/* ------------------------------------------------------------------ */
+
+export function ConfirmActionModal({
+    t,
+    tone,
+    title,
+    description,
+    rows,
+    confirmLabel,
+    loading,
+    error,
+    onConfirm,
+    onClose,
+}: {
+    locale: Locale;
+    t: Messages;
+    tone: "danger" | "warn";
+    title: string;
+    description: string;
+    rows: Array<{ label: string; value: string }>;
+    confirmLabel: string;
+    loading: boolean;
+    error: string;
+    onConfirm: () => void;
+    onClose: () => void;
+}) {
+    const Icon = tone === "danger" ? CalendarX2 : UserX;
+    const iconTone =
+        tone === "danger"
+            ? "bg-rose-500/10 text-rose-500 ring-rose-500/30"
+            : "bg-amber-500/10 text-amber-500 ring-amber-500/30";
+
+    return (
+        <ModalShell
+            title={title}
+            titleId="confirm-action-title"
+            onClose={onClose}
+            closeLabel={t.close}
+            maxWidth="max-w-md"
+            busy={loading}
+            footer={
+                <>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        disabled={loading}
+                        className={`${outlineButton} h-11 px-6`}
+                    >
+                        {t.cfBack}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={onConfirm}
+                        disabled={loading}
+                        className={`${tone === "danger" ? dangerButton : warnButton} h-11 px-6`}
+                    >
+                        {loading && <LoaderCircle className="h-4 w-4 animate-spin" />}
+                        {loading ? t.cfWorking : confirmLabel}
+                    </button>
+                </>
+            }
+        >
+            <div className="flex items-start gap-4">
+                <span
+                    className={`grid h-12 w-12 shrink-0 place-items-center rounded-full ring-1 ${iconTone}`}
+                >
+                    <Icon className="h-6 w-6" />
+                </span>
+                <p className="pt-1 text-sm text-slate-600 dark:text-slate-300">{description}</p>
+            </div>
+
+            <dl className="divide-y divide-slate-200 rounded-xl border border-slate-200 bg-slate-50/60 px-4 dark:divide-slate-800 dark:border-slate-700 dark:bg-slate-950/40">
+                {rows.map((row) => (
+                    <div key={row.label} className="flex items-center justify-between gap-4 py-2.5 text-sm">
+                        <dt className="text-slate-500 dark:text-slate-400">{row.label}</dt>
+                        <dd className="min-w-0 truncate text-end font-semibold text-slate-900 dark:text-slate-100">
+                            {row.value}
+                        </dd>
+                    </div>
+                ))}
+            </dl>
+
+            <ErrorNote message={error} />
+        </ModalShell>
+    );
+}
+
+export type { AppointmentStatus };
