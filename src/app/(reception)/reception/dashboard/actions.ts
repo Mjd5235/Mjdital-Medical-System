@@ -6,25 +6,50 @@
 //  - requirePortalSession("reception"): change the portal key if your guard names it differently.
 //  - Every query is scoped by organizationId AND by `clinicId IN (tenant clinics)`, which keeps
 //    the tenant middleware used on Doctor / Appointment / Patient happy.
+//  - Invoice operations never rely on `clinicId: { in }`: the tenant guard in src/lib/db/prisma.ts
+//    (assertTenantFilter) demands a clinicId on every Invoice operation, so the invoice counter is
+//    aggregated with ONE scalar clinicId per clinic (see maxInvoiceCounter), invoice creation
+//    carries the visit's clinicId, and invoices are otherwise only reached through relations
+//    (appointment.invoices / zatcaTransmission.invoice), never through a top-level Invoice query.
 //  - NPHIES: eligibility checks go through the unified service in `@/lib/nphies`
-//    (`nphies.checkEligibility`). `NPHIES_MODE` ("SIMULATOR" | "PRODUCTION") selects the adapter,
-//    the service builds the FHIR bundle, dispatches it and persists the `nphies_transactions`
-//    audit row. This file only maps the normalized result to the Front Desk UI, so there is no
-//    duplicate transaction logic here.
+//    (`nphies.checkEligibility`). `NPHIES_MODE` ("SIMULATOR" | "PRODUCTION") selects the adapter.
+//  - ZATCA: `@/lib/zatca/zatca-service` (ZATCA_ENV = "SIMULATION" | "PRODUCTION") builds, signs
+//    and reports the Phase 2 Simplified Tax Invoice.
 //
 // Appointment & payment lifecycle (Saudi clinic standard):
 //   1. BOOKING   -> `SCHEDULED`, zero payment (createAppointmentAction / createWalkInAction).
 //   2. CHECK-IN  -> getCheckInQuoteAction: doctor fee + NPHIES / contract coverage + ZATCA VAT.
-//   3. SETTLE    -> settleCheckInPaymentAction: ONE atomic transaction that creates the ZATCA
-//                   Simplified Tax Invoice (+ pending NPHIES claim for the insurer share) and
-//                   ONLY THEN moves the appointment `SCHEDULED/CONFIRMED -> WAITING`.
+//   3. SETTLE    -> settleCheckInPaymentAction, 5 ZATCA steps:
+//                   (1) pre-flight certificate check (no CSID -> abort, visit stays SCHEDULED)
+//                   (2) invoice data + UBL 2.1 XML (UUID / ICV / PIH scoped to the tenant)
+//                   (3) SHA-256 + ECDSA signature + Phase 2 TLV QR
+//                   (4) reporting API call (Simplified Tax Invoice, B2C)
+//                   (5) persistence + ZATCA transmission log + pending NPHIES claim, and ONLY THEN
+//                       the appointment moves `SCHEDULED/CONFIRMED -> WAITING`.
+//                   The ICV/PIH slot is reserved in a short serializable transaction, the HTTP call
+//                   happens outside any transaction, and the result is finalized afterwards, so a
+//                   slow gateway never holds a database transaction open.
 //   4. WAITING   -> visible in the live queue and the doctor's queue.
-//   `WAITING` can never be reached without a paid invoice: updateAppointmentStatusAction and
-//   checkInAppointmentAction both refuse `-> WAITING` when the visit has no invoice.
+//   `WAITING` can never be reached without a reported invoice: updateAppointmentStatusAction and
+//   checkInAppointmentAction both refuse `-> WAITING` when the visit has no settled invoice.
+//
+// Persistence notes (schema.prisma has no QR / payment-method / status columns on Invoice):
+//   - zatca_transmissions.invoiceHash / status / httpStatus / zatcaRequestId hold the ZATCA outcome.
+//   - zatca_transmissions.messages holds, for a reported invoice, the receipt snapshot + the signed
+//     XML (base64) + ZATCA messages; for rejected / pending rows it holds the ZATCA message array
+//     the Admin "ZATCA Transmission Log" understands.
+//   - Pre-flight failures (Compliance / mock CSID, missing certificate) are written as REJECTED rows
+//     (see logPreflightRejection) so they show up in the Admin ZATCA Transmission Log too.
+//
+// ZATCA invoice identity rules applied at settlement:
+//   - Seller VAT (BT-31) is the VAT number embedded in the authentication certificate
+//     (`withCertificateVat`), otherwise ZATCA answers `certificate-permissions`.
+//   - Buyer identification (BT-46): Saudi citizens (0%, VATEX-SA-HEA) carry their national ID with
+//     scheme NAT (BR-KSA-49); residents (15%, category S) carry their Iqama with scheme IQA.
 // ============================================================================
 "use server";
 
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import {
     AppointmentStatus,
@@ -32,8 +57,9 @@ import {
     NphiesTransactionStatus,
     NphiesTransactionType,
     Prisma,
+    ZatcaResponseStatus,
 } from "@prisma/client";
-import type { DoctorPresence } from "@prisma/client";
+import type { DoctorPresence, DoctorProfessionalRank } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
 import { requirePortalSession } from "@/lib/auth/guard";
 import { getSession } from "@/lib/auth/session";
@@ -47,6 +73,20 @@ import {
     type NphiesServiceResponse,
     type PortalIdentityType,
 } from "@/lib/nphies";
+import { ZatcaFlowError } from "@/lib/zatca/crypto";
+import {
+    ZATCA_GENESIS_PIH,
+    buildSignedSimplifiedInvoice,
+    checkReportingCredential,
+    inspectZatcaReadiness,
+    loadSigningMaterial,
+    reportSimplifiedInvoice,
+    resolveZatcaEnvironment,
+    withCertificateVat,
+    type ZatcaBuyerIdentification,
+    type ZatcaEnvironmentName,
+    type ZatcaSellerProfile,
+} from "@/lib/zatca/zatca-service"
 
 /* -------------------------------------------------------------------------- */
 /* Constants (module-private: "use server" files may only export async fns)   */
@@ -63,9 +103,8 @@ const FRONT_DESK_PATH = "/reception";
 /** ZATCA standard VAT rate applied to the patient's payable share of non-Saudi patients. */
 const VAT_RATE_STANDARD = 15;
 
-/** ZATCA genesis "previous invoice hash" (base64 of SHA-256("0")) for the first invoice in a chain. */
-const ZATCA_GENESIS_HASH =
-    "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==";
+/** A PENDING settlement younger than this blocks a second concurrent settlement of the same visit. */
+const SETTLEMENT_LOCK_MS = 90_000;
 
 const PAYMENT_METHODS = ["CASH", "MADA"] as const;
 
@@ -73,6 +112,7 @@ const UUID_PATTERN =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NATIONAL_ID_PATTERN = /^[12]\d{9}$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const VAT_NUMBER_PATTERN = /^3\d{13}3$/;
 
 /** Status moves the reception desk is allowed to make (doctors complete visits). */
 const RECEPTION_TRANSITIONS: Record<AppointmentStatus, AppointmentStatus[]> = {
@@ -94,6 +134,42 @@ const ACTIVE_VISIT_STATUSES: AppointmentStatus[] = [
 ];
 /** Visits that are awaiting arrival: the only ones the payment gate can settle. */
 const AWAITING_CHECK_IN_STATUSES: AppointmentStatus[] = ["SCHEDULED", "CONFIRMED"];
+
+/**
+ * A "settled" invoice is one that counts as payment for the visit: either a legacy invoice with no
+ * ZATCA transmission at all (billed from the billing page) or one whose transmission was reported.
+ * Reserved-but-unreported invoices (rejected / gateway unavailable) never unlock the waiting room.
+ */
+const SETTLED_INVOICE_FILTER = {
+    OR: [
+        { zatcaTransmissions: { none: {} } },
+        {
+            zatcaTransmissions: {
+                some: {
+                    status: {
+                        in: [ZatcaResponseStatus.REPORTED, ZatcaResponseStatus.CLEARED],
+                    },
+                },
+            },
+        },
+    ],
+} satisfies Prisma.InvoiceWhereInput;
+
+/** Consultation line item by doctor rank (code + bilingual description for the tax invoice). */
+const CONSULTATION_ITEMS: Record<
+    DoctorProfessionalRank,
+    { code: string; ar: string; en: string }
+> = {
+    CONSULTANT: { code: "CONS-01", ar: "كشفية استشاري", en: "Consultant Consultation" },
+    SPECIALIST: { code: "CONS-02", ar: "كشفية أخصائي", en: "Specialist Consultation" },
+    RESIDENT: { code: "CONS-03", ar: "كشفية طبيب مقيم", en: "Resident Consultation" },
+    GENERAL_PRACTITIONER: {
+        code: "CONS-04",
+        ar: "كشفية طبيب عام",
+        en: "General Practitioner Consultation",
+    },
+    REGISTRAR: { code: "CONS-05", ar: "كشفية طبيب مسجّل", en: "Registrar Consultation" },
+};
 
 /* -------------------------------------------------------------------------- */
 /* Public types                                                               */
@@ -129,6 +205,8 @@ export type EligibilityMessageCode =
 
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 
+export type ZatcaStatusValue = "PENDING" | "REPORTED" | "CLEARED" | "REJECTED";
+
 export interface QueueCoverage {
     state: CoverageState;
     payerNameEn: string | null;
@@ -159,8 +237,9 @@ export interface QueueItem {
     clinicNameEn: string;
     clinicNameAr: string;
     coverage: QueueCoverage;
+    /** Settled invoice of the visit (reported to ZATCA, or a legacy billing-page invoice). */
     invoiceId: string | null;
-    /** True when a ZATCA invoice exists for the visit (i.e. the visit was settled at check-in). */
+    /** True when a settled invoice exists for the visit (i.e. the visit was paid at check-in). */
     paid: boolean;
     searchText: string;
 }
@@ -172,7 +251,7 @@ export interface FrontDeskKpis {
     waiting: number;
     nphiesEligible: number;
     nphiesAuthPending: number;
-    /** Today's visits that still have no invoice (payment not collected yet). */
+    /** Today's visits that still have no settled invoice (payment not collected yet). */
     pendingBilling: number;
 }
 
@@ -337,6 +416,7 @@ export interface CheckInQuote {
     payerNameEn: string | null;
     payerNameAr: string | null;
     policyName: string | null;
+    policyNumber: string | null;
     copay: EligibilityCopay | null;
     nphiesReference: string | null;
     nphiesMode: FrontDeskNphiesMode | null;
@@ -347,8 +427,11 @@ export interface CheckInQuote {
     vatAmount: number;
     /** Amount due from the patient now = patientShare + vatAmount. */
     totalDue: number;
-    /** True when an invoice already exists for the visit (nothing left to settle). */
+    /** True when a settled invoice already exists for the visit (nothing left to settle). */
     alreadyInvoiced: boolean;
+    /** False when no active, non-expired ZATCA certificate (CSID) exists for ZATCA_ENV. */
+    zatcaReady: boolean;
+    zatcaEnvironment: ZatcaEnvironmentName;
     generatedAt: string;
 }
 
@@ -359,6 +442,7 @@ export interface SettleCheckInInput {
     expectedTotalDue: number;
 }
 
+/** Everything the printable Simplified Tax Invoice needs (also the persisted receipt snapshot). */
 export interface SettlementReceipt {
     appointmentId: string;
     status: AppointmentStatus;
@@ -366,16 +450,43 @@ export interface SettlementReceipt {
     invoiceId: string;
     invoiceNumber: string;
     invoiceUuid: string;
+    /** ZATCA ICV (KSA-16). */
+    invoiceCounter: number;
     issuedAt: string;
     paymentMethod: PaymentMethod;
     currency: "SAR";
+    zatcaStatus: ZatcaStatusValue;
+    zatcaEnvironment: ZatcaEnvironmentName;
     sellerNameAr: string;
     sellerNameEn: string;
     sellerVatNumber: string;
+    sellerCrNumber: string | null;
+    sellerLogoUrl: string | null;
+    sellerPhone: string | null;
+    sellerAddressAr: string;
+    sellerAddressEn: string;
     patientNameEn: string;
     patientNameAr: string;
+    /** MRN / file number. */
+    fileNumber: string;
+    nationalIdMasked: string;
+    isSaudi: boolean;
     doctorNameEn: string;
     doctorNameAr: string;
+    specialtyEn: string;
+    specialtyAr: string;
+    clinicNameEn: string;
+    clinicNameAr: string;
+    billingMode: "CASH" | "INSURED";
+    insuranceConverted: boolean;
+    payerNameEn: string | null;
+    payerNameAr: string | null;
+    policyNumber: string | null;
+    policyName: string | null;
+    copay: EligibilityCopay | null;
+    itemCode: string;
+    itemNameAr: string;
+    itemNameEn: string;
     consultationFee: number;
     insuranceShare: number;
     patientShare: number;
@@ -383,7 +494,7 @@ export interface SettlementReceipt {
     vatAmount: number;
     totalPaid: number;
     vatExempt: boolean;
-    /** ZATCA phase-1 QR payload: base64 TLV (seller, VAT no., timestamp, total, VAT). */
+    /** ZATCA Phase 2 QR payload: base64 TLV (9 tags). */
     qrPayload: string;
     /** Pending NPHIES claim reference for the insurer share, or null for cash settlements. */
     claimReference: string | null;
@@ -444,6 +555,12 @@ function actorIdOf(...sources: unknown[]): string | null {
 
 function failure<T>(action: string, error: unknown): FrontDeskActionResult<T> {
     if (error instanceof ActionFailure) {
+        return invalid(error.message, error.code);
+    }
+
+    if (error instanceof ZatcaFlowError) {
+        console.error(`[${action}]`, error);
+
         return invalid(error.message, error.code);
     }
 
@@ -616,7 +733,7 @@ async function withSerializableRetry<T>(run: () => Promise<T>): Promise<T> {
 /**
  * Invoice numbering is a per-organization counter (unique [organizationId, invoiceCounter]), so a
  * concurrent settlement can lose the race with a serialization failure (P2034) or a unique
- * violation (P2002). Both are safe to retry because the whole settlement is one transaction.
+ * violation (P2002). Both are safe to retry because the reservation is one transaction.
  */
 async function withInvoiceRetry<T>(run: () => Promise<T>): Promise<T> {
     for (let attempt = 1; ; attempt++) {
@@ -633,6 +750,69 @@ async function withInvoiceRetry<T>(run: () => Promise<T>): Promise<T> {
 
             throw error;
         }
+    }
+}
+
+function toJson(value: unknown): Prisma.InputJsonValue {
+    return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+/**
+ * Persists a pre-flight failure (certificate / CSID problem detected BEFORE an invoice slot exists)
+ * as a REJECTED row of the ZATCA Transmission Log, so Admin > ZATCA Integration shows it.
+ * Tenant scoping: the visit must belong to one of the tenant's clinics (clinicId IN ctx.clinicIds),
+ * the row carries the organizationId, and the clinic id is added to the message because
+ * zatca_transmissions has no clinic column. Never throws: logging must not hide the real error.
+ */
+async function logPreflightRejection(
+    ctx: Ctx,
+    input: {
+        appointmentId: string;
+        environment: ZatcaEnvironmentName;
+        code: string;
+        message: string;
+    },
+): Promise<void> {
+    try {
+        const visit = await prisma.appointment.findFirst({
+            where: {
+                id: input.appointmentId,
+                organizationId: ctx.organizationId,
+                clinicId: { in: ctx.clinicIds },
+            },
+            select: { clinicId: true },
+        });
+
+        if (!visit) return;
+
+        const compactDate = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+
+        await prisma.zatcaTransmission.create({
+            data: {
+                organizationId: ctx.organizationId,
+                invoiceRef: `PRE-${compactDate}-${randomUUID().slice(0, 8).toUpperCase()}`,
+                invoiceUuid: randomUUID(),
+                invoiceType: "SIMPLIFIED_B2C",
+                isInsurance: false,
+                payerName: null,
+                environment: input.environment,
+                status: ZatcaResponseStatus.REJECTED,
+                httpStatus: null,
+                respondedAt: new Date(),
+                messages: toJson([
+                    {
+                        level: "ERROR",
+                        type: "PRE_FLIGHT",
+                        code: input.code,
+                        category: "CSID",
+                        message: `${input.message} [clinic ${visit.clinicId}]`,
+                    },
+                ]),
+            },
+            select: { id: true },
+        });
+    } catch (error) {
+        console.error("[settleCheckInPaymentAction] could not log the pre-flight rejection", error);
     }
 }
 
@@ -867,6 +1047,7 @@ async function buildSnapshot(ctx: Ctx): Promise<FrontDeskSnapshot> {
             },
             clinic: { select: { id: true, nameEn: true, nameAr: true } },
             invoices: {
+                where: SETTLED_INVOICE_FILTER,
                 select: { id: true },
                 orderBy: { createdAt: "desc" },
                 take: 1,
@@ -1044,7 +1225,7 @@ async function buildSnapshot(ctx: Ctx): Promise<FrontDeskSnapshot> {
         waiting: queue.filter((item) => item.status === "WAITING").length,
         nphiesEligible: queue.filter((item) => item.coverage.state === "ELIGIBLE").length,
         nphiesAuthPending: queue.filter((item) => item.coverage.state === "PRE_AUTH_PENDING").length,
-        // Payment is collected at check-in: every visit without an invoice is still unpaid.
+        // Payment is collected at check-in: every visit without a settled invoice is still unpaid.
         pendingBilling: queue.filter((item) => item.invoiceId === null).length,
     };
 
@@ -1587,7 +1768,7 @@ export async function createWalkInAction(
                 doctorId: doctor.id,
                 patientId: patient.id,
                 createdByUserId: ctx.userId,
-                // Strict payment gate: never WAITING before the ZATCA invoice is issued.
+                // Strict payment gate: never WAITING before the ZATCA invoice is reported.
                 status: AppointmentStatus.SCHEDULED,
                 scheduledAt: now,
                 chiefComplaint: reason || null,
@@ -1658,19 +1839,21 @@ export async function updateAppointmentStatusAction(
             );
         }
 
-        // Payment gate: `-> WAITING` is only legal for a visit that already has a ZATCA invoice.
-        // The normal path is settleCheckInPaymentAction, which issues the invoice and moves the
-        // status inside one transaction; this guard blocks every other way of reaching WAITING.
+        // Payment gate: `-> WAITING` is only legal for a visit that already has a settled (reported)
+        // ZATCA invoice. The normal path is settleCheckInPaymentAction; this guard blocks every
+        // other way of reaching WAITING. The invoice is reached through the appointment relation
+        // (no top-level Invoice query, so the tenant guard on Invoice is never involved).
         if (next === AppointmentStatus.WAITING) {
-            const invoices = await prisma.invoice.count({
+            const settled = await prisma.appointment.count({
                 where: {
+                    id: current.id,
                     organizationId: ctx.organizationId,
-                    clinicId: { in: ctx.clinicIds },
-                    appointmentId: current.id,
+                    clinicId: current.clinicId,
+                    invoices: { some: SETTLED_INVOICE_FILTER },
                 },
             });
 
-            if (invoices === 0) {
+            if (settled === 0) {
                 return invalid(
                     "Payment and a ZATCA invoice are required before the patient can enter the waiting room.",
                     "PAYMENT_REQUIRED",
@@ -1721,8 +1904,8 @@ export async function updateAppointmentStatusAction(
 
 /**
  * Kept for backwards compatibility. Check-in is no longer an instant status update: this only
- * succeeds for a visit that already carries an invoice (otherwise PAYMENT_REQUIRED). The real
- * check-in is the Check-In & Payment Settlement flow (settleCheckInPaymentAction).
+ * succeeds for a visit that already carries a settled invoice (otherwise PAYMENT_REQUIRED). The
+ * real check-in is the Check-In & Payment Settlement flow (settleCheckInPaymentAction).
  */
 export async function checkInAppointmentAction(
     appointmentId: string,
@@ -1997,11 +2180,12 @@ const settlementAppointmentSelect = {
             fullNameAr: true,
             specialtyEn: true,
             specialtyAr: true,
+            professionalRank: true,
             consultationFee: true,
         },
     },
     clinic: { select: { id: true, nameEn: true, nameAr: true } },
-    _count: { select: { invoices: true } },
+    _count: { select: { invoices: { where: SETTLED_INVOICE_FILTER } } },
 } satisfies Prisma.AppointmentSelect;
 
 interface CoverageDecision {
@@ -2032,6 +2216,7 @@ interface ResolvedSettlement {
     patientId: string;
     nationalId: string;
     doctorId: string;
+    item: { code: string; ar: string; en: string };
     amounts: SettlementAmounts;
     claim: {
         payerNphiesId: string | null;
@@ -2040,12 +2225,6 @@ interface ResolvedSettlement {
         policyNumber: string | null;
         nphiesReference: string | null;
     } | null;
-}
-
-interface SellerProfile {
-    nameAr: string;
-    nameEn: string;
-    vatNumber: string;
 }
 
 /** SAR amounts are handled in integer halalas to avoid floating point drift. */
@@ -2215,39 +2394,10 @@ async function decideCoverage(
     };
 }
 
-async function loadSellerProfile(ctx: Ctx): Promise<SellerProfile> {
-    const [settings, organization] = await Promise.all([
-        prisma.centerSettings.findUnique({
-            where: { organizationId: ctx.organizationId },
-            select: { tradeNameAr: true, tradeNameEn: true, taxRegistrationNumber: true },
-        }),
-        prisma.organization.findUnique({
-            where: { id: ctx.organizationId },
-            select: { nameAr: true, nameEn: true, vatNumber: true },
-        }),
-    ]);
-
-    if (!organization) {
-        throw new ActionFailure("Your session has expired. Sign in and try again.", "UNAUTHORIZED");
-    }
-
-    const vatNumber = (settings?.taxRegistrationNumber ?? organization.vatNumber ?? "").trim();
-
-    if (vatNumber === "") {
-        throw new ActionFailure(
-            "The center's ZATCA tax registration number is missing. Complete Center Settings first.",
-            "ZATCA_PROFILE_MISSING",
-        );
-    }
-
-    return {
-        nameAr: settings?.tradeNameAr?.trim() || organization.nameAr,
-        nameEn: settings?.tradeNameEn?.trim() || organization.nameEn,
-        vatNumber,
-    };
-}
-
-/** Steps 1-3: fee, coverage and VAT for one awaiting visit (server-side source of truth). */
+/**
+ * Loads the visit, its patient and doctor, and resolves fee, coverage and VAT (server-side source
+ * of truth for the quote and for the settlement).
+ */
 async function resolveSettlement(ctx: Ctx, appointmentId: string): Promise<ResolvedSettlement> {
     const appointment = await prisma.appointment.findFirst({
         where: {
@@ -2310,6 +2460,7 @@ async function resolveSettlement(ctx: Ctx, appointmentId: string): Promise<Resol
     const amounts = computeAmounts(feeC, decision, isSaudi);
     const nationalId = patient.nationalId.trim();
     const memberId = patient.insuranceMemberId?.trim() ?? "";
+    const item = CONSULTATION_ITEMS[appointment.doctor.professionalRank];
 
     const quote: CheckInQuote = {
         appointmentId: appointment.id,
@@ -2338,6 +2489,10 @@ async function resolveSettlement(ctx: Ctx, appointmentId: string): Promise<Resol
         payerNameEn: decision.payerNameEn,
         payerNameAr: decision.payerNameAr,
         policyName: decision.policyName,
+        policyNumber:
+            decision.billingMode === "INSURED"
+                ? (patient.insurancePolicy?.policyNumber ?? null)
+                : null,
         copay: decision.billingMode === "INSURED" ? decision.copay : null,
         nphiesReference: decision.eligibility?.referenceNumber ?? null,
         nphiesMode: decision.eligibility?.mode ?? null,
@@ -2347,6 +2502,8 @@ async function resolveSettlement(ctx: Ctx, appointmentId: string): Promise<Resol
         vatAmount: fromCents(amounts.vatC),
         totalDue: fromCents(amounts.totalC),
         alreadyInvoiced,
+        zatcaReady: true,
+        zatcaEnvironment: resolveZatcaEnvironment(),
         generatedAt: new Date().toISOString(),
     };
 
@@ -2367,15 +2524,112 @@ async function resolveSettlement(ctx: Ctx, appointmentId: string): Promise<Resol
         patientId: patient.id,
         nationalId,
         doctorId: appointment.doctor.id,
+        item,
         amounts,
         claim,
     };
 }
 
 /**
+ * Seller profile for the tax invoice: legal names, 15-digit VAT number, CR number, logo, phone and
+ * the Saudi national address, all read from Center Settings / the organization (never from the
+ * client). Throws ZATCA_PROFILE_MISSING when ZATCA's mandatory seller fields are incomplete.
+ */
+async function loadSellerProfile(ctx: Ctx): Promise<ZatcaSellerProfile> {
+    const [settings, organization] = await Promise.all([
+        prisma.centerSettings.findUnique({
+            where: { organizationId: ctx.organizationId },
+            select: {
+                tradeNameAr: true,
+                tradeNameEn: true,
+                taxRegistrationNumber: true,
+                logoUrl: true,
+                phone: true,
+                streetName: true,
+                district: true,
+                city: true,
+                postalCode: true,
+                buildingNumber: true,
+                additionalNumber: true,
+            },
+        }),
+        prisma.organization.findUnique({
+            where: { id: ctx.organizationId },
+            select: { nameAr: true, nameEn: true, vatNumber: true, crNumber: true, city: true },
+        }),
+    ]);
+
+    if (!organization) {
+        throw new ActionFailure("Your session has expired. Sign in and try again.", "UNAUTHORIZED");
+    }
+
+    const vatNumber = (settings?.taxRegistrationNumber ?? organization.vatNumber ?? "").trim();
+    const streetName = settings?.streetName?.trim() ?? "";
+    const district = settings?.district?.trim() ?? "";
+    const city = (settings?.city ?? organization.city ?? "").trim();
+    const postalCode = settings?.postalCode?.trim() ?? "";
+    const buildingNumber = settings?.buildingNumber?.trim() ?? "";
+    const additionalNumber = settings?.additionalNumber?.trim() || null;
+
+    if (
+        !VAT_NUMBER_PATTERN.test(vatNumber) ||
+        streetName === "" ||
+        district === "" ||
+        city === "" ||
+        !/^\d{5}$/.test(postalCode) ||
+        !/^\d{4}$/.test(buildingNumber)
+    ) {
+        throw new ActionFailure(
+            "The center's ZATCA tax profile (VAT number and national address) is incomplete. Complete Center Settings first.",
+            "ZATCA_PROFILE_MISSING",
+        );
+    }
+
+    return {
+        nameAr: settings?.tradeNameAr?.trim() || organization.nameAr,
+        nameEn: settings?.tradeNameEn?.trim() || organization.nameEn,
+        vatNumber,
+        crNumber: organization.crNumber?.trim() || null,
+        logoUrl: settings?.logoUrl?.trim() || null,
+        phone: settings?.phone?.trim() || null,
+        streetName,
+        district,
+        city,
+        postalCode,
+        buildingNumber,
+        additionalNumber,
+    };
+}
+
+/**
+ * Buyer identification of the simplified invoice (BT-46): Saudi citizens (VATEX-SA-HEA, 0%) are
+ * identified by their national ID with scheme NAT (BR-KSA-49); residents by their Iqama with IQA.
+ */
+function buyerIdentificationOf(resolved: ResolvedSettlement): ZatcaBuyerIdentification {
+    return {
+        scheme: resolved.quote.isSaudi ? "NAT" : "IQA",
+        value: resolved.nationalId.trim(),
+    };
+}
+
+function sellerAddress(seller: ZatcaSellerProfile): { ar: string; en: string } {
+    const extraEn = seller.additionalNumber ? ` – Additional no. ${seller.additionalNumber}` : "";
+    const extraAr = seller.additionalNumber ? ` – الرقم الإضافي ${seller.additionalNumber}` : "";
+
+    return {
+        en: `Building ${seller.buildingNumber}, ${seller.streetName}, ${seller.district}, ${seller.city} ${seller.postalCode}${extraEn}`,
+        ar: `مبنى ${seller.buildingNumber}، ${seller.streetName}، ${seller.district}، ${seller.city} ${seller.postalCode}${extraAr}`,
+    };
+}
+
+/** Steps 1-3: fee, coverage and VAT for one awaiting visit (server-side source of truth). */
+// (resolveSettlement above is the implementation; this comment block is kept for readability.)
+
+/**
  * Opens the Check-In & Payment Settlement: fetches the doctor's fee, evaluates insurance through
- * `@/lib/nphies` and the center contract (converting to cash when not covered / expired) and
- * calculates ZATCA VAT. Read-only for appointments: the visit stays SCHEDULED.
+ * `@/lib/nphies` and the center contract (converting to cash when not covered / expired),
+ * calculates ZATCA VAT and reports whether a ZATCA certificate (CSID) is active for ZATCA_ENV.
+ * Read-only for appointments: the visit stays SCHEDULED.
  */
 export async function getCheckInQuoteAction(
     appointmentId: string,
@@ -2385,43 +2639,146 @@ export async function getCheckInQuoteAction(
 
         if (!validUuid(id)) return invalid("The selected appointment is invalid.", "INVALID_APPOINTMENT");
 
-        const resolved = await resolveSettlement(ctx, id);
+        const [resolved, readiness] = await Promise.all([
+            resolveSettlement(ctx, id),
+            inspectZatcaReadiness(ctx.organizationId),
+        ]);
 
-        return { success: true, data: resolved.quote };
+        return {
+            success: true,
+            data: {
+                ...resolved.quote,
+                zatcaReady: readiness.ready,
+                zatcaEnvironment: readiness.environment,
+            },
+        };
     });
 }
 
-function tlv(tag: number, value: string): Buffer {
-    const bytes = Buffer.from(value, "utf8");
+/**
+ * Structural client accepted by maxInvoiceCounter. `prisma` is the tenant-guarded EXTENDED client, so
+ * the interactive-transaction client is `Omit<DynamicClientExtensionThis<...>, ...>`, which is not
+ * assignable to the plain `Prisma.TransactionClient`. Only `invoice.aggregate` is needed, and its type
+ * is identical on the extended client and on its transaction client.
+ */
+type InvoiceAggregateClient = { invoice: Pick<typeof prisma.invoice, "aggregate"> };
 
-    return Buffer.concat([Buffer.from([tag, bytes.length]), bytes]);
+/**
+ * Highest invoice counter of the organization. Invoice.aggregate is guarded by the tenant filter
+ * (it must carry a clinicId), and the unique key is [organizationId, invoiceCounter] (org-wide),
+ * so the maximum is taken per clinic with a scalar clinicId and combined here.
+ */
+async function maxInvoiceCounter(tx: InvoiceAggregateClient, ctx: Ctx): Promise<number> {
+    const maxima = await Promise.all(
+        ctx.clinicIds.map((clinicId) =>
+            tx.invoice.aggregate({
+                where: { organizationId: ctx.organizationId, clinicId },
+                _max: { invoiceCounter: true },
+            }),
+        ),
+    );
+
+    return maxima.reduce((highest, row) => Math.max(highest, row._max.invoiceCounter ?? 0), 0);
 }
 
-/** ZATCA QR payload: base64 TLV (1 seller, 2 VAT no., 3 timestamp, 4 total, 5 VAT amount). */
-function buildZatcaQr(input: {
-    sellerName: string;
-    vatNumber: string;
+function buildReceipt(args: {
+    resolved: ResolvedSettlement;
+    seller: ZatcaSellerProfile;
+    invoiceId: string;
+    invoiceNumber: string;
+    invoiceUuid: string;
+    invoiceCounter: number;
     issuedAt: Date;
-    totalC: number;
-    vatC: number;
-}): string {
-    const timestamp = input.issuedAt.toISOString().replace(/\.\d{3}Z$/, "Z");
+    method: PaymentMethod;
+    environment: ZatcaEnvironmentName;
+    status: ZatcaStatusValue;
+    qrPayload: string;
+    claimReference: string | null;
+}): SettlementReceipt {
+    const { resolved, seller } = args;
+    const quote = resolved.quote;
+    const amounts = resolved.amounts;
+    const address = sellerAddress(seller);
 
-    return Buffer.concat([
-        tlv(1, input.sellerName.slice(0, 100)),
-        tlv(2, input.vatNumber),
-        tlv(3, timestamp),
-        tlv(4, centsToDecimal(input.totalC)),
-        tlv(5, centsToDecimal(input.vatC)),
-    ]).toString("base64");
+    return {
+        appointmentId: quote.appointmentId,
+        status: AppointmentStatus.WAITING,
+        scheduledAt: quote.scheduledAt,
+        invoiceId: args.invoiceId,
+        invoiceNumber: args.invoiceNumber,
+        invoiceUuid: args.invoiceUuid,
+        invoiceCounter: args.invoiceCounter,
+        issuedAt: args.issuedAt.toISOString(),
+        paymentMethod: args.method,
+        currency: "SAR",
+        zatcaStatus: args.status,
+        zatcaEnvironment: args.environment,
+        sellerNameAr: seller.nameAr,
+        sellerNameEn: seller.nameEn,
+        sellerVatNumber: seller.vatNumber,
+        sellerCrNumber: seller.crNumber,
+        sellerLogoUrl: seller.logoUrl,
+        sellerPhone: seller.phone,
+        sellerAddressAr: address.ar,
+        sellerAddressEn: address.en,
+        patientNameEn: quote.patientNameEn,
+        patientNameAr: quote.patientNameAr,
+        fileNumber: quote.fileNumber,
+        nationalIdMasked: quote.nationalIdMasked,
+        isSaudi: quote.isSaudi,
+        doctorNameEn: quote.doctorNameEn,
+        doctorNameAr: quote.doctorNameAr,
+        specialtyEn: quote.specialtyEn,
+        specialtyAr: quote.specialtyAr,
+        clinicNameEn: quote.clinicNameEn,
+        clinicNameAr: quote.clinicNameAr,
+        billingMode: quote.billingMode,
+        insuranceConverted: quote.insuranceConverted,
+        payerNameEn: quote.payerNameEn,
+        payerNameAr: quote.payerNameAr,
+        policyNumber: quote.policyNumber,
+        policyName: quote.policyName,
+        copay: quote.copay,
+        itemCode: resolved.item.code,
+        itemNameAr: resolved.item.ar,
+        itemNameEn: resolved.item.en,
+        consultationFee: fromCents(amounts.feeC),
+        insuranceShare: fromCents(amounts.insuranceC),
+        patientShare: fromCents(amounts.patientC),
+        vatRate: amounts.vatRate,
+        vatAmount: fromCents(amounts.vatC),
+        totalPaid: fromCents(amounts.totalC),
+        vatExempt: quote.isSaudi,
+        qrPayload: args.qrPayload,
+        claimReference: args.claimReference,
+    };
+}
+
+function readReceiptSnapshot(
+    value: Prisma.JsonValue | null,
+    status: ZatcaStatusValue,
+    environment: ZatcaEnvironmentName,
+): SettlementReceipt | null {
+    if (!isJsonObject(value ?? undefined)) return null;
+
+    const snapshot = (value as Prisma.JsonObject)["receipt"];
+
+    if (!isJsonObject(snapshot)) return null;
+
+    const required = ["invoiceNumber", "invoiceUuid", "qrPayload", "sellerNameAr", "issuedAt"];
+
+    if (!required.every((key) => typeof snapshot[key] === "string")) return null;
+
+    return {
+        ...(snapshot as unknown as SettlementReceipt),
+        zatcaStatus: status,
+        zatcaEnvironment: environment,
+    };
 }
 
 /**
- * Step 3 + 4: collection and ZATCA Simplified Tax Invoice issuance. One atomic transaction:
- *   1. creates the invoice (+ ZATCA transmission record with hash chain and QR payload),
- *   2. creates a pending NPHIES claim for the insurer share (insured & eligible only),
- *   3. moves the appointment SCHEDULED/CONFIRMED -> WAITING.
- * Any failure rolls everything back, so the visit stays SCHEDULED and unpaid.
+ * Steps 1-5 of the ZATCA pipeline plus the strict payment gate. The visit moves to WAITING only
+ * after the invoice was REPORTED to ZATCA; any earlier failure leaves it SCHEDULED and unpaid.
  */
 export async function settleCheckInPaymentAction(
     input: SettleCheckInInput,
@@ -2439,8 +2796,48 @@ export async function settleCheckInPaymentAction(
             return invalid("Select Cash or Mada / POS.", "INVALID_PAYMENT_METHOD");
         }
 
-        // Fail fast (before any external NPHIES call) when the center cannot issue invoices.
-        const seller = await loadSellerProfile(ctx);
+        // Step 1 - pre-flight: an active, non-expired CSID must exist for ZATCA_ENV. Otherwise
+        // abort before any NPHIES call or database write (the visit stays SCHEDULED).
+        const environment = resolveZatcaEnvironment();
+
+        // Pre-flight 1: the stored certificate must be a reporting-ready Production CSID.
+        // A Compliance / mock CSID would only produce a misleading HTTP 401 from ZATCA. The rejection is
+        // written to the ZATCA Transmission Log and the visit is left untouched (still SCHEDULED).
+        const credentialCheck = await checkReportingCredential(ctx.organizationId, environment);
+
+        if (!credentialCheck.ok) {
+            await logPreflightRejection(ctx, {
+                appointmentId,
+                environment,
+                code: credentialCheck.code,
+                message: credentialCheck.message,
+            });
+
+            throw new ActionFailure(credentialCheck.message, credentialCheck.code);
+        }
+
+        // Pre-flight 2: the credentials must be loadable (missing / expired / undecryptable).
+        let material: Awaited<ReturnType<typeof loadSigningMaterial>>;
+
+        try {
+            material = await loadSigningMaterial(ctx.organizationId, environment);
+        } catch (error) {
+            if (error instanceof ZatcaFlowError) {
+                await logPreflightRejection(ctx, {
+                    appointmentId,
+                    environment,
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+
+            throw error;
+        }
+
+        // ZATCA only accepts the VAT number embedded in the authentication certificate as the seller
+        // VAT (`certificate-permissions`): the Center Settings VAT is replaced by the certificate's
+        // so the XML, the QR and the printed receipt always agree.
+        const seller = withCertificateVat(await loadSellerProfile(ctx), material);
         const resolved = await resolveSettlement(ctx, appointmentId);
 
         if (resolved.quote.alreadyInvoiced) {
@@ -2458,11 +2855,14 @@ export async function settleCheckInPaymentAction(
         }
 
         const { amounts } = resolved;
-        const issuedAt = new Date();
         const vatExempt = resolved.quote.isSaudi;
         const mode = currentNphiesMode();
+        const buyerName = resolved.quote.patientNameAr || resolved.quote.patientNameEn;
 
-        const settled = await withInvoiceRetry(() =>
+        // Step 2 + 3 - reserve the tenant-scoped UUID / ICV / PIH, build the UBL 2.1 XML, hash,
+        // sign and generate the Phase 2 QR. The invoice exists but is NOT settled yet: the visit
+        // is untouched and the transmission is PENDING.
+        const reserved = await withInvoiceRetry(() =>
             prisma.$transaction(
                 async (tx) => {
                     const current = await tx.appointment.findFirst({
@@ -2476,7 +2876,7 @@ export async function settleCheckInPaymentAction(
                             clinicId: true,
                             status: true,
                             isLocked: true,
-                            _count: { select: { invoices: true } },
+                            _count: { select: { invoices: { where: SETTLED_INVOICE_FILTER } } },
                         },
                     });
 
@@ -2505,53 +2905,68 @@ export async function settleCheckInPaymentAction(
                         );
                     }
 
-                    const [lastInvoice, previousTransmission, zatcaConfig] = await Promise.all([
-                        tx.invoice.aggregate({
-                            where: { organizationId: ctx.organizationId },
-                            _max: { invoiceCounter: true },
-                        }),
+                    const inFlight = await tx.zatcaTransmission.count({
+                        where: {
+                            organizationId: ctx.organizationId,
+                            status: ZatcaResponseStatus.PENDING,
+                            submittedAt: { gte: new Date(Date.now() - SETTLEMENT_LOCK_MS) },
+                            invoice: { appointmentId: current.id },
+                        },
+                    });
+
+                    if (inFlight > 0) {
+                        throw new ActionFailure(
+                            "This visit is already being settled. Wait a moment and refresh the queue.",
+                            "SETTLEMENT_IN_PROGRESS",
+                        );
+                    }
+
+                    const [highestCounter, previousTransmission] = await Promise.all([
+                        maxInvoiceCounter(tx, ctx),
                         tx.zatcaTransmission.findFirst({
-                            where: { organizationId: ctx.organizationId },
-                            orderBy: { submittedAt: "desc" },
+                            where: {
+                                organizationId: ctx.organizationId,
+                                environment,
+                                invoiceHash: { not: null },
+                            },
+                            orderBy: [{ submittedAt: "desc" }, { id: "desc" }],
                             select: { invoiceHash: true },
-                        }),
-                        tx.zatcaConfig.findUnique({
-                            where: { organizationId: ctx.organizationId },
-                            select: { activeEnvironment: true },
                         }),
                     ]);
 
-                    const counter = (lastInvoice._max.invoiceCounter ?? 0) + 1;
-                    const previousHash = previousTransmission?.invoiceHash ?? ZATCA_GENESIS_HASH;
+                    const counter = highestCounter + 1;
+                    const previousHash = previousTransmission?.invoiceHash ?? ZATCA_GENESIS_PIH;
                     const invoiceUuid = randomUUID();
+                    const issuedAt = new Date();
                     const year = zonedParts(issuedAt, ctx.timezone).year;
                     const invoiceNumber = `INV-${year}-${String(counter).padStart(5, "0")}`;
-                    const issuedIso = issuedAt.toISOString();
 
-                    const invoiceHash = createHash("sha256")
-                        .update(
-                            [
-                                invoiceUuid,
-                                invoiceNumber,
-                                issuedIso,
-                                seller.vatNumber,
-                                centsToDecimal(amounts.patientC),
-                                centsToDecimal(amounts.vatC),
-                                centsToDecimal(amounts.totalC),
-                                previousHash,
-                            ].join("|"),
-                        )
-                        .digest("base64");
+                    const signed = buildSignedSimplifiedInvoice(
+                        {
+                            uuid: invoiceUuid,
+                            invoiceNumber,
+                            icv: counter,
+                            pih: previousHash,
+                            issuedAt,
+                            seller,
+                            buyerName,
+                            buyerId: buyerIdentificationOf(resolved),
+                            paymentMethod: method,
+                            itemCode: resolved.item.code,
+                            itemNameAr: resolved.item.ar,
+                            itemNameEn: resolved.item.en,
+                            feeC: amounts.feeC,
+                            insuranceC: amounts.insuranceC,
+                            patientC: amounts.patientC,
+                            vatC: amounts.vatC,
+                            vatRate: amounts.vatRate,
+                            vatExempt,
+                        },
+                        material,
+                    );
 
-                    const qrPayload = buildZatcaQr({
-                        sellerName: seller.nameAr,
-                        vatNumber: seller.vatNumber,
-                        issuedAt,
-                        totalC: amounts.totalC,
-                        vatC: amounts.vatC,
-                    });
-
-                    // 1. Payment recorded as a ZATCA Simplified Tax Invoice (patient's payable share).
+                    // Payment recorded as a ZATCA Simplified Tax Invoice (patient's payable share).
+                    // clinicId is always present: the tenant guard requires it on every Invoice op.
                     const invoice = await tx.invoice.create({
                         data: {
                             organizationId: ctx.organizationId,
@@ -2570,7 +2985,7 @@ export async function settleCheckInPaymentAction(
                         select: { id: true },
                     });
 
-                    await tx.zatcaTransmission.create({
+                    const transmission = await tx.zatcaTransmission.create({
                         data: {
                             organizationId: ctx.organizationId,
                             invoiceId: invoice.id,
@@ -2579,126 +2994,25 @@ export async function settleCheckInPaymentAction(
                             invoiceType: "SIMPLIFIED_B2C",
                             isInsurance: false,
                             payerName: null,
-                            environment: zatcaConfig?.activeEnvironment ?? "SIMULATION",
-                            status: "PENDING",
-                            invoiceHash,
-                            messages: {
-                                paymentMethod: method,
-                                appointmentId: current.id,
-                                qrPayload,
-                                consultationFee: centsToDecimal(amounts.feeC),
-                                insuranceShare: centsToDecimal(amounts.insuranceC),
-                                patientShare: centsToDecimal(amounts.patientC),
-                                vatRate: amounts.vatRate,
-                                vatExempt,
-                            },
+                            environment,
+                            status: ZatcaResponseStatus.PENDING,
+                            invoiceHash: signed.invoiceHash,
+                            messages: [],
                         },
+                        select: { id: true },
                     });
 
-                    // 2. Insurer share -> pending NPHIES claim entry (batch submitted later).
-                    let claimReference: string | null = null;
-
-                    if (resolved.claim && amounts.insuranceC > 0) {
-                        const compactDate = issuedIso.slice(0, 10).replace(/-/g, "");
-
-                        claimReference = `CLM-${compactDate}-${randomUUID().slice(0, 8).toUpperCase()}`;
-
-                        await tx.nphiesTransaction.create({
-                            data: {
-                                organizationId: ctx.organizationId,
-                                transactionType: NphiesTransactionType.CLAIM,
-                                referenceNumber: claimReference,
-                                patientNationalId: resolved.nationalId,
-                                requestPayload: {
-                                    portalRequest: {
-                                        kind: "CONSULTATION_CLAIM",
-                                        appointmentId: current.id,
-                                        invoiceId: invoice.id,
-                                        invoiceNumber,
-                                        doctorId: resolved.doctorId,
-                                        payerNphiesId: resolved.claim.payerNphiesId,
-                                        payerNameEn: resolved.claim.payerNameEn,
-                                        memberId: resolved.claim.memberId,
-                                        policyNumber: resolved.claim.policyNumber,
-                                        eligibilityReference: resolved.claim.nphiesReference,
-                                        currency: "SAR",
-                                        serviceAmount: centsToDecimal(amounts.feeC),
-                                        insuranceShare: centsToDecimal(amounts.insuranceC),
-                                        patientShare: centsToDecimal(amounts.patientC),
-                                    },
-                                    fhirBundle: null,
-                                },
-                                responsePayload: {
-                                    portalResult: { state: "pending-submission" },
-                                    error: null,
-                                    fhirBundle: null,
-                                },
-                                status: NphiesTransactionStatus.QUEUED,
-                                mode,
-                                latencyMs: 0,
-                            },
-                        });
-                    }
-
-                    // 3. Only now (invoice + payment recorded) does the visit enter the waiting room.
-                    const moved = await tx.appointment.updateMany({
-                        where: {
-                            id: current.id,
-                            organizationId: ctx.organizationId,
-                            clinicId: { in: ctx.clinicIds },
-                            status: { in: AWAITING_CHECK_IN_STATUSES },
-                            isLocked: false,
-                        },
-                        data: { status: AppointmentStatus.WAITING },
-                    });
-
-                    if (moved.count === 0) {
-                        throw new ActionFailure(
-                            "This visit was just updated by someone else. The queue has been refreshed.",
-                            "CONFLICT",
-                        );
-                    }
-
-                    if (ctx.userId) {
-                        await tx.auditLog.create({
-                            data: {
-                                organizationId: ctx.organizationId,
-                                clinicId: current.clinicId,
-                                userId: ctx.userId,
-                                actionType: AuditActionType.CREATE,
-                                targetTable: "invoices",
-                                recordId: invoice.id,
-                                metadata: {
-                                    source: "front-desk-check-in-payment",
-                                    appointmentId: current.id,
-                                    invoiceNumber,
-                                    paymentMethod: method,
-                                    billingMode: resolved.quote.billingMode,
-                                    insuranceConverted: resolved.quote.insuranceConverted,
-                                    totalPaid: centsToDecimal(amounts.totalC),
-                                    claimReference,
-                                },
-                            },
-                        });
-
-                        await tx.auditLog.create({
-                            data: {
-                                organizationId: ctx.organizationId,
-                                clinicId: current.clinicId,
-                                userId: ctx.userId,
-                                actionType: AuditActionType.UPDATE,
-                                targetTable: "appointments",
-                                recordId: current.id,
-                                metadata: {
-                                    from: current.status,
-                                    to: AppointmentStatus.WAITING,
-                                    source: "front-desk-check-in-payment",
-                                },
-                            },
-                        });
-                    }
-
-                    return { invoiceId: invoice.id, invoiceUuid, invoiceNumber, qrPayload, claimReference };
+                    return {
+                        clinicId: current.clinicId,
+                        previousStatus: current.status,
+                        invoiceId: invoice.id,
+                        transmissionId: transmission.id,
+                        invoiceUuid,
+                        invoiceNumber,
+                        counter,
+                        issuedAt,
+                        signed,
+                    };
                 },
                 {
                     isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
@@ -2708,39 +3022,268 @@ export async function settleCheckInPaymentAction(
             ),
         );
 
+        // Step 4 - report to ZATCA (outside any database transaction).
+        const report = await reportSimplifiedInvoice({
+            material,
+            uuid: reserved.invoiceUuid,
+            invoiceHash: reserved.signed.invoiceHash,
+            xmlBase64: reserved.signed.xmlBase64,
+        });
+
+        if (report.outcome !== "REPORTED") {
+            try {
+                await prisma.zatcaTransmission.updateMany({
+                    where: { id: reserved.transmissionId, organizationId: ctx.organizationId },
+                    data: {
+                        status:
+                            report.outcome === "REJECTED"
+                                ? ZatcaResponseStatus.REJECTED
+                                : ZatcaResponseStatus.PENDING,
+                        httpStatus: report.httpStatus,
+                        zatcaRequestId: report.requestId,
+                        respondedAt: new Date(),
+                        messages: toJson(report.messages),
+                    },
+                });
+            } catch (error) {
+                console.error("[settleCheckInPaymentAction] could not log the failed report", error);
+            }
+
+            // The visit stays SCHEDULED and unpaid.
+            throw new ActionFailure(
+                report.reason ?? "ZATCA did not accept the invoice.",
+                report.outcome === "REJECTED" ? "ZATCA_REJECTED" : "ZATCA_UNREACHABLE",
+            );
+        }
+
+        // Step 5 - persistence: transmission log (REPORTED + receipt snapshot), pending NPHIES
+        // claim for the insurer share, and only now the move to WAITING.
+        let claimReference: string | null = null;
+
+        if (resolved.claim && amounts.insuranceC > 0) {
+            const compactDate = reserved.issuedAt.toISOString().slice(0, 10).replace(/-/g, "");
+
+            claimReference = `CLM-${compactDate}-${randomUUID().slice(0, 8).toUpperCase()}`;
+        }
+
+        const receipt = buildReceipt({
+            resolved,
+            seller,
+            invoiceId: reserved.invoiceId,
+            invoiceNumber: reserved.invoiceNumber,
+            invoiceUuid: reserved.invoiceUuid,
+            invoiceCounter: reserved.counter,
+            issuedAt: reserved.issuedAt,
+            method,
+            environment,
+            status: "REPORTED",
+            qrPayload: reserved.signed.qrPayload,
+            claimReference,
+        });
+
+        try {
+            await prisma.zatcaTransmission.updateMany({
+                where: { id: reserved.transmissionId, organizationId: ctx.organizationId },
+                data: {
+                    status: ZatcaResponseStatus.REPORTED,
+                    httpStatus: report.httpStatus,
+                    zatcaRequestId: report.requestId,
+                    respondedAt: new Date(),
+                    messages: toJson({
+                        receipt,
+                        signedXmlBase64: reserved.signed.xmlBase64,
+                        invoiceHash: reserved.signed.invoiceHash,
+                        mock: report.mock,
+                        zatcaMessages: report.messages,
+                        paymentMethod: method,
+                    }),
+                },
+            });
+        } catch (error) {
+            console.error(
+                `[settleCheckInPaymentAction] invoice ${reserved.invoiceNumber} was reported to ZATCA but the transmission log could not be updated`,
+                error,
+            );
+
+            throw error;
+        }
+
+        try {
+            await withSerializableRetry(() =>
+                prisma.$transaction(
+                    async (tx) => {
+                        if (resolved.claim && claimReference) {
+                            await tx.nphiesTransaction.create({
+                                data: {
+                                    organizationId: ctx.organizationId,
+                                    transactionType: NphiesTransactionType.CLAIM,
+                                    referenceNumber: claimReference,
+                                    patientNationalId: resolved.nationalId,
+                                    requestPayload: {
+                                        portalRequest: {
+                                            kind: "CONSULTATION_CLAIM",
+                                            appointmentId,
+                                            invoiceId: reserved.invoiceId,
+                                            invoiceNumber: reserved.invoiceNumber,
+                                            doctorId: resolved.doctorId,
+                                            payerNphiesId: resolved.claim.payerNphiesId,
+                                            payerNameEn: resolved.claim.payerNameEn,
+                                            memberId: resolved.claim.memberId,
+                                            policyNumber: resolved.claim.policyNumber,
+                                            eligibilityReference: resolved.claim.nphiesReference,
+                                            currency: "SAR",
+                                            serviceAmount: centsToDecimal(amounts.feeC),
+                                            insuranceShare: centsToDecimal(amounts.insuranceC),
+                                            patientShare: centsToDecimal(amounts.patientC),
+                                        },
+                                        fhirBundle: null,
+                                    },
+                                    responsePayload: {
+                                        portalResult: { state: "pending-submission" },
+                                        error: null,
+                                        fhirBundle: null,
+                                    },
+                                    status: NphiesTransactionStatus.QUEUED,
+                                    mode,
+                                    latencyMs: 0,
+                                },
+                            });
+                        }
+
+                        // Only now (invoice reported + payment recorded) does the visit enter the
+                        // waiting room.
+                        const moved = await tx.appointment.updateMany({
+                            where: {
+                                id: appointmentId,
+                                organizationId: ctx.organizationId,
+                                clinicId: { in: ctx.clinicIds },
+                                status: { in: AWAITING_CHECK_IN_STATUSES },
+                                isLocked: false,
+                            },
+                            data: { status: AppointmentStatus.WAITING },
+                        });
+
+                        if (moved.count === 0) {
+                            throw new ActionFailure(
+                                "This visit was just updated by someone else. The queue has been refreshed.",
+                                "CONFLICT",
+                            );
+                        }
+
+                        if (ctx.userId) {
+                            await tx.auditLog.create({
+                                data: {
+                                    organizationId: ctx.organizationId,
+                                    clinicId: reserved.clinicId,
+                                    userId: ctx.userId,
+                                    actionType: AuditActionType.CREATE,
+                                    targetTable: "invoices",
+                                    recordId: reserved.invoiceId,
+                                    metadata: {
+                                        source: "front-desk-check-in-payment",
+                                        appointmentId,
+                                        invoiceNumber: reserved.invoiceNumber,
+                                        paymentMethod: method,
+                                        billingMode: resolved.quote.billingMode,
+                                        insuranceConverted: resolved.quote.insuranceConverted,
+                                        totalPaid: centsToDecimal(amounts.totalC),
+                                        zatcaEnvironment: environment,
+                                        claimReference,
+                                    },
+                                },
+                            });
+
+                            await tx.auditLog.create({
+                                data: {
+                                    organizationId: ctx.organizationId,
+                                    clinicId: reserved.clinicId,
+                                    userId: ctx.userId,
+                                    actionType: AuditActionType.UPDATE,
+                                    targetTable: "appointments",
+                                    recordId: appointmentId,
+                                    metadata: {
+                                        from: reserved.previousStatus,
+                                        to: AppointmentStatus.WAITING,
+                                        source: "front-desk-check-in-payment",
+                                    },
+                                },
+                            });
+                        }
+                    },
+                    {
+                        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+                        maxWait: 10_000,
+                        timeout: 20_000,
+                    },
+                ),
+            );
+        } catch (error) {
+            console.error(
+                `[settleCheckInPaymentAction] invoice ${reserved.invoiceNumber} was reported but the visit could not be moved to WAITING`,
+                error,
+            );
+
+            throw error;
+        }
+
         revalidateFrontDesk();
 
-        const quote = resolved.quote;
+        return { success: true, data: receipt };
+    });
+}
 
-        return {
-            success: true,
-            data: {
-                appointmentId: quote.appointmentId,
-                status: AppointmentStatus.WAITING,
-                scheduledAt: quote.scheduledAt,
-                invoiceId: settled.invoiceId,
-                invoiceNumber: settled.invoiceNumber,
-                invoiceUuid: settled.invoiceUuid,
-                issuedAt: issuedAt.toISOString(),
-                paymentMethod: method,
-                currency: "SAR",
-                sellerNameAr: seller.nameAr,
-                sellerNameEn: seller.nameEn,
-                sellerVatNumber: seller.vatNumber,
-                patientNameEn: quote.patientNameEn,
-                patientNameAr: quote.patientNameAr,
-                doctorNameEn: quote.doctorNameEn,
-                doctorNameAr: quote.doctorNameAr,
-                consultationFee: fromCents(amounts.feeC),
-                insuranceShare: fromCents(amounts.insuranceC),
-                patientShare: fromCents(amounts.patientC),
-                vatRate: amounts.vatRate,
-                vatAmount: fromCents(amounts.vatC),
-                totalPaid: fromCents(amounts.totalC),
-                vatExempt,
-                qrPayload: settled.qrPayload,
-                claimReference: settled.claimReference,
+/**
+ * Re-opens the printable Simplified Tax Invoice of a settled visit ("View Invoice"). Reads the
+ * receipt snapshot saved with the reported ZATCA transmission (the invoice is reached through
+ * its transmission, never through a top-level Invoice query).
+ */
+export async function getInvoiceReceiptAction(
+    invoiceId: string,
+): Promise<FrontDeskActionResult<SettlementReceipt>> {
+    return withSession("getInvoiceReceiptAction", async (ctx) => {
+        const id = cleanText(invoiceId);
+
+        if (!validUuid(id)) return invalid("The selected invoice is invalid.", "INVALID_INVOICE");
+
+        const transmission = await prisma.zatcaTransmission.findFirst({
+            where: {
+                organizationId: ctx.organizationId,
+                invoiceId: id,
+                status: { in: [ZatcaResponseStatus.REPORTED, ZatcaResponseStatus.CLEARED] },
             },
-        };
+            orderBy: [{ submittedAt: "desc" }, { id: "desc" }],
+            select: {
+                status: true,
+                environment: true,
+                messages: true,
+                invoice: { select: { clinicId: true } },
+            },
+        });
+
+        if (
+            !transmission ||
+            !transmission.invoice ||
+            !ctx.clinicIds.includes(transmission.invoice.clinicId)
+        ) {
+            return invalid(
+                "No ZATCA invoice snapshot is available for this visit.",
+                "RECEIPT_UNAVAILABLE",
+            );
+        }
+
+        const receipt = readReceiptSnapshot(
+            transmission.messages,
+            transmission.status,
+            transmission.environment,
+        );
+
+        if (!receipt) {
+            return invalid(
+                "No ZATCA invoice snapshot is available for this visit.",
+                "RECEIPT_UNAVAILABLE",
+            );
+        }
+
+        return { success: true, data: receipt };
     });
 }

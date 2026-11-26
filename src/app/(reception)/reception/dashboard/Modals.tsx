@@ -2,9 +2,9 @@
 
 // ============================================================================
 // app/(reception)/reception/dashboard/Modals.tsx
-// Quick Appointment, Walk-in, Instant NPHIES Eligibility, Check-In & Payment Settlement and
-// brand-matched Confirmation modals, plus the shared SelectBox dropdown (custom listbox: dark
-// slate surface, teal-500 border, ✓ on selected).
+// Quick Appointment, Walk-in, Instant NPHIES Eligibility, Check-In & Payment Settlement,
+// printable ZATCA Simplified Tax Invoice and brand-matched Confirmation modals, plus the shared
+// SelectBox dropdown (custom listbox: dark slate surface, teal-500 border, ✓ on selected).
 // ============================================================================
 
 import {
@@ -31,6 +31,7 @@ import {
     CircleAlert,
     CreditCard,
     LoaderCircle,
+    Printer,
     Receipt,
     Search,
     ShieldCheck,
@@ -38,7 +39,6 @@ import {
     UserX,
     X,
 } from "lucide-react";
-import type { AppointmentStatus } from "@prisma/client";
 import type { Locale } from "@/lib/i18n/types";
 import {
     checkEligibilityByNationalIdAction,
@@ -47,6 +47,7 @@ import {
     getAvailableSlotsAction,
     getBookingOptionsAction,
     getCheckInQuoteAction,
+    getInvoiceReceiptAction,
     searchPatientsAction,
     settleCheckInPaymentAction,
     type BookingOptionsData,
@@ -62,11 +63,14 @@ import {
     addDaysToDate,
     backdropMotion,
     baseInput,
+    buildQrSvg,
     dangerButton,
     displayDoctor,
     fill,
+    formatDateTimeSeconds,
     formatMoney,
     formatTime,
+    messages,
     outlineButton,
     panelMotion,
     selectGroupLabelClass,
@@ -1476,7 +1480,7 @@ export function CheckInPaymentModal({
     timezone: string;
     appointmentId: string;
     onClose: () => void;
-    /** Called once the invoice is issued and the visit is Waiting. */
+    /** Called once the invoice is reported to ZATCA and the visit is Waiting. */
     onSettled: (receipt: SettlementReceipt) => void;
 }) {
     const isRtl = locale === "ar";
@@ -1494,7 +1498,8 @@ export function CheckInPaymentModal({
 
         try {
             // Fetches the doctor's fee, verifies insurance through @/lib/nphies + the center
-            // contract and calculates ZATCA VAT. The visit stays Scheduled.
+            // contract, calculates ZATCA VAT and checks the ZATCA certificate. The visit stays
+            // Scheduled.
             const result = await getCheckInQuoteAction(appointmentId);
 
             if (result.success && result.data) {
@@ -1641,6 +1646,17 @@ export function CheckInPaymentModal({
 
             {!loading && quote && (
                 <>
+                    {/* ZATCA certificate pre-flight warning (the server enforces it on confirm) */}
+                    {!quote.zatcaReady && (
+                        <div
+                            role="alert"
+                            className="flex items-start gap-3 rounded-lg border-2 border-rose-500/50 bg-rose-500/10 p-3.5 text-rose-700 dark:text-rose-300"
+                        >
+                            <CircleAlert className="mt-0.5 h-5 w-5 shrink-0" />
+                            <p className="text-sm font-bold">{t.codes.ZATCA_CERT_MISSING}</p>
+                        </div>
+                    )}
+
                     {/* Patient & visit summary */}
                     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-teal-500/30 bg-teal-600/10 px-4 py-3">
                         <div className="min-w-0">
@@ -1709,6 +1725,9 @@ export function CheckInPaymentModal({
                                         }
                                     />
                                     <AmountRow muted label={t.elPolicy} value={<span dir="auto">{quote.policyName ?? t.none}</span>} />
+                                    {quote.policyNumber && (
+                                        <AmountRow muted label={t.invPolicy} value={quote.policyNumber} />
+                                    )}
                                     <AmountRow muted label={t.elCopay} value={<span dir="auto">{copayText}</span>} />
                                     {quote.nphiesReference && (
                                         <AmountRow
@@ -1736,6 +1755,9 @@ export function CheckInPaymentModal({
                                 value={money(quote.vatAmount)}
                             />
                         </dl>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                            {fill(t.ckZatcaEnv, { env: quote.zatcaEnvironment })}
+                        </p>
                     </StepCard>
 
                     {/* Step 4 — amount due + payment method */}
@@ -1811,6 +1833,600 @@ export function CheckInPaymentModal({
 
             <ErrorNote message={formError} />
         </ModalShell>
+    );
+}
+
+/* ------------------------------------------------------------------ */
+/* ZATCA Simplified Tax Invoice (printable receipt)                   */
+/* ------------------------------------------------------------------ */
+
+type InvoiceLabelKey =
+    | "invoiceNo"
+    | "date"
+    | "patientVisit"
+    | "name"
+    | "mrn"
+    | "id"
+    | "doctor"
+    | "insurance"
+    | "payer"
+    | "policy"
+    | "copay"
+    | "method"
+    | "code"
+    | "description"
+    | "price"
+    | "insShare"
+    | "patient"
+    | "vat"
+    | "total"
+    | "gross"
+    | "insCovered"
+    | "taxable"
+    | "vatRow"
+    | "netPayable"
+    | "scan"
+    | "customerCare"
+    | "saudiPill"
+    | "nonSaudiPill";
+
+/** Short receipt labels (kept local to the receipt so the shared message catalogue is untouched). */
+const INVOICE_LABELS: Record<Locale, Record<InvoiceLabelKey, string>> = {
+    en: {
+        invoiceNo: "Invoice #",
+        date: "Date",
+        patientVisit: "Patient & Visit",
+        name: "Name",
+        mrn: "MRN",
+        id: "ID",
+        doctor: "Doctor",
+        insurance: "Insurance Coverage",
+        payer: "Payer",
+        policy: "Policy #",
+        copay: "Co-pay",
+        method: "Payment Method",
+        code: "Code",
+        description: "Description",
+        price: "Price",
+        insShare: "Ins. Share",
+        patient: "Patient",
+        vat: "VAT",
+        total: "Total",
+        gross: "Gross Total",
+        insCovered: "Insurance Covered",
+        taxable: "Taxable Amount",
+        vatRow: "VAT {rate}%",
+        netPayable: "Net Payable by Patient",
+        scan: "Scan with ZATCA Fatoora App",
+        customerCare: "Customer Care",
+        saudiPill: "Saudi • 0% VAT Exempt",
+        nonSaudiPill: "Non-Saudi • {rate}% VAT",
+    },
+    ar: {
+        invoiceNo: "رقم الفاتورة",
+        date: "التاريخ",
+        patientVisit: "المريض والزيارة",
+        name: "الاسم",
+        mrn: "رقم الملف",
+        id: "الهوية",
+        doctor: "الطبيب",
+        insurance: "التأمين",
+        payer: "شركة التأمين",
+        policy: "رقم الوثيقة",
+        copay: "نسبة التحمّل",
+        method: "طريقة الدفع",
+        code: "الرمز",
+        description: "الوصف",
+        price: "السعر",
+        insShare: "حصة التأمين",
+        patient: "المريض",
+        vat: "الضريبة",
+        total: "الإجمالي",
+        gross: "الإجمالي قبل التأمين",
+        insCovered: "المغطى من التأمين",
+        taxable: "المبلغ الخاضع للضريبة",
+        vatRow: "ضريبة {rate}%",
+        netPayable: "الصافي المستحق",
+        scan: "امسح الرمز بتطبيق «فاتورة»",
+        customerCare: "خدمة العملاء",
+        saudiPill: "سعودي • معفى من الضريبة 0%",
+        nonSaudiPill: "غير سعودي • ضريبة {rate}%",
+    },
+};
+
+const INVOICE_PRINT_CSS = `
+@page { size: A4; margin: 12mm; }
+@media print {
+  html, body { background: #fff !important; height: auto !important; overflow: visible !important; }
+  body > *:not(#zatca-print-portal) { display: none !important; }
+  #zatca-print-portal { position: static !important; display: block !important; overflow: visible !important; height: auto !important; background: #fff !important; padding: 0 !important; }
+  #zatca-print-portal .no-print { display: none !important; }
+  #zatca-print-portal .print-frame { max-width: none !important; width: 100% !important; margin: 0 !important; }
+  #zatca-print-portal .print-sheet { box-shadow: none !important; border: 0 !important; border-radius: 0 !important; padding: 0 !important; overflow: visible !important; }
+  #zatca-print-portal .print-avoid-break { break-inside: avoid; page-break-inside: avoid; }
+  #zatca-print-portal .print-qr { width: 3.8cm !important; height: 3.8cm !important; }
+  #zatca-print-portal * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+`;
+
+function MedicalCross({ className = "" }: { className?: string }) {
+    return (
+        <svg
+            aria-hidden
+            viewBox="0 0 48 48"
+            className={className}
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+        >
+            <path
+                d="M18 4h12a2 2 0 0 1 2 2v10h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H32v10a2 2 0 0 1-2 2H18a2 2 0 0 1-2-2V32H6a2 2 0 0 1-2-2V18a2 2 0 0 1 2-2h10V6a2 2 0 0 1 2-2Z"
+                fill="#14b8a6"
+            />
+        </svg>
+    );
+}
+
+function QrCodeSvg({ payload, label }: { payload: string; label: string }) {
+    const qr = useMemo(() => buildQrSvg(payload), [payload]);
+
+    if (!qr) return null;
+
+    return (
+        <svg
+            role="img"
+            aria-label={label}
+            viewBox={`0 0 ${qr.size} ${qr.size}`}
+            shapeRendering="crispEdges"
+            className="print-qr mx-auto h-32 w-32 bg-white sm:h-36 sm:w-36"
+        >
+            <rect width={qr.size} height={qr.size} fill="#ffffff" />
+            <path d={qr.path} fill="#000000" />
+        </svg>
+    );
+}
+
+function InvoiceInfoRow({ label, children }: { label: string; children: ReactNode }) {
+    return (
+        <div className="flex items-baseline gap-x-2 text-[15px] leading-snug">
+            <span className="shrink-0 text-slate-500">{label}:</span>
+            <span className="min-w-0 flex-1 font-medium text-slate-900">{children}</span>
+        </div>
+    );
+}
+
+export function InvoiceReceiptModal({
+    locale,
+    t,
+    timezone,
+    receipt: initialReceipt,
+    invoiceId,
+    onClose,
+}: {
+    locale: Locale;
+    t: Messages;
+    timezone: string;
+    /** Receipt returned by the settlement; when null it is loaded by `invoiceId`. */
+    receipt: SettlementReceipt | null;
+    invoiceId: string | null;
+    onClose: () => void;
+}) {
+    const isRtl = locale === "ar";
+    const [receipt, setReceipt] = useState<SettlementReceipt | null>(initialReceipt);
+    const [loading, setLoading] = useState(initialReceipt === null && invoiceId !== null);
+    const [error, setError] = useState("");
+
+    useEffect(() => {
+        if (initialReceipt !== null || invoiceId === null) return;
+
+        let cancelled = false;
+
+        setLoading(true);
+        setError("");
+
+        getInvoiceReceiptAction(invoiceId)
+            .then((result) => {
+                if (cancelled) return;
+
+                if (result.success && result.data) setReceipt(result.data);
+                else setError(actionErrorMessage(t, result.code, result.error));
+            })
+            .catch(() => {
+                if (!cancelled) setError(t.failed);
+            })
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [initialReceipt, invoiceId, t]);
+
+    useEffect(() => {
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === "Escape") onClose();
+        };
+
+        document.addEventListener("keydown", onKeyDown);
+
+        return () => document.removeEventListener("keydown", onKeyDown);
+    }, [onClose]);
+
+    const primary = messages[locale];
+    const secondary = messages[isRtl ? "en" : "ar"];
+    const L = INVOICE_LABELS[locale];
+    const LS = INVOICE_LABELS[isRtl ? "en" : "ar"];
+
+    /** Bilingual heading: current language first, then the other language (`EN / AR`). */
+    const biTitle = (key: InvoiceLabelKey): string => `${L[key]} / ${LS[key]}`;
+
+    const fmt = (value: number): string => `${formatMoney(value, locale)} SAR`;
+
+    const content = (() => {
+        if (loading) {
+            return (
+                <div className="flex items-center justify-center gap-3 rounded-2xl bg-white p-12 text-sm font-medium text-slate-700">
+                    <LoaderCircle className="h-5 w-5 animate-spin text-teal-600" />
+                    {t.invLoading}
+                </div>
+            );
+        }
+
+        if (!receipt) {
+            return (
+                <div role="alert" className="rounded-2xl bg-white p-8 text-center text-sm font-medium text-rose-600">
+                    {error || t.failed}
+                </div>
+            );
+        }
+
+        const issued = formatDateTimeSeconds(receipt.issuedAt, timezone, locale);
+        const reported = receipt.zatcaStatus === "REPORTED" || receipt.zatcaStatus === "CLEARED";
+        const uuidShort = `${receipt.invoiceUuid.slice(0, 8)}…${receipt.invoiceUuid.slice(-4)}`;
+        const doctor = displayDoctor(isRtl ? receipt.doctorNameAr : receipt.doctorNameEn, locale);
+        const insured = receipt.billingMode === "INSURED";
+        const copayText = receipt.copay
+            ? receipt.copay.type === "PERCENTAGE"
+                ? `${receipt.copay.value}%`
+                : `${formatMoney(receipt.copay.value, locale)} SAR`
+            : t.none;
+        const vatRate = receipt.vatExempt ? 0 : receipt.vatRate;
+        const nationalityPill = receipt.isSaudi
+            ? L.saudiPill
+            : fill(L.nonSaudiPill, { rate: receipt.vatRate });
+        const methodText =
+            receipt.paymentMethod === "CASH"
+                ? isRtl
+                    ? `${messages.ar.ckCash} / Cash`
+                    : `Cash / ${messages.ar.ckCash}`
+                : isRtl
+                    ? `${messages.ar.ckMada} / Mada`
+                    : `Mada / ${messages.ar.ckMada}`;
+        const addresses = Array.from(
+            new Set(
+                (isRtl
+                    ? [receipt.sellerAddressAr, receipt.sellerAddressEn]
+                    : [receipt.sellerAddressEn, receipt.sellerAddressAr]
+                ).filter((line): line is string => typeof line === "string" && line.trim() !== ""),
+            ),
+        );
+        const itemNames = isRtl
+            ? [
+                { text: receipt.itemNameAr, dir: "rtl" as const },
+                { text: receipt.itemNameEn, dir: "ltr" as const },
+            ]
+            : [
+                { text: receipt.itemNameEn, dir: "ltr" as const },
+                { text: receipt.itemNameAr, dir: "rtl" as const },
+            ];
+        const insuranceShareText =
+            receipt.insuranceShare > 0 ? `-${fmt(receipt.insuranceShare)}` : fmt(0);
+
+        const summaryRows: Array<{ label: string; value: string }> = [
+            { label: L.gross, value: fmt(receipt.consultationFee) },
+            { label: L.insCovered, value: insuranceShareText },
+            { label: L.taxable, value: fmt(receipt.patientShare) },
+            { label: fill(L.vatRow, { rate: vatRate }), value: fmt(receipt.vatAmount) },
+        ];
+
+        const cell = "px-3 py-4 align-top text-[13px] leading-snug text-slate-900";
+        const head =
+            "px-3 py-3 text-start text-[13px] font-semibold text-slate-800 first:rounded-s-lg last:rounded-e-lg";
+
+        return (
+            <article
+                dir={isRtl ? "rtl" : "ltr"}
+                lang={locale}
+                className="print-sheet overflow-hidden rounded-3xl border border-white/10 bg-white text-slate-900 shadow-2xl shadow-black/50"
+            >
+                {/* 1. Dark navy header banner */}
+                <header className="border-b-4 border-teal-500 bg-gradient-to-br from-[#0b1d33] via-[#0d2340] to-[#0b1d33] px-6 pb-7 pt-8 text-white sm:px-10">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div className="flex min-w-0 items-start gap-4">
+                            {receipt.sellerLogoUrl ? (
+                                // eslint-disable-next-line @next/next/no-img-element
+                                <img
+                                    src={receipt.sellerLogoUrl}
+                                    alt=""
+                                    className="h-12 w-12 shrink-0 rounded-lg bg-white/5 object-contain"
+                                />
+                            ) : (
+                                <MedicalCross className="h-12 w-12 shrink-0" />
+                            )}
+                            <div className="min-w-0 space-y-0.5">
+                                <p dir="ltr" className="text-xl font-semibold leading-tight">
+                                    <span dir="rtl">{receipt.sellerNameAr}</span>
+                                    <span className="mx-1.5 text-white/70">/</span>
+                                    <span dir="ltr">{receipt.sellerNameEn}</span>
+                                </p>
+                                {addresses.map((line, index) => (
+                                    <p key={index} dir="auto" className="text-sm text-slate-300">
+                                        {line}
+                                    </p>
+                                ))}
+                                <p className="text-sm text-slate-300">
+                                    {L.vat === "VAT" ? "VAT Reg #" : primary.invVatNo}:{" "}
+                                    <span dir="ltr">{receipt.sellerVatNumber}</span>
+                                    {receipt.sellerCrNumber && (
+                                        <>
+                                            <span className="mx-2 text-slate-500">•</span>
+                                            {primary.invCrNo}: <span dir="ltr">{receipt.sellerCrNumber}</span>
+                                        </>
+                                    )}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                            {receipt.zatcaEnvironment === "SIMULATION" && (
+                                <span className="rounded-full bg-amber-400/20 px-3 py-1 text-xs font-semibold text-amber-200 ring-1 ring-amber-300/40">
+                                    {primary.invSimulation} / {secondary.invSimulation}
+                                </span>
+                            )}
+                            <span
+                                className={`inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-sm font-semibold ring-1 ${reported
+                                    ? "bg-emerald-500/15 text-emerald-50 ring-emerald-400/40"
+                                    : "bg-amber-400/15 text-amber-100 ring-amber-300/40"
+                                    }`}
+                            >
+                                <span
+                                    className={`grid h-5 w-5 place-items-center rounded-full text-white ${reported ? "bg-emerald-500" : "bg-amber-500"
+                                        }`}
+                                >
+                                    {reported ? (
+                                        <Check className="h-3 w-3" strokeWidth={3} aria-hidden />
+                                    ) : (
+                                        <LoaderCircle className="h-3 w-3" aria-hidden />
+                                    )}
+                                </span>
+                                {reported ? primary.invReported : primary.invPending}
+                            </span>
+                        </div>
+                    </div>
+
+                    <h2 className="mt-6 text-center">
+                        <span dir="rtl" className="block text-3xl font-extrabold leading-tight sm:text-4xl">
+                            {messages.ar.invTitle} /
+                        </span>
+                        <span dir="ltr" className="mt-2 block text-xl font-medium text-white/95 sm:text-2xl">
+                            {messages.en.invTitle}
+                        </span>
+                    </h2>
+                </header>
+
+                {/* 2. Invoice metadata strip */}
+                <section className="flex flex-wrap items-center justify-between gap-x-6 gap-y-1 border-b border-slate-200 bg-slate-50 px-6 py-4 text-[15px] sm:px-10">
+                    <p>
+                        <span className="text-slate-500">{L.invoiceNo}:</span>{" "}
+                        <span dir="ltr" className="font-semibold text-slate-900">
+                            {receipt.invoiceNumber}
+                        </span>
+                    </p>
+                    <p>
+                        <span className="text-slate-500">{L.date}:</span>{" "}
+                        <span dir="ltr" className="font-semibold text-slate-900">
+                            {issued}
+                        </span>
+                    </p>
+                </section>
+
+                <div className="space-y-6 px-6 py-6 sm:px-10">
+                    {/* 3. Patient & visit + insurance cards */}
+                    <section className="print-avoid-break grid gap-5 sm:grid-cols-2">
+                        <div className="space-y-2.5 rounded-2xl border border-slate-200 bg-slate-50/90 p-5">
+                            <h3 className="mb-3 text-base font-semibold text-slate-900">
+                                {biTitle("patientVisit")}
+                            </h3>
+                            <InvoiceInfoRow label={L.name}>
+                                {isRtl ? receipt.patientNameAr : receipt.patientNameEn}
+                            </InvoiceInfoRow>
+                            <InvoiceInfoRow label={L.mrn}>
+                                <span dir="ltr">{receipt.fileNumber}</span>
+                            </InvoiceInfoRow>
+                            <InvoiceInfoRow label={L.id}>
+                                <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                                    <span dir="ltr">{receipt.nationalIdMasked}</span>
+                                    <span className="rounded-md bg-slate-200/70 px-2.5 py-1 text-xs font-medium text-slate-700">
+                                        {nationalityPill}
+                                    </span>
+                                </span>
+                            </InvoiceInfoRow>
+                            <InvoiceInfoRow label={L.doctor}>
+                                {doctor} <span className="mx-1 text-slate-500">•</span>{" "}
+                                {isRtl ? receipt.clinicNameAr : receipt.clinicNameEn}
+                            </InvoiceInfoRow>
+                        </div>
+
+                        <div className="space-y-2.5 rounded-2xl border border-slate-200 bg-slate-50/90 p-5">
+                            <h3 className="mb-3 text-base font-semibold text-slate-900">
+                                {biTitle("insurance")}
+                            </h3>
+                            {insured ? (
+                                <>
+                                    <InvoiceInfoRow label={L.payer}>
+                                        {(isRtl ? receipt.payerNameAr : receipt.payerNameEn) ?? t.none}
+                                    </InvoiceInfoRow>
+                                    <InvoiceInfoRow label={L.policy}>
+                                        <span dir="ltr">{receipt.policyNumber ?? t.none}</span>
+                                    </InvoiceInfoRow>
+                                    <InvoiceInfoRow label={L.copay}>
+                                        <span dir="ltr">{copayText}</span>
+                                    </InvoiceInfoRow>
+                                </>
+                            ) : (
+                                <p className="text-[15px] font-medium text-slate-700">
+                                    {receipt.insuranceConverted ? primary.invConverted : primary.invCash}
+                                </p>
+                            )}
+                            <div className={insured ? "pt-1" : ""}>
+                                <InvoiceInfoRow label={L.method}>{methodText}</InvoiceInfoRow>
+                            </div>
+                        </div>
+                    </section>
+
+                    {/* 4. Line items */}
+                    <section className="print-avoid-break overflow-x-auto">
+                        <table className="w-full min-w-[560px] border-collapse">
+                            <thead className="bg-slate-100/80">
+                                <tr>
+                                    <th className={head}>{L.code}</th>
+                                    <th className={head}>{L.description}</th>
+                                    <th className={head}>{L.price}</th>
+                                    <th className={head}>{L.insShare}</th>
+                                    <th className={head}>{L.patient}</th>
+                                    <th className={head}>{L.vat}</th>
+                                    <th className={head}>{L.total}</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr className="border-b border-slate-200">
+                                    <td dir="ltr" className={`${cell} text-start font-medium`}>
+                                        {receipt.itemCode}
+                                    </td>
+                                    <td className={cell}>
+                                        {itemNames.map((name, index) => (
+                                            <span key={index} dir={name.dir} className="block">
+                                                {name.text}
+                                            </span>
+                                        ))}
+                                    </td>
+                                    <td dir="ltr" className={`${cell} text-start tabular-nums`}>
+                                        {fmt(receipt.consultationFee)}
+                                    </td>
+                                    <td dir="ltr" className={`${cell} text-start tabular-nums`}>
+                                        {insuranceShareText}
+                                    </td>
+                                    <td dir="ltr" className={`${cell} text-start tabular-nums`}>
+                                        {fmt(receipt.patientShare)}
+                                    </td>
+                                    <td dir="ltr" className={`${cell} text-start tabular-nums`}>
+                                        {fmt(receipt.vatAmount)}
+                                    </td>
+                                    <td dir="ltr" className={`${cell} text-start font-semibold tabular-nums`}>
+                                        {fmt(receipt.totalPaid)}
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </section>
+
+                    {/* 5. QR + financial summary */}
+                    <section className="print-avoid-break grid items-start gap-6 sm:grid-cols-[2fr_3fr]">
+                        <div className="rounded-2xl bg-slate-50/80 px-4 py-6 text-center">
+                            <div className="mx-auto inline-block rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+                                <QrCodeSvg payload={receipt.qrPayload} label={primary.invQrLabel} />
+                            </div>
+                            <p className="mt-3 text-[15px] text-slate-700">{L.scan}</p>
+                            {receipt.claimReference && (
+                                <p className="mt-1 text-xs text-slate-500">
+                                    {primary.invClaim}: <span dir="ltr">{receipt.claimReference}</span>
+                                </p>
+                            )}
+                        </div>
+
+                        <div>
+                            <div className="space-y-3 border-t border-slate-200 pb-4 pt-4">
+                                {summaryRows.map((row, index) => (
+                                    <div
+                                        key={index}
+                                        className="flex items-start justify-between gap-3 text-[15px] text-slate-800"
+                                    >
+                                        <span>{row.label}:</span>
+                                        <span dir="ltr" className="shrink-0 font-medium tabular-nums">
+                                            {row.value}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div className="flex items-center justify-between gap-4 rounded-2xl border border-teal-100 bg-teal-50 px-5 py-4">
+                                <p className="min-w-0 text-[15px] font-medium leading-snug text-slate-900">
+                                    <span className="block">{L.netPayable} /</span>
+                                    <span className="block">{LS.netPayable}:</span>
+                                </p>
+                                <span
+                                    dir="ltr"
+                                    className="shrink-0 text-2xl font-bold tabular-nums text-slate-900"
+                                >
+                                    {fmt(receipt.totalPaid)}
+                                </span>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                {/* 6. Footer */}
+                <footer className="print-avoid-break space-y-1.5 px-6 pb-8 pt-4 text-center sm:px-10">
+                    <p dir="rtl" className="text-[15px] text-slate-800">
+                        {messages.ar.invThanks}
+                    </p>
+                    {receipt.sellerPhone && (
+                        <p className="text-sm text-slate-700">
+                            {L.customerCare}: <span dir="ltr">{receipt.sellerPhone}</span>
+                        </p>
+                    )}
+                    <p dir="ltr" title={receipt.invoiceUuid} className="pt-1 font-mono text-[10px] text-slate-400">
+                        UUID {uuidShort}
+                    </p>
+                </footer>
+            </article>
+        );
+    })();
+
+    return createPortal(
+        <div
+            id="zatca-print-portal"
+            dir={isRtl ? "rtl" : "ltr"}
+            className="fixed inset-0 z-[110] flex items-start justify-center overflow-y-auto bg-slate-950/90 p-3 sm:p-6"
+            onMouseDown={(event) => {
+                if (event.target === event.currentTarget) onClose();
+            }}
+        >
+            <style>{INVOICE_PRINT_CSS}</style>
+            <div className="print-frame my-auto w-full max-w-3xl">
+                <div className="no-print mb-4 flex items-center justify-center gap-3 print:hidden">
+                    <button
+                        type="button"
+                        onClick={() => window.print()}
+                        disabled={!receipt}
+                        className="inline-flex h-12 items-center justify-center gap-2 rounded-xl bg-teal-500 px-6 text-base font-semibold text-white shadow-lg shadow-teal-500/25 transition hover:bg-teal-400 focus:outline-none focus:ring-2 focus:ring-teal-300 focus:ring-offset-2 focus:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        <Printer className="h-5 w-5" />
+                        {t.ckPrint}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        className="inline-flex h-12 items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900/80 px-6 text-base font-semibold text-white transition hover:border-slate-500 hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-offset-2 focus:ring-offset-slate-950"
+                    >
+                        <X className="h-5 w-5" />
+                        {t.close}
+                    </button>
+                </div>
+                {content}
+            </div>
+        </div>,
+        document.body,
     );
 }
 
@@ -1902,5 +2518,3 @@ export function ConfirmActionModal({
         </ModalShell>
     );
 }
-
-export type { AppointmentStatus };

@@ -1,4 +1,12 @@
 // src/app/admin/finance/zatca/actions.ts
+//
+// READ FIRST (Developer Portal sandbox): its Production CSID is reported to be a fixed sample
+// certificate bound to test VAT 399999999900003, so reporting with another VAT number is expected
+// to be rejected. For the center's own VAT, set ZATCA_SIMULATION_URL to
+// https://gw-fatoora.zatca.gov.sa/e-invoicing/simulation, keep ZATCA_ENV unset or "SIMULATION",
+// use an OTP from the Fatoora simulation portal and certify again.
+// Source: search excerpt of github.com/salsabr119/GDXora/pull/24 (the full page could not be read).
+// Status: not run against the ZATCA gateway or a database.
 
 "use server";
 
@@ -7,12 +15,19 @@ import { randomInt, randomUUID } from "node:crypto";
 import { prisma } from "@/lib/db/prisma";
 import { requirePortalSession } from "@/lib/auth/guard";
 import {
+    buildComplianceSamples,
+    isProductionCsidCertificate,
+    resolveZatcaEnvironment,
+    type ZatcaSellerProfile,
+} from "@/lib/zatca/zatca-service";
+import {
     MOCK_SEALED_PREFIX,
     ZatcaFlowError,
     encryptionKey,
     generateKeyAndCsr,
     parseCertificateValidity,
     sealSecret,
+    type ZatcaCsrTemplate,
 } from "@/lib/zatca/crypto";
 
 /* -------------------------------------------------------------------------- */
@@ -140,6 +155,10 @@ const POSTAL_CODE_PATTERN = /^\d{5}$/;
 /** Fixed EGS serial used by the testing mock certificate. */
 const MOCK_EGS_SERIAL = "EGS-KSA-01-00482";
 
+/** Test VAT number the Developer Portal sample certificates are reported to be bound to. */
+const DEVELOPER_PORTAL_TEST_VAT = "399999999900003";
+const MAX_DIAGNOSTIC_LENGTH = 4000;
+
 const DEVELOPER_PORTAL_URL =
     "https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal";
 const PRODUCTION_URL = "https://gw-fatoora.zatca.gov.sa/e-invoicing/core";
@@ -186,7 +205,7 @@ function resolveGatewayBase(environment: ZatcaEnvironmentValue): string {
 
     const path = parsed.pathname
         .replace(/\/+$/, "")
-        .replace(/\/(compliance|production\/csids)$/, "");
+        .replace(/\/(compliance|production\/csids|invoices\/reporting\/single)$/, "");
 
     return `${parsed.origin}${path}`;
 }
@@ -195,21 +214,17 @@ function isDeveloperPortal(base: string): boolean {
     return base.includes("/e-invoicing/developer-portal");
 }
 
-/**
- * Compliance-only onboarding: the Compliance CSID returned by POST {base}/compliance is stored as
- * the device certificate and the production CSID step is skipped.
- * Default: ON for the Developer Portal sandbox, OFF everywhere else.
- * Override with ZATCA_COMPLIANCE_ONLY="true" | "false". Never applies to the PRODUCTION environment.
- */
-function isComplianceOnly(environment: ZatcaEnvironmentValue, base: string): boolean {
-    if (environment !== "SIMULATION") return false;
+/** The CSR template is dictated by the gateway that receives it, not by the UI toggle alone. */
+function resolveCsrTemplate(base: string): ZatcaCsrTemplate {
+    if (isDeveloperPortal(base)) return "TSTZATCA-Code-Signing";
+    if (base.includes("/e-invoicing/simulation")) return "PREZATCA-Code-Signing";
 
-    const flag = (process.env.ZATCA_COMPLIANCE_ONLY ?? "").trim().toLowerCase();
+    return "ZATCA-Code-Signing";
+}
 
-    if (flag === "true") return true;
-    if (flag === "false") return false;
-
-    return isDeveloperPortal(base);
+/** Keeps gateway text on one line and free of the " \u2014 " separator the UI splits languages on. */
+function singleLine(value: string): string {
+    return value.replace(/\s+/g, " ").replace(/\u2014/g, "-").trim();
 }
 
 function basicAuthHeader(binarySecurityToken: string, secret: string): string {
@@ -392,6 +407,26 @@ async function persistCredential(
     const { organizationId, environment, ...fields } = input;
 
     return prisma.$transaction(async (tx) => {
+        // Remove stale Compliance-only rows of this tenant (the current environment is overwritten
+        // by the upsert below). Rows whose X.509 issuer proves a Production CSID are kept.
+        const unmarked = await tx.zatcaCredential.findMany({
+            where: {
+                organizationId,
+                environment: { not: environment },
+                OR: [{ productionRequestId: null }, { productionRequestId: "" }],
+            },
+            select: { id: true, binarySecurityToken: true },
+        });
+        const staleIds = unmarked
+            .filter((row) => !isProductionCsidCertificate(row.binarySecurityToken))
+            .map((row) => row.id);
+
+        if (staleIds.length > 0) {
+            await tx.zatcaCredential.deleteMany({
+                where: { organizationId, id: { in: staleIds } },
+            });
+        }
+
         const credential = await tx.zatcaCredential.upsert({
             where: {
                 organizationId_environment: { organizationId, environment },
@@ -533,7 +568,7 @@ interface GatewayResponse {
     status: number;
     /** Parsed JSON body (null when the response was empty or not JSON). */
     body: unknown;
-    /** Raw response text (kept for logging / classification only, never shown to the user). */
+    /** Raw response text (kept for logging / classification). */
     raw: string;
     isJson: boolean;
     contentType: string;
@@ -592,7 +627,7 @@ async function callGateway(
         }
 
         if (!response.ok) {
-            // Full detail for debugging; the UI only receives a short, safe summary.
+            // Full detail for debugging.
             console.error(
                 `[zatca gateway] HTTP ${response.status} POST ${url} (content-type: ${contentType || "n/a"})\n${raw.slice(0, 2000)}`,
             );
@@ -679,7 +714,7 @@ function gatewayHaystack(body: unknown): string {
     return chunks.join(" ").toLowerCase();
 }
 
-/** Short "[HTTP 400 /path] {json}" suffix so the real ZATCA reply is visible in the UI and logs. */
+/** "[HTTP 400 /path] {json}" suffix so the real ZATCA reply is visible in the UI and logs. */
 function failureDiagnostic(response: GatewayResponse): string {
     let path = response.url;
 
@@ -691,9 +726,18 @@ function failureDiagnostic(response: GatewayResponse): string {
 
     const head = `[HTTP ${response.status} ${path}]`;
 
-    return response.isJson
-        ? `\n${head} ${JSON.stringify(response.body).slice(0, 700)}`
-        : `\n${head}`;
+    if (!response.isJson) {
+        const text = singleLine(response.raw).slice(0, 700);
+
+        return text && !text.startsWith("<") ? `\n${head} ${text}` : `\n${head}`;
+    }
+
+    // Credentials must never reach the browser, even inside a failure report.
+    const safeBody = JSON.stringify(response.body, (key: string, value: unknown) =>
+        key === "secret" || key === "binarySecurityToken" ? "[redacted]" : value,
+    );
+
+    return `\n${head} ${safeBody.slice(0, MAX_DIAGNOSTIC_LENGTH)}`;
 }
 
 /** Turns a failed gateway response into a clear bilingual message plus a stable code. */
@@ -711,7 +755,7 @@ function classifyGatewayFailure(
     stage: "compliance" | "production",
 ): { message: string; code: string } {
     const haystack = gatewayHaystack(response.body);
-    const detail = gatewayMessage(response.body, "");
+    const detail = singleLine(gatewayMessage(response.body, ""));
     const looksLikeHtml = /^\s*<(!doctype|html)/i.test(response.raw);
 
     // An HTML page (e.g. the zatca.gov.sa website 404 page) means the request never reached the
@@ -725,6 +769,16 @@ function classifyGatewayFailure(
             message: bi(
                 `ZATCA answered with a non-API page (HTTP ${response.status}). The gateway URL is wrong: set ZATCA_SIMULATION_URL=${DEVELOPER_PORTAL_URL}`,
                 `ردّت الهيئة بصفحة غير تابعة للـ API (HTTP ${response.status}). رابط البوابة غير صحيح: اضبط ZATCA_SIMULATION_URL على ${DEVELOPER_PORTAL_URL}`,
+            ),
+        };
+    }
+
+    if (response.status === 401 || response.status === 403) {
+        return {
+            code: "CSID_UNAUTHORIZED",
+            message: bi(
+                `ZATCA rejected the onboarding credentials (${stage}). Generate a fresh OTP and try again.`,
+                `رفضت هيئة الزكاة بيانات الاعتماد أثناء التهيئة (${stage}). أنشئ رمز OTP جديداً وحاول مرة أخرى.`,
             ),
         };
     }
@@ -784,7 +838,7 @@ function classifyGatewayFailure(
             code: "COMPLIANCE_CHECKS_REQUIRED",
             message: bi(
                 `ZATCA did not issue the production CSID. Make sure the compliance checks passed.${detail ? ` (${detail})` : ""}`,
-                "لم تُصدر هيئة الزكاة معرّف CSID للإنتاج. تأكد من اجتياز فحوصات الامتثال.",
+                `لم تُصدر هيئة الزكاة معرّف CSID للإنتاج. تأكد من اجتياز فحوصات الامتثال.${detail ? ` (${detail})` : ""}`,
             ),
         };
     }
@@ -793,7 +847,7 @@ function classifyGatewayFailure(
         code: "ZATCA_REJECTED",
         message: bi(
             `ZATCA rejected the certificate request${detail ? `: ${detail}` : "."}`,
-            "رفضت هيئة الزكاة طلب الشهادة.",
+            `رفضت هيئة الزكاة طلب الشهادة${detail ? `: ${detail}` : "."}`,
         ),
     };
 }
@@ -808,16 +862,15 @@ function readIssuedCsid(body: unknown): IssuedCsid | null {
     if (!body || typeof body !== "object") return null;
 
     const record = body as Record<string, unknown>;
-    const token = record.binarySecurityToken;
-    const secret = record.secret;
+    const token = nonEmptyString(record.binarySecurityToken);
+    const secret = nonEmptyString(record.secret);
+    const disposition = nonEmptyString(record.dispositionMessage).toUpperCase();
 
-    if (typeof token !== "string" || !token || typeof secret !== "string" || !secret) {
-        return null;
-    }
+    if (!token || !secret || (disposition && disposition !== "ISSUED")) return null;
 
     const requestId =
         typeof record.requestID === "number" || typeof record.requestID === "string"
-            ? String(record.requestID)
+            ? String(record.requestID).trim()
             : "";
 
     return { requestId, binarySecurityToken: token, secret };
@@ -1116,15 +1169,189 @@ export async function setZatcaEnvironmentAction(
     }
 }
 
+/** Seller data of the compliance sample documents (same source as Reception's seller profile). */
+async function loadComplianceSeller(organizationId: string): Promise<ZatcaSellerProfile> {
+    const organization = await prisma.organization.findUnique({
+        where: { id: organizationId },
+        select: {
+            nameAr: true,
+            nameEn: true,
+            vatNumber: true,
+            crNumber: true,
+            city: true,
+            centerSettings: {
+                select: {
+                    tradeNameAr: true,
+                    tradeNameEn: true,
+                    taxRegistrationNumber: true,
+                    logoUrl: true,
+                    phone: true,
+                    streetName: true,
+                    district: true,
+                    city: true,
+                    postalCode: true,
+                    buildingNumber: true,
+                    additionalNumber: true,
+                },
+            },
+        },
+    });
+
+    const settings = organization?.centerSettings ?? null;
+    const vatNumber = cleanText(settings?.taxRegistrationNumber ?? organization?.vatNumber, 15);
+    const streetName = cleanText(settings?.streetName, 127);
+    const district = cleanText(settings?.district, 127);
+    const city = cleanText(settings?.city ?? organization?.city, 127);
+    const postalCode = cleanText(settings?.postalCode, 5);
+    const buildingNumber = cleanText(settings?.buildingNumber, 4);
+
+    if (
+        !organization ||
+        !TAX_NUMBER_PATTERN.test(vatNumber) ||
+        !streetName ||
+        !district ||
+        !city ||
+        !POSTAL_CODE_PATTERN.test(postalCode) ||
+        !/^\d{4}$/.test(buildingNumber)
+    ) {
+        throw new ZatcaFlowError(
+            "PROFILE_INCOMPLETE",
+            bi(
+                "The tax profile is incomplete (VAT number, street, district, city, 5-digit postal code and 4-digit building number are required). Complete it in Center Settings first.",
+                "الملف الضريبي غير مكتمل (الرقم الضريبي والشارع والحي والمدينة والرمز البريدي من 5 أرقام ورقم المبنى من 4 أرقام). أكمله من إعدادات المركز أولاً.",
+            ),
+        );
+    }
+
+    return {
+        nameAr: cleanText(settings?.tradeNameAr, 120) || organization.nameAr,
+        nameEn: cleanText(settings?.tradeNameEn, 120) || organization.nameEn,
+        vatNumber,
+        crNumber: cleanText(organization.crNumber, 30) || null,
+        logoUrl: null,
+        phone: cleanText(settings?.phone, 20) || null,
+        streetName,
+        district,
+        city,
+        postalCode,
+        buildingNumber,
+        additionalNumber: cleanText(settings?.additionalNumber, 4) || null,
+    };
+}
+
+function readValidationOutcome(body: unknown): { failed: boolean; errors: string } {
+    if (!body || typeof body !== "object") return { failed: false, errors: "" };
+
+    const root = body as Record<string, unknown>;
+    const reportingFailed =
+        nonEmptyString(root.reportingStatus).toUpperCase() === "NOT_REPORTED";
+    const results = root.validationResults;
+
+    if (!results || typeof results !== "object" || Array.isArray(results)) {
+        return { failed: reportingFailed, errors: "" };
+    }
+
+    const record = results as Record<string, unknown>;
+    const errorMessages: unknown[] = Array.isArray(record.errorMessages)
+        ? record.errorMessages
+        : [];
+    const errors = errorMessages
+        .slice(0, 5)
+        .map((item) => {
+            if (!item || typeof item !== "object") return "";
+
+            const entry = item as Record<string, unknown>;
+
+            return [nonEmptyString(entry.code), nonEmptyString(entry.message)]
+                .filter(Boolean)
+                .join(": ");
+        })
+        .filter(Boolean)
+        .join(" | ");
+
+    return {
+        failed: reportingFailed || nonEmptyString(record.status).toUpperCase() === "ERROR",
+        errors: singleLine(errors).slice(0, 900),
+    };
+}
+
 /**
- * Onboards the EGS device.
+ * Step 2 of the onboarding: posts the signed sample documents (simplified invoice, credit note,
+ * debit note) to POST {base}/compliance/invoices with the Compliance CSID. Returns null when ZATCA
+ * accepted all of them, otherwise the failure to show to the admin.
+ */
+async function runComplianceChecks(args: {
+    base: string;
+    environment: ZatcaEnvironmentValue;
+    seller: ZatcaSellerProfile;
+    csid: IssuedCsid;
+    privateKeyPem: string;
+}): Promise<{ code: string; message: string } | null> {
+    const samples = buildComplianceSamples({
+        seller: args.seller,
+        binarySecurityToken: args.csid.binarySecurityToken,
+        privateKeyPem: args.privateKeyPem,
+        environment: args.environment,
+    });
+    const testVatRequired =
+        isDeveloperPortal(args.base) && args.seller.vatNumber !== DEVELOPER_PORTAL_TEST_VAT;
+
+    for (const sample of samples) {
+        const response = await callGateway(
+            `${args.base}/compliance/invoices`,
+            { Authorization: basicAuthHeader(args.csid.binarySecurityToken, args.csid.secret) },
+            { invoiceHash: sample.invoiceHash, uuid: sample.uuid, invoice: sample.xmlBase64 },
+        );
+
+        if (response.status === 401 || response.status === 403) {
+            return {
+                code: "CSID_UNAUTHORIZED",
+                message: `${bi(
+                    "ZATCA rejected the Compliance CSID during the compliance checks. Generate a fresh OTP and try again.",
+                    "رفضت هيئة الزكاة CSID الامتثال أثناء فحوصات الامتثال. أنشئ رمز OTP جديداً وحاول مرة أخرى.",
+                )}${failureDiagnostic(response)}`,
+            };
+        }
+
+        const outcome = readValidationOutcome(response.body);
+
+        if (!response.ok || outcome.failed) {
+            const detail = outcome.errors || singleLine(gatewayMessage(response.body, ""));
+            const suffix = detail ? `: ${detail}` : ".";
+            const hintEn = testVatRequired
+                ? ` The Developer Portal sandbox is reported to accept only test VAT ${DEVELOPER_PORTAL_TEST_VAT}.`
+                : "";
+            const hintAr = testVatRequired
+                ? ` يُذكر أن بيئة بوابة المطورين تقبل الرقم الضريبي التجريبي ${DEVELOPER_PORTAL_TEST_VAT} فقط.`
+                : "";
+
+            return {
+                code: "COMPLIANCE_CHECK_FAILED",
+                message: `${bi(
+                    `ZATCA compliance check failed for ${sample.label}${suffix}${hintEn}`,
+                    `فشل فحص الامتثال لدى هيئة الزكاة (${sample.label})${suffix}${hintAr}`,
+                )}${failureDiagnostic(response)}`,
+            };
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Onboards the EGS device (full ZATCA handshake).
  *
- * - ZATCA_MOCK_MODE === "true": handled FIRST, right after authentication. No encryption key, tax
- *   profile, CSR or gateway call is involved; a dummy active certificate is stored and returned.
- * - Otherwise: builds the CSR and exchanges the OTP for a compliance CSID (POST {base}/compliance).
- *   Developer Portal (default for SIMULATION): the compliance CSID is stored as the device certificate.
- *   Other gateways: it is upgraded to a production CSID (POST {base}/production/csids) first.
- *   Secrets are stored AES-256-GCM encrypted.
+ * - ZATCA_MOCK_MODE === "true": a dummy active certificate is stored (no network).
+ * - Otherwise, for SIMULATION (Developer Portal) and PRODUCTION alike:
+ *     1) POST {base}/compliance            CSR + OTP            -> Compliance CSID
+ *     2) POST {base}/compliance/invoices   3 signed samples     -> compliance checks must pass
+ *     3) POST {base}/production/csids      compliance_request_id -> Production CSID
+ *   Only the PRODUCTION CSID (token + secret) is stored; the secret and private key are
+ *   AES-256-GCM sealed. A non-empty `productionRequestId` marks the row as reporting-capable. Any
+ *   failure returns ZATCA's real reply and leaves the stored certificates untouched.
+ *
+ * Tenant scope: ZatcaCredential is unique per (organizationId, environment); the schema has no
+ * clinicId or stage column on it, so no migration is needed.
  */
 export async function generateZatcaCsidAction(
     input: GenerateZatcaCsidInput,
@@ -1162,11 +1389,14 @@ export async function generateZatcaCsidAction(
 
         // Fail fast on a misconfigured gateway URL (before anything else runs or the OTP is spent).
         const base = resolveGatewayBase(environment);
-        const complianceOnly = isComplianceOnly(environment, base);
 
-        console.info(
-            `[zatca] onboarding ${environment} via ${base} (complianceOnly=${complianceOnly})`,
-        );
+        console.info(`[zatca] onboarding ${environment} via ${base}`);
+
+        if (environment !== resolveZatcaEnvironment()) {
+            console.warn(
+                `[zatca] certifying ${environment}, but Reception reports with ZATCA_ENV=${resolveZatcaEnvironment()}.`,
+            );
+        }
 
         // Fail fast (before the single-use OTP is spent) when the server cannot protect the secrets.
         const key = encryptionKey();
@@ -1182,6 +1412,9 @@ export async function generateZatcaCsidAction(
                 "PROFILE_INCOMPLETE",
             );
         }
+
+        // Also before the OTP is consumed: the compliance sample documents need the full seller address.
+        const seller = await loadComplianceSeller(organizationId);
 
         const existing = await prisma.zatcaCredential.findUnique({
             where: {
@@ -1213,6 +1446,8 @@ export async function generateZatcaCsidAction(
             city: profile.city,
             street: profile.streetName,
             district: profile.district,
+            invoiceTypes: "0100",
+            templateName: resolveCsrTemplate(base),
         });
 
         // 1) Compliance CSID (the single-use OTP is consumed here).
@@ -1230,38 +1465,54 @@ export async function generateZatcaCsidAction(
             return fail(failure.message, failure.code);
         }
 
-        // 2) Production CSID (requires the compliance request to be accepted by ZATCA).
-        //    Skipped in compliance-only mode (Developer Portal): the Compliance CSID is stored instead.
-        let issued: IssuedCsid = complianceCsid;
-        let productionRequestId: string | null = null;
-
-        if (!complianceOnly) {
-            const production = await callGateway(
-                `${base}/production/csids`,
-                {
-                    Authorization: basicAuthHeader(
-                        complianceCsid.binarySecurityToken,
-                        complianceCsid.secret,
-                    ),
-                },
-                { compliance_request_id: complianceCsid.requestId },
+        if (!complianceCsid.requestId) {
+            return fail(
+                `${bi(
+                    "ZATCA issued a Compliance CSID without a request ID, so the Production CSID cannot be requested.",
+                    "أصدرت هيئة الزكاة CSID امتثال دون معرّف طلب، لذا لا يمكن طلب CSID الإنتاج.",
+                )}${failureDiagnostic(compliance)}`,
+                "COMPLIANCE_REQUEST_ID_MISSING",
             );
-
-            const productionCsid = production.ok ? readIssuedCsid(production.body) : null;
-
-            if (!productionCsid) {
-                const failure = describeGatewayFailure(production, "production");
-
-                return fail(failure.message, failure.code);
-            }
-
-            issued = productionCsid;
-            productionRequestId = productionCsid.requestId || null;
         }
 
-        const { issuedAt, expiresAt } = parseCertificateValidity(issued.binarySecurityToken);
+        // 2) Compliance invoice checks (simplified invoice, credit note, debit note).
+        const checkFailure = await runComplianceChecks({
+            base,
+            environment,
+            seller,
+            csid: complianceCsid,
+            privateKeyPem,
+        });
 
-        const secretEncrypted = sealSecret(issued.secret, organizationId, key);
+        if (checkFailure) {
+            return fail(checkFailure.message, checkFailure.code);
+        }
+
+        // 3) Production CSID: the ONLY credential accepted by the reporting endpoint.
+        const production = await callGateway(
+            `${base}/production/csids`,
+            {
+                Authorization: basicAuthHeader(
+                    complianceCsid.binarySecurityToken,
+                    complianceCsid.secret,
+                ),
+            },
+            { compliance_request_id: complianceCsid.requestId },
+        );
+
+        const productionCsid = production.ok ? readIssuedCsid(production.body) : null;
+
+        if (!productionCsid) {
+            const failure = describeGatewayFailure(production, "production");
+
+            return fail(failure.message, failure.code);
+        }
+
+        const productionRequestId = productionCsid.requestId || complianceCsid.requestId;
+
+        const { issuedAt, expiresAt } = parseCertificateValidity(productionCsid.binarySecurityToken);
+
+        const secretEncrypted = sealSecret(productionCsid.secret, organizationId, key);
         const privateKeyEncrypted = sealSecret(privateKeyPem, organizationId, key);
 
         const saved = await persistCredential({
@@ -1269,9 +1520,9 @@ export async function generateZatcaCsidAction(
             environment,
             egsSerial,
             egsUuid,
-            complianceRequestId: complianceCsid.requestId || null,
+            complianceRequestId: complianceCsid.requestId,
             productionRequestId,
-            binarySecurityToken: issued.binarySecurityToken,
+            binarySecurityToken: productionCsid.binarySecurityToken,
             secretEncrypted,
             privateKeyEncrypted,
             issuedAt,

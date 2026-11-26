@@ -12,10 +12,12 @@
 //   2. Check-In  - the Check-In button (and every Walk-in) opens the Check-In & Payment
 //                  Settlement modal: doctor fee -> NPHIES / contract coverage -> ZATCA VAT.
 //                  Closing the modal without paying leaves the visit SCHEDULED.
-//   3. Settle    - "Confirm Payment & Issue ZATCA" runs one atomic server transaction
-//                  (invoice + pending NPHIES claim + SCHEDULED -> WAITING).
+//   3. Settle    - "Confirm Payment & Issue ZATCA" runs the 5-step ZATCA Phase 2 pipeline on the
+//                  server (certificate pre-flight, UBL XML, signature + QR, reporting, persistence)
+//                  and only then moves the visit SCHEDULED -> WAITING.
 //   4. Waiting   - the visit appears in the live queue / doctor's queue; the modal closes, the
-//                  queue and KPIs refresh and a toast offers to print the receipt.
+//                  queue and KPIs refresh and the printable ZATCA Simplified Tax Invoice opens.
+//                  "View Invoice" on any paid row re-opens the same printable invoice.
 //   Cancel / No-show use a brand-matched confirmation modal (no native confirm()).
 //
 // Appointment entry points (two separate flows):
@@ -25,6 +27,10 @@
 //   * "+ Quick Appointment" button in this page's header -> opens the in-page
 //     QuickAppointmentModal, books through createAppointmentAction and refreshes the queue
 //     without leaving the dashboard (no router navigation involved).
+//
+// Layout: the live queue card is `self-start` inside an `items-start` grid, so its height follows
+// its own rows (compact empty state when there are none) and is never stretched by the
+// Live NPHIES Feed column.
 //
 // Real-time strategy:
 //   * Supabase Realtime (postgres_changes on appointments / nphies_transactions /
@@ -63,6 +69,7 @@ import {
     LoaderCircle,
     MoreHorizontal,
     Plus,
+    ReceiptText,
     RefreshCw,
     RotateCcw,
     Search,
@@ -88,6 +95,7 @@ import {
     CheckInPaymentModal,
     ConfirmActionModal,
     EligibilityModal,
+    InvoiceReceiptModal,
     QuickAppointmentModal,
     SelectBox,
     WalkInModal,
@@ -103,7 +111,6 @@ import {
     formatTime,
     messages,
     outlineButton,
-    printReceipt,
     relativeTime,
     shortRef,
     tealButton,
@@ -127,6 +134,7 @@ type ToastItem = { id: number; kind: ToastKind; message: string; action?: ToastA
 type ModalName = "quick" | "walkin" | "eligibility" | null;
 type ConfirmableStatus = "CANCELLED" | "NO_SHOW";
 type ConfirmTarget = { item: QueueItem; next: ConfirmableStatus };
+type ReceiptView = { receipt: SettlementReceipt | null; invoiceId: string | null };
 type PrimaryAction =
     | "CHECK_IN"
     | "VERIFY"
@@ -669,6 +677,7 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
     const [page, setPage] = useState(1);
     const [modal, setModal] = useState<ModalName>(null);
     const [settleId, setSettleId] = useState<string | null>(null);
+    const [receiptView, setReceiptView] = useState<ReceiptView | null>(null);
     const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null);
     const [confirmBusy, setConfirmBusy] = useState(false);
     const [confirmError, setConfirmError] = useState("");
@@ -867,14 +876,11 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
         );
     }
 
-    function goViewInvoice(item: QueueItem) {
+    /** Opens the printable ZATCA Simplified Tax Invoice of a paid visit. */
+    function openInvoice(item: QueueItem) {
         if (!item.invoiceId) return;
 
-        router.push(
-            `/reception/billing?invoiceId=${encodeURIComponent(
-                item.invoiceId,
-            )}&appointmentId=${encodeURIComponent(item.id)}`,
-        );
+        setReceiptView({ receipt: null, invoiceId: item.invoiceId });
     }
 
     /* ------------------------------ mutations --------------------------- */
@@ -919,8 +925,8 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
 
     /**
      * Check-In never flips the status directly: it opens the Check-In & Payment Settlement. The
-     * only exception is a visit that already carries an invoice (e.g. billed from the billing
-     * page), which the server allows to move to Waiting.
+     * only exception is a visit that already carries a settled invoice (e.g. billed from the
+     * billing page), which the server allows to move to Waiting.
      */
     function startCheckIn(item: QueueItem) {
         if (item.paid) {
@@ -1077,25 +1083,22 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
         void refresh();
     }, [refresh]);
 
+    const closeReceipt = useCallback(() => setReceiptView(null), []);
+
     const timezone = snapshot?.timezone ?? "Asia/Riyadh";
 
+    /** Payment + ZATCA reporting succeeded: close the settlement, refresh and open the invoice. */
     const handleSettled = useCallback(
         (receipt: SettlementReceipt) => {
             const current = tRef.current;
             const name = locale === "ar" ? receipt.patientNameAr : receipt.patientNameEn;
 
             setSettleId(null);
-            pushToast("success", fill(current.ckToastPaid, { name }), {
-                label: current.ckPrint,
-                onClick: () => {
-                    if (!printReceipt(receipt, tRef.current, locale, timezone)) {
-                        pushToast("error", tRef.current.ckPopupBlocked);
-                    }
-                },
-            });
+            setReceiptView({ receipt, invoiceId: receipt.invoiceId });
+            pushToast("success", fill(current.ckToastPaid, { name }));
             void refresh();
         },
-        [locale, pushToast, refresh, timezone],
+        [locale, pushToast, refresh],
     );
 
     const handleRegisterFromModal = useCallback(() => {
@@ -1530,7 +1533,7 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                                                                                         {primary === "VIEW_INVOICE" && (
                                                                                             <button
                                                                                                 type="button"
-                                                                                                onClick={() => goViewInvoice(item)}
+                                                                                                onClick={() => openInvoice(item)}
                                                                                                 className="inline-flex h-10 items-center whitespace-nowrap rounded-lg border border-sky-500 px-4 text-sm font-semibold text-sky-600 transition hover:bg-sky-500/10 focus:outline-none focus:ring-2 focus:ring-sky-500 dark:text-sky-400"
                                                                                             >
                                                                                                 {t.viewInvoice}
@@ -1542,6 +1545,18 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                                                                                                 <CheckCircle2 className="h-4 w-4" />
                                                                                                 {t.checkedIn}
                                                                                             </span>
+                                                                                        )}
+
+                                                                                        {item.invoiceId && primary !== "VIEW_INVOICE" && (
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                onClick={() => openInvoice(item)}
+                                                                                                aria-label={t.viewInvoice}
+                                                                                                title={t.viewInvoice}
+                                                                                                className="grid h-10 w-10 place-items-center rounded-lg border border-transparent text-sky-600 transition hover:bg-sky-500/10 focus:outline-none focus:ring-2 focus:ring-sky-500 dark:text-sky-400"
+                                                                                            >
+                                                                                                <ReceiptText className="h-5 w-5" />
+                                                                                            </button>
                                                                                         )}
 
                                                                                         <RowMenu
@@ -1741,6 +1756,18 @@ export default function FrontDeskToday({ initialLocale }: { initialLocale: Local
                         appointmentId={settleId}
                         onClose={closeSettlement}
                         onSettled={handleSettled}
+                    />
+                )}
+
+                {receiptView && (
+                    <InvoiceReceiptModal
+                        key={`invoice-receipt-${receiptView.invoiceId ?? "new"}`}
+                        locale={locale}
+                        t={t}
+                        timezone={timezone}
+                        receipt={receiptView.receipt}
+                        invoiceId={receiptView.invoiceId}
+                        onClose={closeReceipt}
                     />
                 )}
 
